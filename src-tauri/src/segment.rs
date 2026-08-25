@@ -56,7 +56,16 @@ pub fn build(req: &SegmentReq, allowed: &HashSet<String>) -> std::result::Result
             clauses.push(format!("{col} LIKE ?"));
             binds.push(format!("%{}%", f.value));
         } else {
-            clauses.push(format!("{col} {} ?", f.op));
+            let sql_op = match f.op.as_str() {
+                "=" => "=",
+                "!=" => "!=",
+                ">" => ">",
+                "<" => "<",
+                ">=" => ">=",
+                "<=" => "<=",
+                _ => unreachable!("operator already validated against ALLOWED_OPS"),
+            };
+            clauses.push(format!("{col} {sql_op} ?"));
             binds.push(f.value.clone());
         }
     }
@@ -176,6 +185,27 @@ mod tests {
         let mut evil = allowed();
         evil.insert("Name\" OR 1=1 --".into());
         assert!(build(&req(vec![("Name\" OR 1=1 --", "=", "x")], None), &evil).is_err());
+    }
+
+    #[test]
+    fn every_comparison_operator_maps_to_its_own_sql_fragment() {
+        for op in ["=", "!=", ">", "<", ">=", "<="] {
+            let b = build(&req(vec![("Amount", op, "42")], None), &allowed()).unwrap();
+            assert!(
+                b.count_sql.contains(&format!("\"Amount\" {op} ?")),
+                "op {op:?}: expected fragment in {:?}",
+                b.count_sql
+            );
+            assert_eq!(
+                b.binds,
+                vec!["42".to_string()],
+                "op {op:?}: value must be bound, not inlined"
+            );
+            assert!(
+                !b.count_sql.contains("42"),
+                "op {op:?}: value must not appear in SQL"
+            );
+        }
     }
 
     #[test]
