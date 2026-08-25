@@ -42,3 +42,6 @@ dist-ssr
 # SDD scratch workspace
 .superpowers/
 RESUME.md
+
+# Playwright MCP scratch (render checks)
+.playwright-mcp/
