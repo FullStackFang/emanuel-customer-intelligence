@@ -3,6 +3,7 @@ pub mod config;
 pub mod profile;
 pub mod salesforce;
 pub mod secrets;
+pub mod segment;
 pub mod store;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
