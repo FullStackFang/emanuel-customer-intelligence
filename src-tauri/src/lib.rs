@@ -1,3 +1,5 @@
+pub mod config;
+pub mod secrets;
 pub mod store;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
