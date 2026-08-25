@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod salesforce;
 pub mod secrets;
 pub mod store;
 
