@@ -1,0 +1,8 @@
+/* ============================================================================
+   FONTS — Emanuel Design System
+   The brand ships its webfonts from Google Fonts (as the source app does).
+   DM Sans        → display + body
+   JetBrains Mono → code / IDs / technical labels
+   ============================================================================ */
+
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap");

@@ -1,0 +1,50 @@
+/* ============================================================================
+   COMPONENT-SCOPED TOKENS — Emanuel Design System
+   Named sizing constants the primitives read. Verbatim from source app.
+   ============================================================================ */
+
+:root {
+  /* Buttons */
+  --btn-height-sm: 32px;
+  --btn-height-md: 40px;
+  --btn-height-lg: 48px;
+  --btn-padding-sm: var(--space-2) var(--space-3);
+  --btn-padding-md: var(--space-2) var(--space-4);
+  --btn-padding-lg: var(--space-3) var(--space-6);
+
+  /* Inputs */
+  --input-height-sm: 32px;
+  --input-height-md: 40px;
+  --input-height-lg: 48px;
+  --input-padding: var(--space-2) var(--space-3);
+  --input-border-width: 1px;
+
+  /* Cards */
+  --card-padding: var(--space-6);
+  --card-radius: var(--radius-xl);
+  --card-shadow: var(--shadow-sm);
+  --card-shadow-hover: var(--shadow-md);
+
+  /* Tables */
+  --table-header-bg: var(--color-neutral-50);
+  --table-row-hover: var(--color-neutral-50);
+  --table-border: var(--color-neutral-200);
+
+  /* Modals */
+  --modal-width-sm: 400px;
+  --modal-width-md: 560px;
+  --modal-width-lg: 720px;
+  --modal-width-xl: 900px;
+  --modal-radius: var(--radius-2xl);
+  --modal-shadow: var(--shadow-2xl);
+
+  /* Badges */
+  --badge-padding: var(--space-1) var(--space-2);
+  --badge-radius: var(--radius-full);
+  --badge-font-size: var(--text-xs);
+
+  /* Calendar */
+  --calendar-cell-min-height: 100px;
+  --calendar-event-radius: var(--radius-md);
+  --calendar-today-ring: 2px solid var(--color-primary-400);
+}

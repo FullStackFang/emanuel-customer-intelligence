@@ -1,0 +1,25 @@
+/* ============================================================================
+   BASE LAYER — Emanuel Design System
+   The only element-level rules in the system. Establishes the full-bleed
+   viewport and the height chain that percentage-height app shells depend on.
+   ============================================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}

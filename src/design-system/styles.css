@@ -1,0 +1,16 @@
+/* ============================================================================
+   EMANUEL DESIGN SYSTEM — Global entry point
+   Consumers link this ONE file. It only @imports token, font, and base layers.
+   Never add rules directly here.
+   ============================================================================ */
+
+@import "./tokens/fonts.css";
+@import "./tokens/colors.css";
+@import "./tokens/typography.css";
+@import "./tokens/spacing.css";
+@import "./tokens/radii-shadows.css";
+@import "./tokens/motion.css";
+@import "./tokens/components.css";
+
+/* Base must come last: it consumes the tokens above. */
+@import "./base.css";

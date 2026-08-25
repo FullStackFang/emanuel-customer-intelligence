@@ -1,0 +1,26 @@
+/* ============================================================================
+   MOTION — Emanuel Design System
+   Quick, restrained transitions. The one expressive curve is --ease-bounce,
+   used sparingly (badge pulses). Verbatim from source app.
+   ============================================================================ */
+
+:root {
+  --duration-instant: 0ms;   /* @kind other */
+  --duration-fast:    100ms; /* @kind other */
+  --duration-normal:  200ms; /* @kind other */
+  --duration-slow:    300ms; /* @kind other */
+  --duration-slower:  500ms; /* @kind other */
+
+  --ease-linear: linear;                        /* @kind other */
+  --ease-in:     cubic-bezier(0.4, 0, 1, 1);    /* @kind other */
+  --ease-out:    cubic-bezier(0, 0, 0.2, 1);    /* @kind other */
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);  /* @kind other */
+  --ease-bounce: cubic-bezier(0.68, -0.55, 0.265, 1.55); /* @kind other */
+
+  --transition-colors: color var(--duration-normal) var(--ease-in-out),
+                       background-color var(--duration-normal) var(--ease-in-out),
+                       border-color var(--duration-normal) var(--ease-in-out);
+  --transition-transform: transform var(--duration-normal) var(--ease-out);
+  --transition-shadow:    box-shadow var(--duration-normal) var(--ease-in-out);
+  --transition-all:       all var(--duration-normal) var(--ease-in-out);
+}
