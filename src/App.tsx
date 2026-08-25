@@ -40,7 +40,7 @@ function SignedOut({ onConnected, error }: { onConnected: () => Promise<void>; e
         <img src={logoUrl} alt="Temple Emanu-El" style={{ width: 72, height: 72, marginBottom: "var(--space-4)" }} />
         <h1 style={{ margin: 0, fontFamily: "var(--font-display)", fontSize: "var(--text-2xl)", fontWeight: "var(--font-semibold)",
           letterSpacing: "var(--tracking-tight)", color: "var(--text-primary)" }}>Temple Emanu-El</h1>
-        <div style={{ color: "var(--text-accent)", fontSize: "var(--text-xs)", letterSpacing: "0.18em", textTransform: "uppercase",
+        <div style={{ color: "var(--text-secondary)", fontSize: "var(--text-xs)", letterSpacing: "0.18em", textTransform: "uppercase",
           fontWeight: "var(--font-medium)", marginBottom: "var(--space-6)" }}>Customer Intelligence</div>
         <p style={{ color: "var(--text-secondary)", fontSize: "var(--text-sm)", margin: "0 0 var(--space-6)" }}>
           Sign in with your Salesforce account. The login opens in your browser; this app never sees your password.
