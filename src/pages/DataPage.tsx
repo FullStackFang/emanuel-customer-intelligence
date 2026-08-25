@@ -34,6 +34,7 @@ export default function DataPage({ status, refresh }: PageProps) {
   const [current, setCurrent] = useState<string>("");
   const [search, setSearch] = useState("");
   const [onlyPopulated, setOnlyPopulated] = useState(false);
+  const [sortBy, setSortBy] = useState<"records" | "name">("records");
   const [err, setErr] = useState<string | null>(null);
 
   const loadObjects = useCallback(async () => {
@@ -59,8 +60,11 @@ export default function DataPage({ status, refresh }: PageProps) {
 
   const visibleObjects = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return objects.filter((o) => !q || o.name.toLowerCase().includes(q) || o.label.toLowerCase().includes(q));
-  }, [objects, search]);
+    const filtered = objects.filter((o) => !q || o.name.toLowerCase().includes(q) || o.label.toLowerCase().includes(q));
+    // Records: most rows first; objects with an unavailable count (-1) sink to the bottom.
+    return [...filtered].sort((a, b) =>
+      sortBy === "name" ? a.name.localeCompare(b.name) : b.record_count - a.record_count);
+  }, [objects, search, sortBy]);
   const visibleFields = useMemo(
     () => (onlyPopulated ? fields.filter((f) => (f.fill_rate ?? 0) > 0) : fields),
     [fields, onlyPopulated]);
@@ -81,8 +85,13 @@ export default function DataPage({ status, refresh }: PageProps) {
       {err && <Alert tone="error" style={{ marginBottom: "var(--space-4)" }}>{err}</Alert>}
       <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: "var(--space-4)", alignItems: "start" }}>
         <Card padded={false}>
-          <div style={{ padding: "var(--space-3)", borderBottom: "1px solid var(--border-default)" }}>
+          <div style={{ padding: "var(--space-3)", borderBottom: "1px solid var(--border-default)", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
             <Input placeholder="Search objects" value={search} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)} />
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <span>Sort</span>
+              <Button size="sm" variant={sortBy === "records" ? "primary" : "secondary"} onClick={() => setSortBy("records")}>Records</Button>
+              <Button size="sm" variant={sortBy === "name" ? "primary" : "secondary"} onClick={() => setSortBy("name")}>Name</Button>
+            </div>
           </div>
           <div style={{ maxHeight: "calc(100vh - 320px)", overflowY: "auto" }}>
             {visibleObjects.map((o) => (

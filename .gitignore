@@ -7,6 +7,9 @@
 src-tauri/target/
 src-tauri/gen/schemas/
 
+# local, machine-specific cargo build config (target-dir + perl path)
+.cargo/
+
 # local data (lives in %APPDATA% anyway, belt and braces)
 *.db
 *.db-journal

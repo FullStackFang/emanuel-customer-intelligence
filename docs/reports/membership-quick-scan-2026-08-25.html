@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Membership Quick Scan</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --plane: #f9f9f7;
+    --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7;
+    --deemph: #c3c2b7;
+    --seq100:#cde2fb; --seq200:#9ec5f4; --seq300:#6da7ec; --seq400:#3987e5; --seq500:#256abf; --seq600:#184f95; --seq700:#0d366b;
+    --good: #006300; --bad: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface: #1a1a19; --plane: #0d0d0d;
+      --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9;
+      --deemph: #383835;
+      --good: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --plane: #0d0d0d;
+    --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9;
+    --deemph: #383835;
+    --good: #0ca30c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--plane); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--ink2); margin: 0 0 24px; }
+  h2 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+  .lede { color: var(--ink2); margin: 0 0 16px; font-size: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 20px 20px 16px; margin-bottom: 20px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .kpi { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; }
+  .kpi .l { font-size: 13px; color: var(--ink2); }
+  .kpi .v { font-size: 30px; font-weight: 600; line-height: 1.15; margin-top: 2px; }
+  .kpi .d { font-size: 13px; color: var(--ink2); margin-top: 2px; }
+  .kpi .d.up { color: var(--good); } .kpi .d.down { color: var(--bad); }
+  .so { margin: 12px 0 0; padding: 10px 12px; background: var(--plane); border-radius: 8px; font-size: 14px; }
+  .so b { font-weight: 600; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .axis text, .lbl { font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); }
+  .lbl.ink { fill: var(--ink2); }
+  .lbl.strong { fill: var(--ink); font-weight: 600; }
+  .grid line { stroke: var(--grid); stroke-width: 1; }
+  .baseline { stroke: var(--axis); stroke-width: 1; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--ink2); margin: 6px 0 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .sw.line { height: 3px; border-radius: 2px; width: 16px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--ink2); font-size: 13px; }
+  table { border-collapse: collapse; font-size: 13px; margin-top: 8px; width: 100%; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink2); font-weight: 500; }
+  .tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface); font-size: 12px; padding: 6px 8px; border-radius: 6px; opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 9; }
+  .hit { fill: transparent; }
+  .hm { display: grid; gap: 2px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .hm .h { color: var(--muted); text-align: center; padding: 2px 0; }
+  .hm .r { color: var(--ink2); text-align: right; padding-right: 8px; align-self: center; }
+  .hm .c { height: 30px; border-radius: 4px; display: flex; align-items: center; justify-content: center; }
+  .hm .c.empty { background: transparent; }
+  .scale { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .scale .bar { flex: 0 0 160px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--seq100), var(--seq700)); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 820px) { .two { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Membership Quick Scan</h1>
+  <p class="sub">Temple Emanu-El · household level · fiscal years run June 1 – May 31 and are labeled by the year they end (FY2025 = June 2024 – May 2025). Read from the local encrypted mirror on 25 Aug 2026. Aggregates only.</p>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card">
+    <h2>Membership is flat; the FY2024 join wave has not held</h2>
+    <p class="lede">Active member households at the end of each fiscal year (left) and the joins and resignations that produced them (right).</p>
+    <div class="two">
+      <div><div id="c_active"></div></div>
+      <div><div class="legend"><span><i class="sw" style="background:var(--s1)"></i>Joins</span><span><i class="sw" style="background:var(--s2)"></i>Resignations</span></div><div id="c_flows"></div></div>
+    </div>
+    <p class="so"><b>So what:</b> after a decade near 2,450–2,600 households, FY2024 brought a record 374 joins — but resignations then rose to 328 (FY2025) and 306 (FY2026), the two highest years in the period, and the net gain was given back.</p>
+    <details><summary>Table view</summary><div id="t_flows"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>First-year retention collapsed for the two newest cohorts</h2>
+    <p class="lede">Of households that joined in each fiscal year, the share still members one year later. Every cohort from 2010 to 2023 kept 84–91% through year one.</p>
+    <div id="c_y1"></div>
+    <p class="so"><b>So what:</b> the FY2024 cohort kept only <b>69%</b> and FY2025 only <b>67%</b> — roughly double the historical first-year loss. Whatever brought the 2024–25 wave in (introductory tiers, a campaign, a pricing change) is not converting to a second year. This is the single most important thing to investigate.</p>
+    <details><summary>Table view</summary><div id="t_y1"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>Cohort retention over time</h2>
+    <p class="lede">Each row is a join-year cohort; each cell is the share still members after that many years. Darker = more retained. Blank cells are years that haven't happened yet.</p>
+    <div id="c_heat"></div>
+    <div class="scale"><span>30%</span><div class="bar"></div><span>90%</span></div>
+    <p class="so"><b>So what:</b> the 2014–2017 cohorts were the stickiest in the period (57–70% still members after five years); the 2018–2021 cohorts slipped back to 43–55%. Five-year retention has drifted down for recent cohorts even before the 2024 shock.</p>
+    <details><summary>Table view</summary><div id="t_heat"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>Joining <em>for</em> religious school is not stickier — it's below average</h2>
+    <p class="lede">Households that joined in FY2014–FY2022 (so every one has had at least three full years) and recorded a reason for joining. Share still members today, by stated reason; a household counts under every reason it named.</p>
+    <div class="legend"><span><i class="sw" style="background:var(--s1)"></i>School-driven joins</span><span><i class="sw" style="background:var(--deemph)"></i>Other reasons</span></div>
+    <div id="c_channel"></div>
+    <p class="so"><b>So what:</b> across 1,400 recent joiners, households drawn in by clergy, Streicker, or family ties are the most durable (55–65%). Joining because of <b>religious school</b> retains <b>37%</b> — below the 41% for a plain "affiliation" — and <b>nursery school</b> is the weakest entry point at <b>26%</b>. The hypothesis that school families are stickier is not supported at the point of joining.</p>
+    <details><summary>Table view</summary><div id="t_channel"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>…but families whose children actually <em>go through</em> religious school do stay</h2>
+    <p class="lede">Same FY2014–FY2022 joiners, grouped by whether the household ever had a child enrolled (any join reason). Single measure, so one color.</p>
+    <div id="c_school"></div>
+    <p class="so"><b>So what:</b> households with a child who went through religious school retain <b>48%</b> versus 40% with no school history — and families that did <b>both</b> nursery and religious school retain <b>68%</b>. Nursery-school-only families are the flight risk (34%). The practical read: nursery school is the entry door and religious school is the retention engine; the leak is families who don't make the transition between them.</p>
+    <details><summary>Table view</summary><div id="t_school"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>Why people leave: non-payment has become the #1 reason</h2>
+    <p class="lede">Coded resignation reasons by fiscal year (reason coding is reliable from FY2021). Stacked so the height is total coded resignations.</p>
+    <div class="legend" id="lg_reasons"></div>
+    <div id="c_reasons"></div>
+    <p class="so"><b>So what:</b> "non-payment" — quiet non-renewal rather than an explicit decision — went from 5 in FY2021 to 107 in FY2025 and 90 in FY2026. Together with the rising first-year losses above, this points at renewal friction and lapsed introductory memberships rather than people actively choosing to leave. Moves (~50–70/yr) and the young-adult tier aging out (~25–33/yr) are steady, structural losses.</p>
+    <details><summary>Table view</summary><div id="t_reasons"></div></details>
+  </div>
+
+  <div class="card">
+    <h2>What to do with this</h2>
+    <p class="lede" style="margin-bottom:8px">Where the data points next — the questions worth building into the app as live, repeatable views:</p>
+    <ol style="margin:0; padding-left: 20px; font-size:14px; color: var(--ink2)">
+      <li><b style="color:var(--ink)">Diagnose the FY2024–25 first-year churn.</b> Split those cohorts by tier (Young Professionals / Downtown introductory vs. Voting) and by join reason; the billing statements will show whether they were ever invoiced for year two.</li>
+      <li><b style="color:var(--ink)">Track the nursery → religious school hand-off.</b> Per-year enrollment (Class Enrollment object) makes "did this NS family enroll in RS?" and "how many years after the last RS year did they leave?" exact.</li>
+      <li><b style="color:var(--ink)">Turn non-payment into an at-risk list.</b> Households billed but unpaid this fiscal year, before they become next year's resignations.</li>
+      <li><b style="color:var(--ink)">Watch the young-adult tier conversion.</b> ~30 households/yr age out; how many convert to Voting membership vs. lapse?</li>
+    </ol>
+    <p class="note">Caveats: pre-2019 dates come from the legacy iMIS migration; 294 records with placeholder join dates were excluded; "still members" uses the current membership flag, so recent cohorts have had less time to churn (their year-1 figures are directly comparable, later years are not).</p>
+  </div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+const D = {
+  flows: [[2005,114,188,2851],[2006,225,167,2909],[2007,173,350,2733],[2008,276,175,2834],[2009,178,219,2794],[2010,170,247,2717],[2011,164,286,2594],[2012,164,196,2562],[2013,154,228,2489],[2014,185,199,2475],[2015,185,208,2452],[2016,174,136,2490],[2017,184,143,2530],[2018,170,168,2532],[2019,188,133,2587],[2020,201,193,2595],[2021,65,222,2440],[2022,155,173,2422],[2023,172,172,2423],[2024,374,239,2559],[2025,321,328,2552],[2026,244,306,2490]],
+  cohort: {
+    2010:[88.8,74.7,62.4,55.9,49.4,45.9,40,37.6],2011:[84.8,65.9,59.1,49.4,45.7,43.9,40.2,39.6],2012:[86,67.1,59.8,56.7,54.9,49.4,46.3,43.3],2013:[85.7,69.5,64.3,59.1,52.6,49.4,49.4,46.8],2014:[90.3,80.5,77.8,66.5,61.6,56.8,53.5,50.8],2015:[90.8,88.1,80,75.1,69.7,62.7,58.9,56.8],2016:[85.6,77.6,70.1,62.6,56.9,53.4,51.7,48.9],2017:[90.8,83.2,76.1,71.7,66.3,64.1,59.8,57.1],2018:[87.6,77.1,66.5,54.1,50.6,48.2,45.9,41.8],2019:[86.7,71.3,62.2,56.4,48.9,40.4,36.7],2020:[87.6,78.1,72.1,63.7,55.2,48.3],2021:[87.7,73.8,56.9,49.2,43.1],2022:[84.5,77.4,60.6,51],2023:[83.7,64.5,54.7],2024:[69,56.7],2025:[66.7]
+  },
+  cohortN: {2010:170,2011:164,2012:164,2013:154,2014:185,2015:185,2016:174,2017:184,2018:170,2019:188,2020:201,2021:65,2022:155,2023:172,2024:374,2025:321},
+  channel: [["Clergy",76,49,64.5],["Streicker",52,29,55.8],["To be with family",99,54,54.5],["Community",23,11,47.8],["Life cycle event",85,36,42.4],["Worship services",168,70,41.7],["Affiliation",404,165,40.8],["High Holy Day tickets",55,22,40],["Move or relocation",63,25,39.7],["Religious school",252,93,36.9],["Nursery school",122,32,26.2]],
+  school: [["Both nursery and religious school",98,67,68.4],["Religious school family",209,100,47.8],["No school history",1115,443,39.7],["Nursery school family",85,29,34.1]],
+  reasonsFY: [2021,2022,2023,2024,2025,2026],
+  reasons: [
+    ["Non-payment",[5,38,6,69,107,90]],
+    ["Moved",[71,44,52,45,67,51]],
+    ["No longer engaged",[28,12,19,32,47,42]],
+    ["Deceased",[20,23,24,30,23,30]],
+    ["Young-adult tier aged out",[28,17,23,24,30,33]],
+    ["Joined another synagogue",[10,11,2,14,18,23]],
+    ["Other / not coded",[57,28,36,25,25,37]]
+  ]
+};
+const tip = document.getElementById('tip');
+function showTip(e, html){ tip.innerHTML = html; tip.style.opacity = 1; moveTip(e); }
+function moveTip(e){ tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY - 28) + 'px'; }
+function hideTip(){ tip.style.opacity = 0; }
+const fmt = n => n.toLocaleString();
+const S = (tag, attrs={}, kids=[]) => { const el = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const k in attrs) el.setAttribute(k, attrs[k]); kids.forEach(c => el.appendChild(c)); return el; };
+const T = (x,y,txt,cls='lbl',anchor='middle',extra={}) => { const t = S('text', {x,y,'text-anchor':anchor,class:cls,...extra}); t.textContent = txt; return t; };
+function niceMax(v){ const p = Math.pow(10, Math.floor(Math.log10(v))); const r = v / p; const m = r <= 1 ? 1 : r <= 2 ? 2 : r <= 2.5 ? 2.5 : r <= 4 ? 4 : r <= 5 ? 5 : 10; return m * p; }
+
+// KPIs
+(function(){
+  const last = D.flows[D.flows.length-1], prev = D.flows[D.flows.length-2];
+  const net = last[3]-prev[3];
+  const y1 = D.cohort[2025][0], y1hist = 87.4;
+  const kp = [
+    ['Member households, end FY2026', fmt(last[3]), (net>=0?'+':'')+net+' vs FY2025', net>=0?'up':'down'],
+    ['Joins in FY2026', fmt(last[1]), '374 in FY2024, 321 in FY2025', ''],
+    ['Resignations in FY2026', fmt(last[2]), '2nd-highest year in the period', 'down'],
+    ['First-year retention, FY2025 cohort', y1+'%', 'vs '+y1hist+'% average for 2010–2023 cohorts', 'down'],
+    ['Nursery-school-only joiners retained', '26%', 'lowest of any join channel', 'down'],
+  ];
+  document.getElementById('kpis').innerHTML = kp.map(k => `<div class="kpi"><div class="l">${k[0]}</div><div class="v">${k[1]}</div><div class="d ${k[3]}">${k[2]}</div></div>`).join('');
+})();
+
+// Generic line chart (single series, emphasis-free)
+function lineChart(id, pts, {ymin=0, ymax, w=520, h=260, color='var(--s1)', label, unit=''}){
+  const m = {t:16,r:44,b:32,l:44}; const iw = w-m.l-m.r, ih = h-m.t-m.b;
+  const xs = pts.map(p=>p[0]); const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  ymax = ymax ?? niceMax(Math.max(...pts.map(p=>p[1])));
+  const X = x => m.l + (x-x0)/(x1-x0)*iw, Y = y => m.t + ih - (y-ymin)/(ymax-ymin)*ih;
+  const svg = S('svg', {viewBox:`0 0 ${w} ${h}`});
+  const grid = S('g',{class:'grid'}); const ticks = 4;
+  for (let i=0;i<=ticks;i++){ const y = ymin + (ymax-ymin)*i/ticks; grid.appendChild(S('line',{x1:m.l,x2:m.l+iw,y1:Y(y),y2:Y(y)})); svg.appendChild(T(m.l-8, Y(y)+4, fmt(Math.round(y)), 'lbl', 'end')); }
+  svg.appendChild(grid);
+  svg.appendChild(S('line',{class:'baseline',x1:m.l,x2:m.l+iw,y1:Y(ymin),y2:Y(ymin)}));
+  const ax = S('g',{class:'axis'}); xs.forEach((x,i)=>{ if (i%3===0 || i===xs.length-1) ax.appendChild(T(X(x), h-10, x)); }); svg.appendChild(ax);
+  const d = pts.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join(' ');
+  svg.appendChild(S('path',{d, fill:'none', stroke:color, 'stroke-width':2, 'stroke-linejoin':'round', 'stroke-linecap':'round'}));
+  const end = pts[pts.length-1];
+  svg.appendChild(S('circle',{cx:X(end[0]),cy:Y(end[1]),r:5,fill:color,stroke:'var(--surface)','stroke-width':2}));
+  svg.appendChild(T(X(end[0])+8, Y(end[1])+4, fmt(end[1])+unit, 'lbl strong', 'start'));
+  // hover layer
+  const cross = S('line',{stroke:'var(--axis)','stroke-width':1, y1:m.t, y2:m.t+ih, opacity:0});
+  const dot = S('circle',{r:5,fill:color,stroke:'var(--surface)','stroke-width':2,opacity:0});
+  svg.appendChild(cross); svg.appendChild(dot);
+  const hit = S('rect',{class:'hit',x:m.l,y:m.t,width:iw,height:ih});
+  hit.addEventListener('mousemove', e => { const r = svg.getBoundingClientRect(); const px = (e.clientX - r.left) * w / r.width; let best = pts[0]; for (const p of pts) if (Math.abs(X(p[0])-px) < Math.abs(X(best[0])-px)) best = p; cross.setAttribute('x1',X(best[0])); cross.setAttribute('x2',X(best[0])); cross.setAttribute('opacity',1); dot.setAttribute('cx',X(best[0])); dot.setAttribute('cy',Y(best[1])); dot.setAttribute('opacity',1); showTip(e, `<b>FY${best[0]}</b> · ${label}: ${fmt(best[1])}${unit}`); });
+  hit.addEventListener('mouseleave', () => { cross.setAttribute('opacity',0); dot.setAttribute('opacity',0); hideTip(); });
+  svg.appendChild(hit);
+  document.getElementById(id).appendChild(svg);
+}
+
+// Grouped columns (2 series), thin marks, 2px surface gap
+function groupedColumns(id, cats, series, {w=520,h=260, ymax}){
+  const m = {t:16,r:12,b:32,l:44}; const iw = w-m.l-m.r, ih = h-m.t-m.b;
+  ymax = ymax ?? niceMax(Math.max(...series.flatMap(s=>s.v)));
+  const Y = y => m.t + ih - y/ymax*ih; const band = iw/cats.length; const bw = Math.min(10, (band-6)/series.length);
+  const svg = S('svg',{viewBox:`0 0 ${w} ${h}`});
+  const grid = S('g',{class:'grid'}); for (let i=0;i<=4;i++){ const y=ymax*i/4; grid.appendChild(S('line',{x1:m.l,x2:m.l+iw,y1:Y(y),y2:Y(y)})); svg.appendChild(T(m.l-8,Y(y)+4,fmt(Math.round(y)),'lbl','end')); } svg.appendChild(grid);
+  svg.appendChild(S('line',{class:'baseline',x1:m.l,x2:m.l+iw,y1:Y(0),y2:Y(0)}));
+  const ax = S('g',{class:'axis'}); cats.forEach((c,i)=>{ if (i%3===0||i===cats.length-1) ax.appendChild(T(m.l+band*(i+.5), h-10, c)); }); svg.appendChild(ax);
+  cats.forEach((c,i)=>{ const gx = m.l + band*(i+.5) - (series.length*bw + (series.length-1)*2)/2;
+    series.forEach((s,j)=>{ const v = s.v[i]; const x = gx + j*(bw+2); const y = Y(v); const hh = Y(0)-y;
+      const r = S('path',{d:`M${x} ${Y(0)} V${y+4} a4 4 0 0 1 4 -4 h${bw-8} a4 4 0 0 1 4 4 V${Y(0)} Z`, fill:s.color});
+      r.addEventListener('mousemove', e=>showTip(e,`<b>FY${c}</b> · ${s.name}: ${fmt(v)}`)); r.addEventListener('mouseleave',hideTip);
+      svg.appendChild(r); }); });
+  document.getElementById(id).appendChild(svg);
+}
+
+// Single-series columns with emphasis on selected categories, direct labels on emphasized
+function emphasisColumns(id, cats, vals, emph, {w=1040,h=260, unit='%', ymax=100, label}){
+  const m = {t:20,r:12,b:32,l:40}; const iw = w-m.l-m.r, ih = h-m.t-m.b;
+  const Y = y => m.t + ih - y/ymax*ih; const band = iw/cats.length; const bw = Math.min(24, band*0.6);
+  const svg = S('svg',{viewBox:`0 0 ${w} ${h}`});
+  const grid = S('g',{class:'grid'}); for (let i=0;i<=4;i++){ const y=ymax*i/4; grid.appendChild(S('line',{x1:m.l,x2:m.l+iw,y1:Y(y),y2:Y(y)})); svg.appendChild(T(m.l-8,Y(y)+4,y+unit,'lbl','end')); } svg.appendChild(grid);
+  svg.appendChild(S('line',{class:'baseline',x1:m.l,x2:m.l+iw,y1:Y(0),y2:Y(0)}));
+  const ax = S('g',{class:'axis'}); cats.forEach((c,i)=>ax.appendChild(T(m.l+band*(i+.5), h-10, c))); svg.appendChild(ax);
+  cats.forEach((c,i)=>{ const v = vals[i]; const x = m.l + band*(i+.5) - bw/2; const y = Y(v); const e = emph.includes(c);
+    const r = S('path',{d:`M${x} ${Y(0)} V${y+4} a4 4 0 0 1 4 -4 h${bw-8} a4 4 0 0 1 4 4 V${Y(0)} Z`, fill: e ? 'var(--s1)' : 'var(--deemph)'});
+    r.addEventListener('mousemove', ev=>showTip(ev,`<b>FY${c} cohort</b> · ${label}: ${v}${unit}`)); r.addEventListener('mouseleave',hideTip);
+    svg.appendChild(r); if (e) svg.appendChild(T(x+bw/2, y-6, v+unit, 'lbl strong')); });
+  document.getElementById(id).appendChild(svg);
+}
+
+// Horizontal bars, emphasis on some rows, value at tip
+function hbars(id, rows, emphIdx, {w=1040, color='var(--s1)', unit='%', max=100, deemph=true}){
+  const rh = 26, m = {t:6,r:60,b:6,l:220}; const h = m.t+m.b+rows.length*rh; const iw = w-m.l-m.r;
+  const svg = S('svg',{viewBox:`0 0 ${w} ${h}`});
+  rows.forEach((r,i)=>{ const y = m.t + i*rh; const v = r[3]; const wv = v/max*iw; const e = !deemph || emphIdx.includes(i);
+    svg.appendChild(T(m.l-10, y+rh/2+4, r[0], 'lbl ink', 'end'));
+    const bar = S('path',{d:`M${m.l} ${y+5} h${Math.max(wv-4,0)} a4 4 0 0 1 4 4 v${rh-14-4} a4 4 0 0 1 -4 4 H${m.l} Z`, fill: e ? color : 'var(--deemph)'});
+    bar.addEventListener('mousemove', ev=>showTip(ev,`<b>${r[0]}</b> · ${r[2]} of ${r[1]} households still members (${v}${unit})`)); bar.addEventListener('mouseleave',hideTip);
+    svg.appendChild(bar);
+    svg.appendChild(T(m.l+wv+8, y+rh/2+4, v+unit, e ? 'lbl strong' : 'lbl ink', 'start')); });
+  svg.appendChild(S('line',{class:'baseline',x1:m.l,x2:m.l,y1:m.t,y2:h-m.b}));
+  document.getElementById(id).appendChild(svg);
+}
+
+// Stacked columns, categorical, 2px gaps
+function stackedColumns(id, cats, series, {w=1040,h=300}){
+  const m = {t:16,r:12,b:32,l:44}; const iw = w-m.l-m.r, ih = h-m.t-m.b;
+  const totals = cats.map((_,i)=>series.reduce((a,s)=>a+s.v[i],0)); const ymax = niceMax(Math.max(...totals));
+  const Y = y => m.t + ih - y/ymax*ih; const band = iw/cats.length; const bw = Math.min(24, band*0.5);
+  const svg = S('svg',{viewBox:`0 0 ${w} ${h}`});
+  const grid = S('g',{class:'grid'}); for (let i=0;i<=4;i++){ const y=ymax*i/4; grid.appendChild(S('line',{x1:m.l,x2:m.l+iw,y1:Y(y),y2:Y(y)})); svg.appendChild(T(m.l-8,Y(y)+4,fmt(Math.round(y)),'lbl','end')); } svg.appendChild(grid);
+  svg.appendChild(S('line',{class:'baseline',x1:m.l,x2:m.l+iw,y1:Y(0),y2:Y(0)}));
+  const ax = S('g',{class:'axis'}); cats.forEach((c,i)=>ax.appendChild(T(m.l+band*(i+.5), h-10, 'FY'+c))); svg.appendChild(ax);
+  cats.forEach((c,i)=>{ let acc = 0; const x = m.l + band*(i+.5) - bw/2;
+    series.forEach((s,j)=>{ const v = s.v[i]; if (!v) return; const y0 = Y(acc), y1 = Y(acc+v); const top = j===series.length-1;
+      const d = top ? `M${x} ${y0} V${y1+4} a4 4 0 0 1 4 -4 h${bw-8} a4 4 0 0 1 4 4 V${y0} Z` : `M${x} ${y0} V${y1+1} H${x+bw} V${y0} Z`;
+      const seg = S('path',{d, fill:s.color}); seg.addEventListener('mousemove', ev=>showTip(ev,`<b>FY${c}</b> · ${s.name}: ${v} of ${totals[i]}`)); seg.addEventListener('mouseleave',hideTip);
+      svg.appendChild(seg); acc += v; });
+    svg.appendChild(T(x+bw/2, Y(totals[i])-6, totals[i], 'lbl ink')); });
+  document.getElementById(id).appendChild(svg);
+}
+
+function table(id, head, rows){ document.getElementById(id).innerHTML = `<table><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+
+// 1. Active + flows
+lineChart('c_active', D.flows.map(r=>[r[0],r[3]]), {ymin:2000, ymax:3000, label:'Active households'});
+groupedColumns('c_flows', D.flows.map(r=>r[0]), [{name:'Joins',v:D.flows.map(r=>r[1]),color:'var(--s1)'},{name:'Resignations',v:D.flows.map(r=>r[2]),color:'var(--s2)'}], {ymax:400});
+table('t_flows', ['Fiscal year','Joins','Resignations','Active at year end'], D.flows.map(r=>[`FY${r[0]}`,fmt(r[1]),fmt(r[2]),fmt(r[3])]));
+
+// 2. Year-1 retention
+const cohorts = Object.keys(D.cohort).map(Number);
+emphasisColumns('c_y1', cohorts, cohorts.map(c=>D.cohort[c][0]), [2024,2025], {label:'retained after 1 year'});
+table('t_y1', ['Join cohort','Households','Still members after 1 year'], cohorts.map(c=>[`FY${c}`, fmt(D.cohortN[c]), D.cohort[c][0]+'%']));
+
+// 3. Heatmap (CSS grid, sequential ramp)
+(function(){
+  const ks = [1,2,3,4,5,6,7,8]; const steps = ['--seq100','--seq200','--seq300','--seq400','--seq500','--seq600','--seq700'];
+  const col = v => { const t = Math.max(0, Math.min(1, (v-30)/60)); return `var(${steps[Math.round(t*(steps.length-1))]})`; };
+  const ink = v => ((v-30)/60) > 0.55 ? '#ffffff' : 'var(--ink)';
+  const el = document.getElementById('c_heat'); el.className = 'hm'; el.style.gridTemplateColumns = `90px repeat(${ks.length}, 1fr)`;
+  el.innerHTML = `<div class="h"></div>` + ks.map(k=>`<div class="h">${k} yr${k>1?'s':''}</div>`).join('') +
+    cohorts.map(c => `<div class="r">FY${c} <span style="color:var(--muted)">(${D.cohortN[c]})</span></div>` + ks.map(k => { const v = D.cohort[c][k-1]; return v==null ? `<div class="c empty"></div>` : `<div class="c" style="background:${col(v)};color:${ink(v)}" data-tip="FY${c} cohort · ${v}% still members after ${k} year${k>1?'s':''}">${Math.round(v)}%</div>`; }).join('')).join('');
+  el.querySelectorAll('[data-tip]').forEach(c => { c.addEventListener('mousemove', e=>showTip(e, c.dataset.tip)); c.addEventListener('mouseleave', hideTip); });
+  table('t_heat', ['Cohort','N', ...ks.map(k=>k+' yr')], cohorts.map(c=>[`FY${c}`, fmt(D.cohortN[c]), ...ks.map(k=>D.cohort[c][k-1]==null?'':D.cohort[c][k-1]+'%')]));
+})();
+
+// 4. Channel stickiness (emphasis on school channels)
+hbars('c_channel', D.channel, [9,10], {});
+table('t_channel', ['Stated join reason','Households (FY2014–22 joiners)','Still members','Share'], D.channel.map(r=>[r[0],fmt(r[1]),fmt(r[2]),r[3]+'%']));
+
+// 5. School history (single series, one color)
+hbars('c_school', D.school, [], {deemph:false});
+table('t_school', ['School history','Households (FY2014–22 joiners)','Still members','Share'], D.school.map(r=>[r[0],fmt(r[1]),fmt(r[2]),r[3]+'%']));
+
+// 6. Resign reasons stacked (7 series incl. Other — fixed slot order)
+(function(){
+  const cols = ['var(--s1)','var(--s2)','var(--s3)','var(--s4)','var(--s5)','var(--s6)','var(--s7)'];
+  const series = D.reasons.map((r,i)=>({name:r[0], v:r[1], color: i===6 ? 'var(--deemph)' : cols[i]}));
+  document.getElementById('lg_reasons').innerHTML = series.map(s=>`<span><i class="sw" style="background:${s.color}"></i>${s.name}</span>`).join('');
+  stackedColumns('c_reasons', D.reasonsFY, series, {});
+  table('t_reasons', ['Reason', ...D.reasonsFY.map(f=>'FY'+f)], D.reasons.map(r=>[r[0], ...r[1]]));
+})();
+</script>
+</body>
+</html>
