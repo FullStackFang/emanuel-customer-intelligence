@@ -15,7 +15,7 @@ const TONES = {
  * Ported adaptation: icon rendering delegates to the Icon wrapper
  * (lucide-react) instead of the design project's window.lucide UMD build.
  */
-export function Alert({ tone = 'info', title, icon, children, style = {}, ...rest }) {
+export function Alert({ tone = 'info', title = undefined, icon = undefined, children, style = {}, ...rest }) {
   const t = TONES[tone] || TONES.info;
 
   return (
