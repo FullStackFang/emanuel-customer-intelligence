@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod commands;
 pub mod config;
 pub mod profile;
 pub mod salesforce;
@@ -6,17 +7,48 @@ pub mod secrets;
 pub mod segment;
 pub mod store;
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+use commands::AppState;
+use std::sync::Mutex;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let cfg = config::Config::from_env().expect("configuration: set SF_CLIENT_ID in .env");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .setup(move |app| {
+            let db_path = app.path().app_data_dir()?.join("mirror.db");
+            app.manage(AppState {
+                cfg: cfg.clone(),
+                secrets: secrets::Secrets::default_service(),
+                db_path,
+                store: Mutex::new(None),
+                identity: Mutex::new(None),
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_status,
+            commands::connect,
+            commands::disconnect,
+            commands::scan,
+            commands::list_objects,
+            commands::set_object_selected,
+            commands::list_fields,
+            commands::set_field_withheld,
+            commands::sync_selected,
+            commands::profile_selected,
+            commands::query_segment,
+            commands::get_audit,
+            commands::purge_local_data,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
