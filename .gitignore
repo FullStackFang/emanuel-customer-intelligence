@@ -1,0 +1,16 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+
+# node
+node_modules/
+dist/
+
+# tauri / rust
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# local data (lives in %APPDATA% anyway, belt and braces)
+*.db
+*.db-journal
