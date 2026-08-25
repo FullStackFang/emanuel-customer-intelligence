@@ -22,6 +22,10 @@ Design: `docs/superpowers/specs/2026-08-25-customer-intelligence-v1-design.md`
 - Tokens and the database key live in Windows Credential Manager. The mirror
   (`%APPDATA%\org.emanuelnyc.customerintelligence\mirror.db`) is SQLCipher-encrypted.
 - `_audit` is append-only: there is no code path that edits or deletes it.
+- SQLCipher's `cipher_memory_security` in-memory hardening is disabled (off-by-default in
+  SQLCipher 4.x and crashes on Windows in this setup), an accepted residual risk that
+  decrypted pages or the key could in principle reach the Windows pagefile, mitigated by
+  full-disk encryption.
 
 ## Verify
 `npm run typecheck && npm test && (cd src-tauri && cargo test)`

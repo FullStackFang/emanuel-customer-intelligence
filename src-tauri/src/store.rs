@@ -164,7 +164,8 @@ impl Store {
             "INSERT INTO _fields(object, field, sf_type, label, sensitive, withheld)
              VALUES(?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(object, field) DO UPDATE SET
-               sf_type = excluded.sf_type, label = excluded.label, sensitive = excluded.sensitive",
+               sf_type = excluded.sf_type, label = excluded.label, sensitive = excluded.sensitive,
+               withheld = CASE WHEN _fields.sensitive = 0 AND excluded.sensitive = 1 THEN 1 ELSE _fields.withheld END",
             params![object, field, sf_type, label, sensitive as i64],
         )?;
         Ok(())
@@ -440,6 +441,27 @@ mod tests {
             vec!["Email".to_string()]
         );
         assert!(!s.set_field_withheld("Contact", "Email", true).unwrap());
+    }
+
+    #[test]
+    fn upsert_field_rewithholds_on_non_sensitive_to_sensitive_transition() {
+        let (_d, s) = mem();
+        s.upsert_object("Contact", "Contact", 1).unwrap();
+        // First scan: field is non-sensitive, so withheld defaults to 0.
+        s.upsert_field("Contact", "Mobile__c", "string", "Mobile", false)
+            .unwrap();
+        let f = s.list_fields("Contact").unwrap();
+        assert!(!f.iter().find(|x| x.field == "Mobile__c").unwrap().withheld);
+        // Second scan: same field is now classified sensitive.
+        s.upsert_field("Contact", "Mobile__c", "string", "Mobile", true)
+            .unwrap();
+        let f = s.list_fields("Contact").unwrap();
+        let mobile = f.iter().find(|x| x.field == "Mobile__c").unwrap();
+        assert!(mobile.sensitive);
+        assert!(
+            mobile.withheld,
+            "must re-withhold on non-sensitive -> sensitive transition"
+        );
     }
 
     #[test]

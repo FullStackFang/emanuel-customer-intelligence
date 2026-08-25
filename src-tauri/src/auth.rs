@@ -166,7 +166,10 @@ pub async fn login(cfg: &Config, secrets: &Secrets) -> Result<(TokenSet, Identit
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(anyhow!("token exchange failed ({status}): {body}"));
+        return Err(anyhow!(
+            "token exchange failed ({status}): {}",
+            body.chars().take(300).collect::<String>()
+        ));
     }
     let tr: TokenResponse = serde_json::from_str(&body).context("token response")?;
     let tokens = TokenSet {

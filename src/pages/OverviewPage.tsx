@@ -14,11 +14,11 @@ function nextStep(s: api.StatusView): Step {
 }
 
 const STEP_COPY: Record<Step, { title: string; body: string; button: string | null }> = {
-  scan: { title: "Scan your org", body: "Reads object and field names only. No records are copied.", button: "Scan Metadata" },
+  scan: { title: "Scan your org", body: "Reads object and field names only. No records are copied.", button: "Scan metadata" },
   select: { title: "Choose objects to mirror", body: "Nothing is copied until you select objects on the Data page.", button: null },
-  sync: { title: "Sync selected objects", body: "Copies the selected objects into the encrypted local mirror, minus withheld fields.", button: "Sync Now" },
+  sync: { title: "Sync selected objects", body: "Copies the selected objects into the encrypted local mirror, minus withheld fields.", button: "Sync now" },
   profile: { title: "Profile columns", body: "Compute fill rates and top values so you can see which fields carry signal.", button: "Profile" },
-  ready: { title: "Data is ready", body: "Re-sync any time to refresh the mirror. Profiling runs automatically after each sync.", button: "Sync Again" },
+  ready: { title: "Data is ready", body: "Re-sync any time to refresh the mirror. Profiling runs automatically after each sync.", button: "Sync again" },
 };
 
 export default function OverviewPage({ status, refresh }: PageProps) {
@@ -59,7 +59,7 @@ export default function OverviewPage({ status, refresh }: PageProps) {
   return (
     <div style={{ maxWidth: 1100 }}>
       <PageTitle eyebrow="Customer Intelligence" title="Overview" actions={
-        <Button variant="secondary" disabled={busy !== null} onClick={doScan}>Rescan Metadata</Button>
+        <Button variant="secondary" disabled={busy !== null} onClick={doScan}>Rescan metadata</Button>
       } />
 
       {notice && <Alert tone={notice.tone} style={{ marginBottom: "var(--space-6)" }}>{notice.text}</Alert>}
@@ -88,7 +88,7 @@ export default function OverviewPage({ status, refresh }: PageProps) {
           </p>
           <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
             <Button variant="secondary" disabled={busy !== null} onClick={() => run("disconnect", async () => { await api.disconnect(); return "Disconnected."; })}>Disconnect</Button>
-            <Button variant="danger" disabled={busy !== null || status.synced_rows === 0} onClick={() => setConfirmPurge(true)}>Purge Local Data</Button>
+            <Button variant="danger" disabled={busy !== null || status.synced_rows === 0} onClick={() => setConfirmPurge(true)}>Purge local data</Button>
           </div>
         </Card>
       </div>
