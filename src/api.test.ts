@@ -36,12 +36,14 @@ describe("api wrappers map 1:1 to Rust commands", () => {
     await api.getAtRisk();
     await api.exportInsightsCsv("trend");
     await api.revealExport("C:\\x\\exports\\a.csv");
+    await api.exportInsightsPdf(true);
     expect(invoke.mock.calls).toEqual([
       ["get_insights", { forceRebuild: false }],
       ["get_insights", { forceRebuild: true }],
       ["get_at_risk"],
       ["export_insights_csv", { view: "trend" }],
       ["reveal_export", { path: "C:\\x\\exports\\a.csv" }],
+      ["export_insights_pdf", { includeAtRisk: true }],
     ]);
     expect([...api.INSIGHT_VIEWS]).toEqual(["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"]);
   });

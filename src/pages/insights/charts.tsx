@@ -32,9 +32,9 @@ export interface TableProps<T> {
 }
 export const TypedTable = Table as unknown as <T>(props: TableProps<T>) => React.JSX.Element;
 
-export function TableView<T>(props: TableProps<T>) {
+export function TableView<T>({ forceOpen, ...props }: TableProps<T> & { forceOpen?: boolean }) {
   return (
-    <details style={{ marginTop: "var(--space-3)" }}>
+    <details open={forceOpen || undefined} style={{ marginTop: "var(--space-3)" }}>
       <summary style={{ cursor: "pointer", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>Table view</summary>
       <div style={{ marginTop: "var(--space-2)" }}><TypedTable {...props} /></div>
     </details>

@@ -1,0 +1,8 @@
+/* Applied by WebView2 PrintToPdf (print media) and by the browser print path. */
+@media print {
+  header, nav { display: none !important; }
+  html, body, #root, main { height: auto !important; overflow: visible !important; }
+  main { padding: 0 !important; }
+  .insights-report-card { break-inside: avoid; page-break-inside: avoid; }
+  details > summary { display: none; }
+}

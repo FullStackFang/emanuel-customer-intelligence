@@ -68,6 +68,8 @@ export const getInsights = (forceRebuild = false) => invoke<Insights>("get_insig
 export const getAtRisk = () => invoke<AtRiskRow[]>("get_at_risk");
 export const exportInsightsCsv = (view: InsightView) => invoke<string>("export_insights_csv", { view });
 export const revealExport = (path: string) => invoke<void>("reveal_export", { path });
+export const exportInsightsPdf = (includeAtRisk: boolean) =>
+  invoke<string>("export_insights_pdf", { includeAtRisk });
 
 export const onScanProgress = (cb: (p: { done: number; total: number }) => void): Promise<UnlistenFn> =>
   listen<{ done: number; total: number }>("scan:progress", (e) => cb(e.payload));
