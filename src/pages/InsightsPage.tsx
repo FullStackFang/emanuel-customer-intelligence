@@ -87,7 +87,7 @@ export default function InsightsPage({ status }: PageProps) {
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
 
   return (
-    <div className={printing ? "insights-report" : undefined} style={printing ? { width: 940, maxWidth: 940 } : { maxWidth: 1180 }}>
+    <div className={printing ? "insights-report" : undefined} style={printing ? { width: 940, maxWidth: 940, margin: "0 auto" } : { width: "100%", maxWidth: 1180, margin: "0 auto" }}>
       <PageTitle eyebrow="Customer Intelligence" title="Insights" actions={printing ? undefined : (
         <>
           <Button disabled={busy !== null || !ins} onClick={() => void doPdf()}>{busy === "pdf" ? "Rendering…" : "Download PDF"}</Button>
