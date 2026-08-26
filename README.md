@@ -27,6 +27,13 @@ Design: `docs/superpowers/specs/2026-08-25-customer-intelligence-v1-design.md`
   decrypted pages or the key could in principle reach the Windows pagefile, mitigated by
   full-disk encryption.
 
+## Insights
+The Insights page is computed from the local mirror only (never Salesforce). After each
+sync + profile, a household mart (`_m_household`) is rebuilt from the synced, non-withheld
+Account columns; the page reads that table. Fiscal years run June 1 – May 31 and are labeled
+by the year they end. Viewing the at-risk list and exporting CSVs are recorded in the audit log;
+exports land in `%APPDATA%\org.emanuelnyc.customerintelligence\exports\`.
+
 ## Verify
 `npm run typecheck && npm test && (cd src-tauri && cargo test)`
 
