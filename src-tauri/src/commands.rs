@@ -587,7 +587,7 @@ pub async fn set_llm_key(
     if key.trim().is_empty() {
         return Err(err("API key is empty."));
     }
-    state.secrets.set(name, &key).map_err(err)?;
+    state.secrets.set(name, key.trim()).map_err(err)?;
     with_store(state.inner(), |s| {
         s.audit(
             &who(state.inner()),

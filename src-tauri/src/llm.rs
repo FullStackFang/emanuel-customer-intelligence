@@ -259,8 +259,8 @@ pub fn build_test_request(
         }
         Provider::Google => TestRequest {
             method: reqwest::Method::GET,
-            url: format!("{b}/v1beta/models?key={}", key.unwrap_or_default()),
-            headers: vec![],
+            url: format!("{b}/v1beta/models"),
+            headers: vec![("x-goog-api-key".into(), key.unwrap_or_default().to_string())],
             body: None,
         },
         Provider::Ollama => TestRequest {
@@ -436,10 +436,12 @@ mod tests {
         assert_eq!(r.url, "https://api.openai.com/v1/models");
         assert!(r.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
 
-        // Google: key in query string.
+        // Google: key in header, never the URL.
         let c = ProviderConfig::default_for(Provider::Google);
         let r = build_test_request(Provider::Google, &c, Some("k")).unwrap();
-        assert_eq!(r.url, "https://generativelanguage.googleapis.com/v1beta/models?key=k");
+        assert_eq!(r.url, "https://generativelanguage.googleapis.com/v1beta/models");
+        assert!(r.headers.iter().any(|(k, v)| k == "x-goog-api-key" && v == "k"));
+        assert!(!r.url.contains("key="), "key must never ride in the URL");
 
         // Ollama: GET tags, no key, no auth header.
         let c = ProviderConfig::default_for(Provider::Ollama);
@@ -466,5 +468,12 @@ mod tests {
         assert!(build_test_request(Provider::OpenAi, &c, None).is_err());
         let c = ProviderConfig::default_for(Provider::Anthropic);
         assert!(build_test_request(Provider::Anthropic, &c, None).is_err());
+    }
+
+    #[test]
+    fn build_test_request_rejects_empty_base_url() {
+        let mut c = ProviderConfig::default_for(Provider::Ollama);
+        c.base_url = String::new();
+        assert!(build_test_request(Provider::Ollama, &c, None).is_err());
     }
 }
