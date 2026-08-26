@@ -312,13 +312,46 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Column names of a mirror table (empty if the table does not exist).
+    pub fn mirror_columns(&self, object: &str) -> Result<Vec<String>> {
+        if !self.table_exists(object)? {
+            return Ok(Vec::new());
+        }
+        let mut st = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({})", ident(object)?))?;
+        let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn table_exists(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The most recent `last_synced_at` across all objects.
+    pub fn newest_sync_at(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(last_synced_at) FROM _objects", [], |r| r.get(0))?)
+    }
+
     pub fn purge_mirror(&mut self) -> Result<()> {
         let names = self.synced_objects()?;
         let tx = self.conn.transaction()?;
         for n in names {
             tx.execute_batch(&format!("DROP TABLE IF EXISTS {}", ident(&n)?))?;
         }
-        tx.execute_batch("DELETE FROM _profile; UPDATE _objects SET last_synced_at = NULL, last_sync_rows = NULL;")?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS _m_household;
+             DELETE FROM _profile;
+             DELETE FROM _meta WHERE key IN ('insights_built_at', 'insights_unavailable');
+             UPDATE _objects SET last_synced_at = NULL, last_sync_rows = NULL;",
+        )?;
         tx.commit()?;
         Ok(())
     }
