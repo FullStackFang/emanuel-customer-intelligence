@@ -27,6 +27,21 @@ function initials(name: string) {
   return name.split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0]?.toUpperCase() ?? "").join("") || "?";
 }
 
+/** Branded splash shown for the brief moment before the first local status arrives, so the
+ *  window never appears as a blank frame on launch. */
+function Splash() {
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      gap: "var(--space-4)", background: "var(--gradient-brand)", fontFamily: "var(--font-body)", padding: "var(--space-6)" }}>
+      <img src={logoUrl} alt="Temple Emanu-El" style={{ width: 72, height: 72, opacity: 0.95 }} />
+      <div style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", color: "var(--bg-primary)", fontSize: "var(--text-sm)" }}>
+        <span className="app-spinner" aria-hidden="true" />
+        <span>Starting up…</span>
+      </div>
+    </div>
+  );
+}
+
 function SignedOut({ onConnected, error }: { onConnected: () => Promise<void>; error: string | null }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(error);
@@ -68,10 +83,25 @@ export default function App() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  if (!status) return null;
-  if (!status.connected || !status.identity) return <SignedOut onConnected={refresh} error={fatal} />;
+  // Once we know a session exists, recover the signed-in name in the background. First paint
+  // never waits on this network call; if it fails (dead session) we fall back to signed-out.
+  useEffect(() => {
+    if (!status?.connected || status.identity) return;
+    let cancelled = false;
+    api.recoverIdentity()
+      .then((id) => { if (!cancelled && id) setStatus((s) => (s ? { ...s, identity: id } : s)); })
+      .catch((e) => { if (!cancelled) { setFatal(String(e)); setStatus((s) => (s ? { ...s, connected: false } : s)); } });
+    return () => { cancelled = true; };
+  }, [status?.connected, status?.identity]);
 
-  const user = { initials: initials(status.identity.display_name), name: status.identity.display_name, role: "Salesforce" };
+  if (!status) return <Splash />;
+  if (!status.connected) return <SignedOut onConnected={refresh} error={fatal} />;
+
+  // Connected but the name is still resolving: render the app now with a placeholder chip
+  // rather than blocking the whole window on the identity round-trip.
+  const user = status.identity
+    ? { initials: initials(status.identity.display_name), name: status.identity.display_name, role: "Salesforce" }
+    : { initials: "…", name: "Signing in…", role: "Salesforce" };
   const props: PageProps = { status, refresh };
   return (
     <AppFrame nav={NAV} active={page} onNav={(k: string) => setPage(k as PageKey)} user={user}>

@@ -6,6 +6,7 @@ pub mod insights;
 pub mod llm;
 pub mod pdf;
 pub mod profile;
+pub mod progress;
 pub mod risk;
 pub mod salesforce;
 pub mod secrets;
@@ -36,11 +37,13 @@ pub fn run() {
                 db_path,
                 store: Mutex::new(None),
                 identity: Mutex::new(None),
+                job: Mutex::new(None),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::recover_identity,
             commands::connect,
             commands::disconnect,
             commands::scan,
@@ -54,6 +57,7 @@ pub fn run() {
             commands::get_audit,
             commands::purge_local_data,
             commands::get_insights,
+            commands::get_insights_job,
             commands::get_at_risk,
             commands::get_risk_summary,
             commands::get_watch_list,

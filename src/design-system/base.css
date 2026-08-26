@@ -23,3 +23,56 @@ body {
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
 }
+
+/* ── Loading affordances (splash, insights load) ─────────────────────────── */
+
+/* Indeterminate ring spinner. Sizes to the current font (1em) and inherits color. */
+.app-spinner {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: app-spin 0.7s linear infinite;
+}
+@keyframes app-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Indeterminate progress bar for longer operations (e.g. building insights). */
+.app-progress {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: var(--bg-tertiary);
+}
+.app-progress::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 40%;
+  border-radius: inherit;
+  background: var(--bg-brand);
+  animation: app-progress-slide 1.15s ease-in-out infinite;
+}
+@keyframes app-progress-slide {
+  from { left: -40%; }
+  to { left: 100%; }
+}
+/* Determinate variant: hide the sliding band and fill to a known width instead. */
+.app-progress.is-determinate::before { display: none; }
+.app-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--bg-brand);
+  transition: width 0.3s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-spinner { animation-duration: 1.6s; }
+  .app-progress::before { animation-duration: 2.6s; }
+}

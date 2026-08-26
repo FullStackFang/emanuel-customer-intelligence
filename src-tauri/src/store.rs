@@ -367,6 +367,19 @@ impl Store {
             .query_row("SELECT MAX(last_synced_at) FROM _objects", [], |r| r.get(0))?)
     }
 
+    /// The most recent `last_synced_at` among the objects the insights mart reads
+    /// (`insights::MART_SOURCE_OBJECTS`). Syncing any other object cannot change the mart,
+    /// so it must not count as making it stale.
+    pub fn newest_mart_source_sync_at(&self) -> Result<Option<String>> {
+        let names = crate::insights::MART_SOURCE_OBJECTS;
+        let placeholders = vec!["?"; names.len()].join(", ");
+        Ok(self.conn.query_row(
+            &format!("SELECT MAX(last_synced_at) FROM _objects WHERE name IN ({placeholders})"),
+            rusqlite::params_from_iter(names.iter()),
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn purge_mirror(&mut self) -> Result<()> {
         let names = self.synced_objects()?;
         let tx = self.conn.transaction()?;
@@ -577,6 +590,38 @@ mod tests {
         assert_eq!(rows[0].action, "sync.object");
         assert_eq!(rows[0].object.as_deref(), Some("Account"));
         assert_eq!(rows[1].action, "scan.run");
+    }
+
+    #[test]
+    fn newest_mart_source_sync_ignores_objects_the_mart_never_reads() {
+        let (_d, s) = mem();
+        let sync_at = |object: &str, at: &str| {
+            s.upsert_object(object, object, 0).unwrap();
+            s.conn()
+                .execute(
+                    "UPDATE _objects SET last_synced_at = ?2 WHERE name = ?1",
+                    params![object, at],
+                )
+                .unwrap();
+        };
+        assert_eq!(s.newest_mart_source_sync_at().unwrap(), None);
+        sync_at("Contact", "2026-05-01T00:00:00Z");
+        assert_eq!(
+            s.newest_sync_at().unwrap().as_deref(),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert_eq!(
+            s.newest_mart_source_sync_at().unwrap(),
+            None,
+            "Contact is not a mart source"
+        );
+        sync_at("Account", "2026-04-01T00:00:00Z");
+        sync_at("Committee_Membership__c", "2026-04-15T00:00:00Z");
+        assert_eq!(
+            s.newest_mart_source_sync_at().unwrap().as_deref(),
+            Some("2026-04-15T00:00:00Z"),
+            "newest among mart sources only; Contact's later sync is ignored"
+        );
     }
 
     #[test]

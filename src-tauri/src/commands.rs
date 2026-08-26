@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::insights::{self, AtRiskRow, Insights};
 use crate::llm;
 use crate::profile;
+use crate::progress::{self, ProgressEvent, Reporter};
 use crate::risk;
 use crate::salesforce::SfClient;
 use crate::secrets::{Secrets, TOKENS};
@@ -23,6 +24,10 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub store: Mutex<Option<Store>>,
     pub identity: Mutex<Option<Identity>>,
+    /// Latest progress event of the running Insights job (rebuild / risk), or None when no
+    /// job is running. Deliberately separate from `store` so it can be read while a rebuild
+    /// holds the store lock.
+    pub job: Mutex<Option<ProgressEvent>>,
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -82,25 +87,12 @@ pub struct StatusView {
     pub last_scan_at: Option<String>,
 }
 
+/// Fast, local-only status for first paint: whether a session exists (tokens present) plus
+/// mirror counts. It never touches the network — the signed-in name is recovered separately
+/// by `recover_identity` so the window is never gated on a Salesforce round-trip.
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> CmdResult<StatusView> {
-    let tokens = auth::load_tokens(&state.secrets).map_err(err)?;
-    let connected = tokens.is_some();
-    if connected && state.identity.lock().map(|g| g.is_none()).unwrap_or(true) {
-        // App restarted with a stored session: recover who we are (refreshes if needed).
-        let mut c = client(state.inner()).await?;
-        let id = match auth::fetch_identity(c.tokens()).await {
-            Ok(id) => Some(id),
-            Err(_) => {
-                let t = auth::refresh(&state.cfg, &state.secrets, c.tokens())
-                    .await
-                    .map_err(err)?;
-                c = SfClient::new(state.cfg.clone(), state.secrets.clone(), t);
-                Some(auth::fetch_identity(c.tokens()).await.map_err(err)?)
-            }
-        };
-        *state.identity.lock().map_err(|_| "lock".to_string())? = id;
-    }
+    let connected = auth::load_tokens(&state.secrets).map_err(err)?.is_some();
     let identity = state.identity.lock().ok().and_then(|g| g.clone());
     let st = with_store(state.inner(), |s| s.status())?;
     Ok(StatusView {
@@ -111,6 +103,33 @@ pub async fn get_status(state: State<'_, AppState>) -> CmdResult<StatusView> {
         synced_rows: st.synced_rows,
         last_scan_at: st.last_scan_at,
     })
+}
+
+/// Recover the signed-in identity for a stored session (a network call, refreshing the
+/// token if needed). Called in the background after first paint. Returns the cached identity
+/// if already known this session, `None` when no session exists, or an error if the session
+/// cannot be recovered — the frontend treats that error as signed-out.
+#[tauri::command]
+pub async fn recover_identity(state: State<'_, AppState>) -> CmdResult<Option<Identity>> {
+    if let Some(id) = state.identity.lock().ok().and_then(|g| g.clone()) {
+        return Ok(Some(id));
+    }
+    if auth::load_tokens(&state.secrets).map_err(err)?.is_none() {
+        return Ok(None);
+    }
+    let mut c = client(state.inner()).await?;
+    let id = match auth::fetch_identity(c.tokens()).await {
+        Ok(id) => id,
+        Err(_) => {
+            let t = auth::refresh(&state.cfg, &state.secrets, c.tokens())
+                .await
+                .map_err(err)?;
+            c = SfClient::new(state.cfg.clone(), state.secrets.clone(), t);
+            auth::fetch_identity(c.tokens()).await.map_err(err)?
+        }
+    };
+    *state.identity.lock().map_err(|_| "lock".to_string())? = Some(id.clone());
+    Ok(Some(id))
 }
 
 #[tauri::command]
@@ -353,14 +372,10 @@ pub async fn profile_selected(state: State<'_, AppState>) -> CmdResult<usize> {
             None,
             Some(serde_json::json!({"objects": n})),
         )?;
+        // Profiling never changes the mart's sources, so this only rebuilds (and audits)
+        // when a relevant sync or schema change actually left the mart stale.
         if s.table_exists("Account")? {
-            let info = insights::rebuild(s)?;
-            s.audit(
-                &w,
-                "insights.rebuild",
-                None,
-                Some(serde_json::json!({"households": info.households, "unavailable": info.unavailable})),
-            )?;
+            ensure_fresh(s, &w, false)?;
         }
         Ok(n)
     })
@@ -431,8 +446,23 @@ fn exports_dir(state: &AppState) -> PathBuf {
 /// Rebuild the mart if it is missing, older than the newest sync, or built by a prior
 /// mart schema (e.g. before new columns were added to `_m_household_fy`).
 fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
+    let mut sink = progress::noop();
+    let mut reporter = Reporter::new("rebuild", insights::REBUILD_STEPS, &mut sink);
+    ensure_fresh_with(s, w, force, &mut reporter)
+}
+
+/// As `ensure_fresh`, but reports rebuild progress through `progress` when a rebuild
+/// actually runs, so a long post-sync rebuild is visibly working, not a frozen label.
+fn ensure_fresh_with(
+    s: &mut Store,
+    w: &Who,
+    force: bool,
+    progress: &mut Reporter<'_>,
+) -> anyhow::Result<()> {
     let built = s.get_meta("insights_built_at")?;
-    let newest = s.newest_sync_at()?;
+    // Only a sync of an object the mart reads can make it stale (same rule as the
+    // `stale` flag in `insights::views`); syncing Contact etc. must not force a rebuild.
+    let newest = s.newest_mart_source_sync_at()?;
     let stale = match (&built, &newest) {
         (None, _) => true,
         (Some(b), Some(n)) => n > b, // ISO-8601 strings compare chronologically
@@ -443,7 +473,7 @@ fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
         .and_then(|v| v.parse::<i64>().ok())
         == Some(insights::MART_SCHEMA_VERSION);
     if force || stale || !schema_current || !s.table_exists(insights::MART)? {
-        let info = insights::rebuild(s)?;
+        let info = insights::rebuild_with(s, progress)?;
         s.audit(
             w,
             "insights.rebuild",
@@ -456,13 +486,65 @@ fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A progress sink for the Insights jobs: records the latest event in `state.job` (so
+/// `get_insights_job` can answer while the store lock is held) and emits it to the page
+/// on `insights:progress`.
+fn progress_sink<'a>(app: &'a AppHandle, state: &'a AppState) -> impl FnMut(&ProgressEvent) + 'a {
+    move |ev: &ProgressEvent| {
+        if let Ok(mut job) = state.job.lock() {
+            *job = Some(ev.clone());
+        }
+        let _ = app.emit("insights:progress", ev);
+    }
+}
+
+/// Mark no Insights job as running. Must run after the job's store work on every path.
+fn clear_job(state: &AppState) {
+    if let Ok(mut job) = state.job.lock() {
+        *job = None;
+    }
+}
+
+/// Latest progress of the running Insights job, or None when nothing is running. Reads only
+/// `state.job` — never the store — so it answers while a rebuild holds the store lock.
 #[tauri::command]
-pub async fn get_insights(force_rebuild: bool, state: State<'_, AppState>) -> CmdResult<Insights> {
+pub async fn get_insights_job(state: State<'_, AppState>) -> CmdResult<Option<ProgressEvent>> {
+    Ok(state
+        .job
+        .lock()
+        .map_err(|_| "job lock poisoned".to_string())?
+        .clone())
+}
+
+#[tauri::command]
+pub async fn get_insights(
+    app: AppHandle,
+    force_rebuild: bool,
+    state: State<'_, AppState>,
+) -> CmdResult<Insights> {
     let w = who(state.inner());
-    with_store(state.inner(), |s| {
-        ensure_fresh(s, &w, force_rebuild)?;
-        insights::views(s, insights::current_fy())
+    // The rebuild can run for many seconds; keep it off the async workers.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("rebuild", insights::REBUILD_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            // Timing (target "insights_timing"): splits rebuild vs. mart-read to locate the
+            // dominant cost. Off by default; enable with RUST_LOG=insights_timing=debug.
+            let t = std::time::Instant::now();
+            ensure_fresh_with(s, &w, force_rebuild, &mut progress)?;
+            tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "ensure_fresh (rebuild if stale)");
+            let t = std::time::Instant::now();
+            let out = insights::views(s, insights::current_fy());
+            tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "insights::views (mart read)");
+            out
+        });
+        clear_job(state);
+        out
     })
+    .await
+    .map_err(err)?
 }
 
 #[tauri::command]
@@ -481,43 +563,97 @@ pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>
     })
 }
 
-/// Rebuild if needed, then run the validated churn analysis from the freshest mart.
-fn analyze_risk(s: &mut Store, w: &Who) -> anyhow::Result<(risk::RiskModel, risk::WatchList)> {
+/// Rebuild if needed, then return the validated churn analysis — reused from the `_meta`
+/// cache while the analytical dataset is unchanged, recomputed from the freshest mart when
+/// it was rebuilt. Reuse never alters the model or its outputs; it only skips repeats.
+fn analyze_risk(
+    s: &mut Store,
+    w: &Who,
+    progress: &mut Reporter<'_>,
+) -> anyhow::Result<(risk::RiskModel, risk::WatchList)> {
     ensure_fresh(s, w, false)?;
+    // The cache is keyed on `insights_built_at`, which advances only inside the rebuild
+    // transaction, so it self-invalidates on any rebuild. A stamp mismatch, a missing
+    // cache, or an unreadable blob all fall back to the exact compute path below.
+    let built = s.get_meta("insights_built_at")?;
+    if let Some(built_at) = built.as_deref() {
+        let blob = s.get_meta(risk::RISK_CACHE_KEY)?;
+        if let Some(cached) = risk::reuse_cached(built_at, blob.as_deref()) {
+            return Ok(cached);
+        }
+    }
     let cur = insights::current_fy();
+    let t = std::time::Instant::now();
     let hh = insights::load(s)?;
     let years = insights::load_household_years(s)?;
     let caps = insights::source_capabilities(s)?;
-    Ok(risk::analyze(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA))
+    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk mart read");
+    let t = std::time::Instant::now();
+    let (model, list) = risk::analyze_with(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA, progress);
+    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk::analyze (compute)");
+    // Persist for reuse. If there is no build stamp yet, or it cannot encode, skip caching
+    // and return the freshly computed result unchanged.
+    if let Some(built_at) = built {
+        if let Some(blob) = risk::serialize_cache(&built_at, &model, &list) {
+            s.set_meta(risk::RISK_CACHE_KEY, &blob)?;
+        }
+    }
+    Ok((model, list))
 }
 
 /// Aggregate Risk view: validation results and backtests only. No household names, so it
 /// is not audited as named access.
 #[tauri::command]
-pub async fn get_risk_summary(state: State<'_, AppState>) -> CmdResult<risk::RiskSummary> {
+pub async fn get_risk_summary(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<risk::RiskSummary> {
     let w = who(state.inner());
-    with_store(state.inner(), |s| {
-        let (model, list) = analyze_risk(s, &w)?;
-        Ok(risk::risk_summary(&model, &list))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("risk", risk::RISK_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            let (model, list) = analyze_risk(s, &w, &mut progress)?;
+            Ok(risk::risk_summary(&model, &list))
+        });
+        clear_job(state);
+        out
     })
+    .await
+    .map_err(err)?
 }
 
 /// Named Watch List: loaded only on explicit request and audited. The audit records the
 /// result count and availability, never a household name or risk-feature value.
 #[tauri::command]
-pub async fn get_watch_list(state: State<'_, AppState>) -> CmdResult<risk::WatchListView> {
+pub async fn get_watch_list(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<risk::WatchListView> {
     let w = who(state.inner());
-    with_store(state.inner(), |s| {
-        let (model, list) = analyze_risk(s, &w)?;
-        let view = risk::watch_list_view(&model, &list);
-        s.audit(
-            &w,
-            "risk.watch_list.load",
-            None,
-            Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
-        )?;
-        Ok(view)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("risk", risk::RISK_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            let (model, list) = analyze_risk(s, &w, &mut progress)?;
+            let view = risk::watch_list_view(&model, &list);
+            s.audit(
+                &w,
+                "risk.watch_list.load",
+                None,
+                Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
+            )?;
+            Ok(view)
+        });
+        clear_job(state);
+        out
     })
+    .await
+    .map_err(err)?
 }
 
 /// Export the named Watch List to the app's exports directory. Audited like a load; the
@@ -527,7 +663,9 @@ pub async fn export_watch_list_csv(state: State<'_, AppState>) -> CmdResult<Stri
     let w = who(state.inner());
     let dir = exports_dir(state.inner());
     with_store(state.inner(), |s| {
-        let (model, list) = analyze_risk(s, &w)?;
+        let mut sink = progress::noop();
+        let mut quiet = Reporter::new("risk", risk::RISK_STEPS, &mut sink);
+        let (model, list) = analyze_risk(s, &w, &mut quiet)?;
         let view = risk::watch_list_view(&model, &list);
         if !view.available {
             return Err(anyhow::anyhow!("No validated household ranking to export"));

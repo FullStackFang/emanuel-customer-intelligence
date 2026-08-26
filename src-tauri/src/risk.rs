@@ -8,7 +8,9 @@
 //! population rather than labeled as retention outcomes.
 
 use crate::insights::{member_in, Hh, HhFy, SourceCapability, INTRO_TIERS};
-use serde::Serialize;
+use crate::progress::{noop, Reporter};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Primary Exit Outcome that is the prediction target.
 pub const ADDRESSABLE: &str = "Addressable Churn";
@@ -76,18 +78,57 @@ fn label_at(hh: &Hh, n: i32) -> Option<u8> {
     member_in(hh, n + 1).then_some(0)
 }
 
+/// Indexed household-year lookups, built once per analysis. Replaces the repeated linear
+/// scans of the household-year set (`years.iter().find/any`) with hash lookups; the model
+/// output is identical, only the lookup cost changes.
+pub struct YearIndex<'a> {
+    /// First row seen for each `(account_id, fiscal year)`, matching `.find`'s first-wins.
+    by_account_fy: HashMap<(&'a str, i32), &'a HhFy>,
+    /// All rows for an account, in input order, for range scans over its years.
+    by_account: HashMap<&'a str, Vec<&'a HhFy>>,
+}
+
+impl<'a> YearIndex<'a> {
+    pub fn build(years: &'a [HhFy]) -> Self {
+        let mut by_account_fy = HashMap::with_capacity(years.len());
+        let mut by_account: HashMap<&str, Vec<&HhFy>> = HashMap::new();
+        for r in years {
+            // `or_insert` keeps the first row for a key, exactly as `.find` did.
+            by_account_fy.entry((r.account_id.as_str(), r.fy)).or_insert(r);
+            by_account.entry(r.account_id.as_str()).or_default().push(r);
+        }
+        Self {
+            by_account_fy,
+            by_account,
+        }
+    }
+
+    /// The row for `account_id` in fiscal year `fy`, if any (replaces `years.iter().find`).
+    fn at(&self, account_id: &str, fy: i32) -> Option<&'a HhFy> {
+        self.by_account_fy.get(&(account_id, fy)).copied()
+    }
+
+    /// Every row for `account_id`, in input order (replaces per-account `years.iter()` scans).
+    fn account_years(&self, account_id: &str) -> &[&'a HhFy] {
+        self.by_account
+            .get(account_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
 /// Build cutoff-safe feature rows for cutoff year `n`. Features read only fiscal year
 /// `n` and static join-time facts; nothing after the cutoff enters the vector.
 pub fn feature_rows(
     hh: &[Hh],
-    years: &[HhFy],
+    index: &YearIndex,
     n: i32,
     caps: &[SourceCapability],
 ) -> Vec<FeatureRow> {
     hh.iter()
         .filter_map(|household| {
             let label = label_at(household, n)?;
-            build_feature_row(household, years, n, label, caps)
+            build_feature_row(household, index, n, label, caps)
         })
         .collect()
 }
@@ -96,7 +137,7 @@ pub fn feature_rows(
 /// current households whose N+1 outcome is not yet known. The `label` field is 0.
 pub fn scoring_rows(
     hh: &[Hh],
-    years: &[HhFy],
+    index: &YearIndex,
     n: i32,
     caps: &[SourceCapability],
 ) -> Vec<FeatureRow> {
@@ -105,7 +146,7 @@ pub fn scoring_rows(
             if !member_in(household, n) {
                 return None;
             }
-            build_feature_row(household, years, n, 0, caps)
+            build_feature_row(household, index, n, 0, caps)
         })
         .collect()
 }
@@ -114,7 +155,7 @@ pub fn scoring_rows(
 /// join-time facts; nothing after the cutoff enters the vector.
 fn build_feature_row(
     household: &Hh,
-    years: &[HhFy],
+    index: &YearIndex,
     n: i32,
     label: u8,
     caps: &[SourceCapability],
@@ -123,9 +164,7 @@ fn build_feature_row(
     let has_renewal = cap_available(caps, "renewal");
     let has_school = cap_available(caps, "school");
     let has_committee = cap_available(caps, "committee");
-    let at_n = years
-        .iter()
-        .find(|r| r.account_id == household.account_id && r.fy == n);
+    let at_n = index.at(&household.account_id, n);
 
     let tenure = (n - join_fy + 1).max(0) as f64;
     let entry_jobs = household.ch.iter().filter(|f| **f).count() as f64;
@@ -328,7 +367,7 @@ fn baseline_brier(scored: &[(f64, u8)]) -> f64 {
 }
 
 /// One rolling test year.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YearResult {
     pub test_fy: i32,
     pub households: i64,
@@ -337,7 +376,7 @@ pub struct YearResult {
 }
 
 /// Outcome of a rolling backtest over a feature-column set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Validation {
     pub columns: Vec<usize>,
     pub years: Vec<YearResult>,
@@ -353,17 +392,33 @@ pub struct Validation {
 /// history, train on earlier years and score that year. Aggregate metrics pool every
 /// sufficient test year's scored predictions. All gates must pass for `passed`.
 pub fn rolling_validation(rows: &[FeatureRow], columns: &[usize], alpha: f64) -> Validation {
+    let mut sink = noop();
+    let mut progress = Reporter::new("risk", RISK_STEPS, &mut sink);
+    rolling_validation_with(rows, columns, alpha, &mut progress)
+}
+
+/// As `rolling_validation`, ticking `progress` once per test year (progress is a pure
+/// side effect; it never changes the validation).
+pub fn rolling_validation_with(
+    rows: &[FeatureRow],
+    columns: &[usize],
+    alpha: f64,
+    progress: &mut Reporter<'_>,
+) -> Validation {
     let mut test_years: Vec<i32> = rows.iter().map(|r| r.fy_n).collect();
     test_years.sort_unstable();
     test_years.dedup();
 
     let mut years = Vec::new();
     let mut pooled: Vec<(f64, u8)> = Vec::new();
+    let mut tested: u64 = 0;
     for &t in &test_years {
         let train: Vec<&FeatureRow> = rows.iter().filter(|r| r.fy_n < t).collect();
         if train.is_empty() {
             continue; // the earliest year has no history and is not a test year
         }
+        progress.tick(tested, None);
+        tested += 1;
         let test: Vec<&FeatureRow> = rows.iter().filter(|r| r.fy_n == t).collect();
         let households = test.len() as i64;
         let exits = test.iter().filter(|r| r.label == 1).count() as i64;
@@ -382,6 +437,8 @@ pub fn rolling_validation(rows: &[FeatureRow], columns: &[usize], alpha: f64) ->
             }
         }
     }
+
+    progress.tick(tested, Some(tested));
 
     let completed = years.iter().filter(|y| y.sufficient).count();
     let roc = roc_auc(&pooled);
@@ -464,7 +521,7 @@ fn coverage(rows: &[&FeatureRow], family: &str) -> f64 {
 }
 
 /// Coverage of one optional family in training and scoring splits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FamilyCoverage {
     pub family: String,
     pub train: f64,
@@ -473,7 +530,7 @@ pub struct FamilyCoverage {
 }
 
 /// The result of validating with coverage-driven family removal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskModel {
     pub validation: Validation,
     pub coverage: Vec<FamilyCoverage>,
@@ -485,6 +542,13 @@ pub struct RiskModel {
 /// features. A family is removed when its training or scoring coverage is below
 /// `MIN_COVERAGE` or the two differ by more than `MAX_DRIFT`.
 pub fn evaluate(rows: &[FeatureRow], alpha: f64) -> RiskModel {
+    let mut sink = noop();
+    let mut progress = Reporter::new("risk", RISK_STEPS, &mut sink);
+    evaluate_with(rows, alpha, &mut progress)
+}
+
+/// As `evaluate`, reporting rolling-validation progress.
+pub fn evaluate_with(rows: &[FeatureRow], alpha: f64, progress: &mut Reporter<'_>) -> RiskModel {
     // Split coverage on the most recent scored year vs. its training history.
     let latest = rows.iter().map(|r| r.fy_n).max();
     let (train, score): (Vec<&FeatureRow>, Vec<&FeatureRow>) = match latest {
@@ -535,7 +599,7 @@ pub fn evaluate(rows: &[FeatureRow], alpha: f64) -> RiskModel {
     columns.sort_unstable();
 
     RiskModel {
-        validation: rolling_validation(rows, &columns, alpha),
+        validation: rolling_validation_with(rows, &columns, alpha, progress),
         coverage: coverage_report,
         removed_families: removed,
     }
@@ -544,7 +608,7 @@ pub fn evaluate(rows: &[FeatureRow], alpha: f64) -> RiskModel {
 // ── Evidence-gated named Watch List ─────────────────────────────────────────
 
 /// One independent class of current or recent Risk Evidence for a household.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
     pub class: String,
     pub detail: String,
@@ -562,7 +626,7 @@ fn any_anchor_source(caps: &[SourceCapability]) -> bool {
 /// ended more than two completed fiscal years ago. Fields from one event yield one class.
 pub fn evidence_classes(
     h: &Hh,
-    years: &[HhFy],
+    index: &YearIndex,
     cur: i32,
     caps: &[SourceCapability],
 ) -> Vec<Evidence> {
@@ -596,12 +660,13 @@ pub fn evidence_classes(
     // Observed engagement loss: held a Relationship Anchor recently but none this year.
     // This is a positive-anchor drop, not merely absent billing coverage.
     if any_anchor_source(caps) {
-        let held_recent = years.iter().any(|r| {
-            r.account_id == h.account_id && r.fy >= cur - 3 && r.fy < cur && r.anchor_count() > 0
-        });
-        let held_now = years
+        let account_years = index.account_years(&h.account_id);
+        let held_recent = account_years
             .iter()
-            .any(|r| r.account_id == h.account_id && r.fy == cur && r.anchor_count() > 0);
+            .any(|r| r.fy >= cur - 3 && r.fy < cur && r.anchor_count() > 0);
+        let held_now = account_years
+            .iter()
+            .any(|r| r.fy == cur && r.anchor_count() > 0);
         if held_recent && !held_now {
             out.push(Evidence {
                 class: "lost_engagement_anchor".into(),
@@ -622,7 +687,7 @@ pub struct Candidate {
 }
 
 /// A household that qualified for the named Watch List.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchRow {
     pub account_id: String,
     pub name: String,
@@ -669,7 +734,7 @@ fn distinct_classes(evidence: &[Evidence]) -> usize {
 
 /// The full named-risk result: either a validated Watch List or an explicit reason it is
 /// unavailable. Aggregate Risk content remains available regardless.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchList {
     pub available: bool,
     pub unavailable_reason: Option<String>,
@@ -685,12 +750,30 @@ pub struct WatchList {
 pub fn build_watch_list(
     labeled: &[FeatureRow],
     hh: &[Hh],
-    years: &[HhFy],
+    index: &YearIndex,
     caps: &[SourceCapability],
     cur: i32,
     alpha: f64,
 ) -> (RiskModel, WatchList) {
-    let model = evaluate(labeled, alpha);
+    let mut sink = noop();
+    let mut progress = Reporter::new("risk", RISK_STEPS, &mut sink);
+    build_watch_list_with(labeled, hh, index, caps, cur, alpha, &mut progress)
+}
+
+/// As `build_watch_list`, reporting the validation, refit, and scoring phases. The
+/// caller owns the reporter's first phase and its `finish`; phases here are skipped when
+/// validation fails, so the caller must still `finish` to reach `step == steps`.
+pub fn build_watch_list_with(
+    labeled: &[FeatureRow],
+    hh: &[Hh],
+    index: &YearIndex,
+    caps: &[SourceCapability],
+    cur: i32,
+    alpha: f64,
+    progress: &mut Reporter<'_>,
+) -> (RiskModel, WatchList) {
+    progress.phase("Rolling validation");
+    let model = evaluate_with(labeled, alpha, progress);
     let (first, last) = (
         model.validation.years.iter().map(|y| y.test_fy).min(),
         model.validation.years.iter().map(|y| y.test_fy).max(),
@@ -713,6 +796,7 @@ pub fn build_watch_list(
     }
     // Refit on all labeled history using the validated feature columns, then score
     // current households at the last completed fiscal year.
+    progress.phase("Fitting final model");
     let refs: Vec<&FeatureRow> = labeled.iter().collect();
     let Some(fitted) = fit(&refs, &model.validation.columns, alpha) else {
         let unavailable = WatchList {
@@ -725,8 +809,9 @@ pub fn build_watch_list(
         };
         return (model, unavailable);
     };
+    progress.phase("Scoring current households");
     let score_fy = cur - 1;
-    let candidates: Vec<Candidate> = scoring_rows(hh, years, score_fy, caps)
+    let candidates: Vec<Candidate> = scoring_rows(hh, index, score_fy, caps)
         .iter()
         .filter_map(|row| {
             let h = hh.iter().find(|h| h.account_id == row.account_id)?;
@@ -737,7 +822,7 @@ pub fn build_watch_list(
                 account_id: h.account_id.clone(),
                 name: h.name.clone().unwrap_or_default(),
                 score: fitted.score(row),
-                evidence: evidence_classes(h, years, cur, caps),
+                evidence: evidence_classes(h, index, cur, caps),
             })
         })
         .collect();
@@ -767,11 +852,78 @@ pub fn analyze(
     cur: i32,
     alpha: f64,
 ) -> (RiskModel, WatchList) {
+    let mut sink = noop();
+    let mut progress = Reporter::new("risk", RISK_STEPS, &mut sink);
+    analyze_with(hh, years, caps, cur, alpha, &mut progress)
+}
+
+/// Number of phases `analyze_with` reports (the `Reporter` must be built with this).
+pub const RISK_STEPS: u32 = 4;
+
+/// As `analyze`, reporting progress through `progress`. Every return path ends with
+/// `finish`, so the last event always has `step == steps`. Progress is a pure side effect.
+pub fn analyze_with(
+    hh: &[Hh],
+    years: &[HhFy],
+    caps: &[SourceCapability],
+    cur: i32,
+    alpha: f64,
+    progress: &mut Reporter<'_>,
+) -> (RiskModel, WatchList) {
+    progress.phase("Building feature rows");
+    let index = YearIndex::build(years);
     let mut labeled = Vec::new();
-    for n in FIRST_CUTOFF_FY..=(cur - 2) {
-        labeled.extend(feature_rows(hh, years, n, caps));
+    let cutoffs = FIRST_CUTOFF_FY..=(cur - 2);
+    let total = cutoffs.clone().count() as u64;
+    for (i, n) in cutoffs.enumerate() {
+        labeled.extend(feature_rows(hh, &index, n, caps));
+        progress.tick(i as u64 + 1, Some(total));
     }
-    build_watch_list(&labeled, hh, years, caps, cur, alpha)
+    let out = build_watch_list_with(&labeled, hh, &index, caps, cur, alpha, progress);
+    progress.finish();
+    out
+}
+
+// ── Build-stamp-keyed reuse of the fitted result (`_meta` cache) ────────────
+
+/// `_meta` key holding the fitted risk result, keyed to the analytical dataset's build
+/// stamp so it self-invalidates on any rebuild.
+pub const RISK_CACHE_KEY: &str = "risk_cache";
+
+/// Owned cache blob for read-back: the build stamp it was computed for plus the result.
+#[derive(Deserialize)]
+struct RiskCache {
+    built_at: String,
+    model: RiskModel,
+    list: WatchList,
+}
+
+/// Serialize a fitted result for caching, tagged with the build stamp it belongs to.
+/// Borrows the result so caching never clones the model. Returns None if it cannot encode.
+pub fn serialize_cache(built_at: &str, model: &RiskModel, list: &WatchList) -> Option<String> {
+    #[derive(Serialize)]
+    struct Ref<'a> {
+        built_at: &'a str,
+        model: &'a RiskModel,
+        list: &'a WatchList,
+    }
+    serde_json::to_string(&Ref {
+        built_at,
+        model,
+        list,
+    })
+    .ok()
+}
+
+/// Reuse a cached result only when the blob parses AND its build stamp matches the current
+/// dataset. Any stamp mismatch (a rebuild) or parse failure yields None so the caller
+/// recomputes — the cache can only skip repeats, never change a result.
+pub fn reuse_cached(
+    current_built_at: &str,
+    blob: Option<&str>,
+) -> Option<(RiskModel, WatchList)> {
+    let cache: RiskCache = serde_json::from_str(blob?).ok()?;
+    (cache.built_at == current_built_at).then_some((cache.model, cache.list))
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -981,7 +1133,7 @@ mod tests {
             .iter()
             .flat_map(|h| [year(&h.account_id, n), year(&h.account_id, n + 1)])
             .collect();
-        let rows = feature_rows(&households, &years, n, &caps(&[]));
+        let rows = feature_rows(&households, &YearIndex::build(&years), n, &caps(&[]));
         let ids: Vec<&str> = rows.iter().map(|r| r.account_id.as_str()).collect();
         assert!(ids.contains(&"churn") && ids.contains(&"stay"));
         assert!(
@@ -1005,7 +1157,7 @@ mod tests {
             .iter()
             .flat_map(|h| [year(&h.account_id, n), year(&h.account_id, n + 1)])
             .collect();
-        let rows = feature_rows(&[churn, stay], &years, n, &caps(&[]));
+        let rows = feature_rows(&[churn, stay], &YearIndex::build(&years), n, &caps(&[]));
         let f = |id: &str| rows.iter().find(|r| r.account_id == id).unwrap().features;
         assert_eq!(f("churn"), f("stay"), "features are cutoff-safe");
     }
@@ -1022,9 +1174,10 @@ mod tests {
         at_n1.anchor_dues = true;
         at_n1.anchor_religious = true;
         at_n1.anchor_committee = true;
+        let years = [at_n, at_n1];
         let rows = feature_rows(
             &[household],
-            &[at_n, at_n1],
+            &YearIndex::build(&years),
             n,
             &caps(&["renewal", "school", "committee"]),
         );
@@ -1044,9 +1197,10 @@ mod tests {
         at_n.anchor_dues = true;
         at_n.anchor_religious = true;
         at_n.anchor_committee = true;
+        let years = [at_n];
         let rows = feature_rows(
             &[household],
-            &[at_n],
+            &YearIndex::build(&years),
             n,
             &caps(&["renewal", "school", "committee"]),
         );
@@ -1066,7 +1220,8 @@ mod tests {
         at_n.anchor_dues = true;
         at_n.anchor_religious = true;
         at_n.anchor_committee = true;
-        let rows = feature_rows(&[household], &[at_n], n, &caps(&[]));
+        let years = [at_n];
+        let rows = feature_rows(&[household], &YearIndex::build(&years), n, &caps(&[]));
         let row = &rows[0];
         assert_eq!(
             (row.features[5], row.features[7], row.features[8]),
@@ -1188,13 +1343,14 @@ mod tests {
         fy18.dues_coverage_missing = true;
         let years = [fy24, fy18];
         let caps = caps(&["renewal"]);
+        let index = YearIndex::build(&years);
 
-        let r24 = feature_rows(std::slice::from_ref(&household), &years, 2024, &caps).remove(0);
+        let r24 = feature_rows(std::slice::from_ref(&household), &index, 2024, &caps).remove(0);
         assert!(r24.has_renewal && r24.renewal_observed);
         assert!(family_observed(&r24, "renewal"));
         assert_eq!(r24.features[6], 1.0, "coverage missing is a real feature");
 
-        let r18 = feature_rows(std::slice::from_ref(&household), &years, 2018, &caps).remove(0);
+        let r18 = feature_rows(std::slice::from_ref(&household), &index, 2018, &caps).remove(0);
         assert!(r18.has_renewal, "source availability is still reported");
         assert!(!r18.renewal_observed);
         assert!(
@@ -1376,13 +1532,14 @@ mod tests {
         stale.rs_family = true;
         stale.active_rs_students = 0;
         stale.last_rs_year = Some(2021); // cur - 5
-        assert!(evidence_classes(&stale, &[], cur, &[]).is_empty());
+        let empty = YearIndex::build(&[]);
+        assert!(evidence_classes(&stale, &empty, cur, &[]).is_empty());
         // A recent end is a single class no matter how many fields describe that one event.
         let mut recent = hh("recent", true, 2010, None, "(not coded)");
         recent.rs_family = true;
         recent.active_rs_students = 0;
         recent.last_rs_year = Some(2025); // cur - 1
-        let e = evidence_classes(&recent, &[], cur, &[]);
+        let e = evidence_classes(&recent, &empty, cur, &[]);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].class, "recent_religious_school_end");
         // Two distinct events (recent RS end + intro-tier aging) make two classes.
@@ -1391,7 +1548,7 @@ mod tests {
         two.active_rs_students = 0;
         two.last_rs_year = Some(2025);
         two.tier = Some("Young Professionals".into());
-        assert_eq!(evidence_classes(&two, &[], cur, &[]).len(), 2);
+        assert_eq!(evidence_classes(&two, &empty, cur, &[]).len(), 2);
     }
 
     #[test]
@@ -1440,14 +1597,16 @@ mod tests {
 
     #[test]
     fn a_failing_model_suppresses_the_named_watch_list() {
-        let (_model, list) = build_watch_list(&dataset(false), &[], &[], &[], 2024, DEFAULT_ALPHA);
+        let (_model, list) =
+            build_watch_list(&dataset(false), &[], &YearIndex::build(&[]), &[], 2024, DEFAULT_ALPHA);
         assert!(!list.available && list.rows.is_empty());
         assert!(list.unavailable_reason.is_some());
     }
 
     #[test]
     fn risk_payloads_reflect_a_suppressed_model() {
-        let (model, list) = build_watch_list(&dataset(false), &[], &[], &[], 2024, DEFAULT_ALPHA);
+        let (model, list) =
+            build_watch_list(&dataset(false), &[], &YearIndex::build(&[]), &[], 2024, DEFAULT_ALPHA);
         let summary = risk_summary(&model, &list);
         assert!(!summary.available && summary.watch_list_count == 0);
         assert!(summary.unavailable_reason.is_some());
@@ -1486,5 +1645,197 @@ mod tests {
         let csv = watch_list_csv(&view);
         assert!(csv.contains("\"Fam, A\""), "a name with a comma is quoted");
         assert!(csv.contains("recent_religious_school_end;intro_tier_aging"));
+    }
+
+    #[test]
+    fn year_index_matches_linear_scans() {
+        // The indexing refactor must be a pure lookup change: the index primitives return
+        // exactly what the replaced `years.iter().find/filter` scans returned.
+        let ids = ["a", "b", "c"];
+        let mut years = Vec::new();
+        for id in ids {
+            for fy in [2018, 2019, 2021] {
+                years.push(year(id, fy));
+            }
+        }
+        let index = YearIndex::build(&years);
+
+        // Point lookup equals `.find` for present and absent (account, fy) keys.
+        for id in ids {
+            for fy in 2017..=2022 {
+                let linear = years
+                    .iter()
+                    .find(|r| r.account_id == id && r.fy == fy)
+                    .map(|r| (r.account_id.as_str(), r.fy));
+                let indexed = index.at(id, fy).map(|r| (r.account_id.as_str(), r.fy));
+                assert_eq!(linear, indexed, "at({id}, {fy})");
+            }
+        }
+        assert!(index.at("missing", 2018).is_none());
+        assert!(index.account_years("missing").is_empty());
+
+        // Grouped lookup equals a linear per-account filter (as a set of years).
+        for id in ids {
+            let mut linear: Vec<i32> = years
+                .iter()
+                .filter(|r| r.account_id == id)
+                .map(|r| r.fy)
+                .collect();
+            let mut grouped: Vec<i32> = index.account_years(id).iter().map(|r| r.fy).collect();
+            linear.sort_unstable();
+            grouped.sort_unstable();
+            assert_eq!(linear, grouped, "account_years({id})");
+        }
+    }
+
+    #[test]
+    fn cache_is_reused_only_when_the_build_stamp_matches() {
+        // A validated result caches and reads back byte-identically under the same stamp;
+        // a rebuild (new stamp) or an unreadable blob forces recomputation.
+        let (model, list) = build_watch_list(
+            &dataset(true),
+            &[],
+            &YearIndex::build(&[]),
+            &[],
+            2024,
+            DEFAULT_ALPHA,
+        );
+        let stamp = "2026-01-01T00:00:00Z";
+        let blob = serialize_cache(stamp, &model, &list).expect("cache encodes");
+
+        // Same stamp → reused; the round-tripped payload is identical to the original.
+        let (m2, l2) = reuse_cached(stamp, Some(&blob)).expect("same stamp reuses");
+        assert_eq!(
+            serialize_cache(stamp, &m2, &l2).unwrap(),
+            blob,
+            "round-trip preserves the entire fitted result"
+        );
+
+        // Different stamp (a rebuild) → not reused, so the caller recomputes.
+        assert!(reuse_cached("2026-02-01T00:00:00Z", Some(&blob)).is_none());
+        // Unreadable blob or absent cache → not reused.
+        assert!(reuse_cached(stamp, Some("{ not json")).is_none());
+        assert!(reuse_cached(stamp, None).is_none());
+    }
+
+    fn recording<'a>(
+        events: &'a mut Vec<crate::progress::ProgressEvent>,
+    ) -> impl FnMut(&crate::progress::ProgressEvent) + 'a {
+        move |e| events.push(e.clone())
+    }
+
+    fn as_json<T: Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    #[test]
+    fn analyze_with_matches_analyze_and_reports_one_tick_per_test_year() {
+        use crate::progress::Reporter;
+        // (1) Full analyze path over household data: results identical, every phase
+        // reported in order, and the reporter finishes at step == steps.
+        let cur = 2026;
+        let mut households = Vec::new();
+        let mut years = Vec::new();
+        for i in 0..30 {
+            let id = format!("H{i}");
+            let resigned = i % 3 == 0;
+            households.push(hh(
+                &id,
+                !resigned,
+                2012,
+                if resigned { Some(2020) } else { None },
+                if resigned { ADDRESSABLE } else { "" },
+            ));
+            let last = if resigned { 2019 } else { cur - 1 };
+            for fy in 2012..=last {
+                years.push(year(&id, fy));
+            }
+        }
+        let c = caps(&["renewal", "school", "committee"]);
+        let plain = analyze(&households, &years, &c, cur, DEFAULT_ALPHA);
+        let mut events = Vec::new();
+        let mut sink = recording(&mut events);
+        let mut reporter = Reporter::new("risk", RISK_STEPS, &mut sink)
+            .with_min_interval(std::time::Duration::ZERO);
+        let with = analyze_with(&households, &years, &c, cur, DEFAULT_ALPHA, &mut reporter);
+        drop(reporter);
+        drop(sink);
+        assert_eq!(as_json(&with.0), as_json(&plain.0));
+        assert_eq!(as_json(&with.1), as_json(&plain.1));
+        let phases: Vec<(u32, &str)> = events
+            .iter()
+            .filter(|e| e.done.is_none())
+            .map(|e| (e.step, e.phase.as_str()))
+            .collect();
+        // This small dataset fails validation, so the fit/score phases are skipped but
+        // the job still finishes at step == steps.
+        assert_eq!(
+            phases,
+            vec![
+                (1, "Building feature rows"),
+                (2, "Rolling validation"),
+                (4, "Rolling validation"),
+            ]
+        );
+        assert!(events.iter().all(|e| e.job == "risk" && e.steps == RISK_STEPS));
+        assert_eq!(events.last().unwrap().step, RISK_STEPS);
+        // One feature-row tick per cutoff year, ending terminal.
+        let cutoffs = (FIRST_CUTOFF_FY..=(cur - 2)).count() as u64;
+        let last_build = events
+            .iter()
+            .filter(|e| e.step == 1 && e.done.is_some())
+            .last()
+            .unwrap();
+        assert_eq!((last_build.done, last_build.total), (Some(cutoffs), Some(cutoffs)));
+
+        // (2) A validating dataset walks every phase and ticks once per test year.
+        let rows = dataset(true);
+        let plain = build_watch_list(&rows, &[], &YearIndex::build(&[]), &[], 2024, DEFAULT_ALPHA);
+        let mut events = Vec::new();
+        let mut sink = recording(&mut events);
+        let mut reporter = Reporter::new("risk", RISK_STEPS, &mut sink)
+            .with_min_interval(std::time::Duration::ZERO);
+        reporter.phase("Building feature rows");
+        let with = build_watch_list_with(
+            &rows,
+            &[],
+            &YearIndex::build(&[]),
+            &[],
+            2024,
+            DEFAULT_ALPHA,
+            &mut reporter,
+        );
+        drop(reporter);
+        drop(sink);
+        assert_eq!(as_json(&with.0), as_json(&plain.0));
+        assert_eq!(as_json(&with.1), as_json(&plain.1));
+        assert!(with.0.validation.passed);
+        let phases: Vec<(u32, &str)> = events
+            .iter()
+            .filter(|e| e.done.is_none())
+            .map(|e| (e.step, e.phase.as_str()))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                (1, "Building feature rows"),
+                (2, "Rolling validation"),
+                (3, "Fitting final model"),
+                (4, "Scoring current households"),
+            ]
+        );
+        let sufficient = with.0.validation.years.iter().filter(|y| y.sufficient).count() as u64;
+        let validation_ticks: Vec<&crate::progress::ProgressEvent> = events
+            .iter()
+            .filter(|e| e.step == 2 && e.done.is_some())
+            .collect();
+        // One tick per test year with training history, then the terminal tick.
+        assert_eq!(validation_ticks.len() as u64, sufficient + 1);
+        assert_eq!(
+            validation_ticks.iter().filter(|e| e.total.is_none()).count() as u64,
+            sufficient
+        );
+        let terminal = validation_ticks.last().unwrap();
+        assert_eq!((terminal.done, terminal.total), (Some(sufficient), Some(sufficient)));
     }
 }

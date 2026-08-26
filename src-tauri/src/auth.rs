@@ -124,6 +124,15 @@ pub fn save_tokens(secrets: &Secrets, t: &TokenSet) -> Result<()> {
 
 // ── network flows ───────────────────────────────────────────────────────────
 
+/// HTTP client for the short session-recovery calls (identity + refresh), bounded so a
+/// hung or unreachable network cannot block startup indefinitely.
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -236,7 +245,7 @@ pub async fn refresh(cfg: &Config, secrets: &Secrets, current: &TokenSet) -> Res
         .refresh_token
         .as_deref()
         .ok_or_else(|| anyhow!("no refresh token; please reconnect"))?;
-    let resp = reqwest::Client::new()
+    let resp = http()
         .post(format!("{}/services/oauth2/token", cfg.login_url))
         .form(&[
             ("grant_type", "refresh_token"),
@@ -278,7 +287,7 @@ pub async fn revoke(cfg: &Config, tokens: &TokenSet) {
 }
 
 pub async fn fetch_identity(tokens: &TokenSet) -> Result<Identity> {
-    let resp = reqwest::Client::new()
+    let resp = http()
         .get(&tokens.id)
         .bearer_auth(&tokens.access_token)
         .send()

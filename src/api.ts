@@ -68,6 +68,7 @@ export type InsightView = (typeof INSIGHT_VIEWS)[number];
 export const OPS = ["=", "!=", ">", "<", ">=", "<=", "contains"] as const;
 
 export const getStatus = () => invoke<StatusView>("get_status");
+export const recoverIdentity = () => invoke<Identity | null>("recover_identity");
 export const connect = () => invoke<Identity>("connect");
 export const disconnect = () => invoke<void>("disconnect");
 export const scan = () => invoke<ScanSummary>("scan");
@@ -113,6 +114,19 @@ export const onScanProgress = (cb: (p: { done: number; total: number }) => void)
   listen<{ done: number; total: number }>("scan:progress", (e) => cb(e.payload));
 export const onSyncProgress = (cb: (p: { object: string; rows: number }) => void): Promise<UnlistenFn> =>
   listen<{ object: string; rows: number }>("sync:progress", (e) => cb(e.payload));
+/**
+ * Live progress of a long-running Insights job. `step` is 1-based and indexes the job's
+ * fixed phase list (rebuild: 5 phases, risk: 4); `done`/`total` are per-phase counters when
+ * known. A final event with `step === steps` closes a job.
+ */
+export interface InsightsProgress {
+  job: "rebuild" | "risk"; phase: string; step: number; steps: number;
+  done: number | null; total: number | null; elapsed_ms: number;
+}
+export const onInsightsProgress = (cb: (p: InsightsProgress) => void): Promise<UnlistenFn> =>
+  listen<InsightsProgress>("insights:progress", (e) => cb(e.payload));
+/** Latest progress payload if a job is running right now, else null. Never blocks. */
+export const getInsightsJob = () => invoke<InsightsProgress | null>("get_insights_job");
 
 export type LlmProvider = "anthropic" | "openai" | "google" | "ollama" | "custom";
 export const PROVIDERS: LlmProvider[] = ["anthropic", "openai", "google", "ollama", "custom"];

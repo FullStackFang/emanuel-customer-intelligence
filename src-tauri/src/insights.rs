@@ -1,6 +1,7 @@
 //! Membership insights: fiscal-year math, the household mart, and the views
 //! the Insights page renders. Reads the mirror only; never Salesforce.
 
+use crate::progress::{noop, Reporter};
 use crate::store::{ident, Store};
 use anyhow::Result;
 use rusqlite::params;
@@ -310,33 +311,65 @@ pub fn dues_evidence(
     statements: &[BillingStatement<'_>],
     lines: &[BillingStatementLine<'_>],
 ) -> DuesEvidence {
-    let matching: Vec<_> = statements
-        .iter()
-        .filter(|statement| {
-            statement.household_id == Some(household_id)
-                && statement.issued_at.and_then(fy_of) == Some(fiscal_year)
-        })
-        .collect();
-    let qualifying: Vec<_> = lines
-        .iter()
-        .filter(|line| {
-            matching
-                .iter()
-                .any(|statement| line.statement_id == Some(statement.id))
-                && dues_class(line.product_family, line.product_name) == DuesClass::Membership
-        })
-        .collect();
-    if qualifying.is_empty() {
-        return DuesEvidence {
-            coverage: BillingCoverage::Missing,
-            dues_billed: 0.0,
-            settlement: SettlementState::Unknown,
-        };
+    DuesIndex::build(statements, lines).evidence(household_id, fiscal_year)
+}
+
+/// Membership dues lines grouped by household-year, built once per rebuild so each
+/// household-year is one hash lookup instead of a scan of every statement and line.
+/// The evidence is identical to scanning: the same lines qualify, in the same order.
+pub struct DuesIndex<'a> {
+    /// Qualifying (membership-class) lines per `(household_id, fy)`, in original line order.
+    qualifying: std::collections::HashMap<(&'a str, i32), Vec<BillingStatementLine<'a>>>,
+}
+
+impl<'a> DuesIndex<'a> {
+    pub fn build(statements: &[BillingStatement<'a>], lines: &[BillingStatementLine<'a>]) -> Self {
+        // Statement id -> the household-years it places lines in. A line matches a
+        // statement by exact id, and `""` is a legal id. Statements that name no household
+        // or carry no parseable date never match anything, so they are left out.
+        let mut household_years: std::collections::HashMap<&'a str, Vec<(&'a str, i32)>> =
+            std::collections::HashMap::with_capacity(statements.len());
+        for statement in statements {
+            let (Some(household_id), Some(fy)) = (
+                statement.household_id,
+                statement.issued_at.and_then(fy_of),
+            ) else {
+                continue;
+            };
+            let targets = household_years.entry(statement.id).or_default();
+            if !targets.contains(&(household_id, fy)) {
+                targets.push((household_id, fy));
+            }
+        }
+        let mut qualifying: std::collections::HashMap<(&'a str, i32), Vec<BillingStatementLine<'a>>> =
+            std::collections::HashMap::new();
+        for line in lines {
+            let Some(targets) = line.statement_id.and_then(|id| household_years.get(id)) else {
+                continue;
+            };
+            if dues_class(line.product_family, line.product_name) != DuesClass::Membership {
+                continue;
+            }
+            for key in targets {
+                qualifying.entry(*key).or_default().push(*line);
+            }
+        }
+        Self { qualifying }
     }
-    DuesEvidence {
-        coverage: BillingCoverage::Present,
-        dues_billed: qualifying.iter().filter_map(|line| line.amount).sum(),
-        settlement: combined_settlement(qualifying.iter().map(|line| line_settlement(line))),
+
+    pub fn evidence(&self, household_id: &str, fiscal_year: i32) -> DuesEvidence {
+        let Some(qualifying) = self.qualifying.get(&(household_id, fiscal_year)) else {
+            return DuesEvidence {
+                coverage: BillingCoverage::Missing,
+                dues_billed: 0.0,
+                settlement: SettlementState::Unknown,
+            };
+        };
+        DuesEvidence {
+            coverage: BillingCoverage::Present,
+            dues_billed: qualifying.iter().filter_map(|line| line.amount).sum(),
+            settlement: combined_settlement(qualifying.iter().map(line_settlement)),
+        }
     }
 }
 
@@ -480,6 +513,17 @@ pub struct SourceCapability {
     pub last_synced_at: Option<String>,
     pub unavailable_reason: Option<String>,
 }
+
+/// Every mirror object the mart reads (`rebuild_with` and the `apply_*` adapters). A sync
+/// of any other object cannot change the mart, so it neither marks it stale nor triggers a
+/// rebuild. Keep in step with the `mirror_rows`/`mirror_columns` calls in this module.
+pub const MART_SOURCE_OBJECTS: &[&str] = &[
+    "Account",
+    "BillingStatement__c",
+    "BillingStatementLine__c",
+    "Class_Enrolment__c",
+    "Committee_Membership__c",
+];
 
 const SOURCE_CAPABILITIES: [(&str, &[&str]); 4] = [
     ("membership", &["Account"]),
@@ -834,17 +878,21 @@ fn field<'a>(
 
 /// Populate Relationship Anchors on the household-year rows from the optional mirror
 /// sources. Capability-gated: an unsynced source leaves its anchors empty.
-fn apply_anchor_sources(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+fn apply_anchor_sources(
+    store: &Store,
+    rows: &mut [HhFy],
+    progress: &mut Reporter<'_>,
+) -> Result<()> {
     let caps = source_capabilities(store)?;
     let through = current_fy();
     if cap_available(&caps, "renewal") {
-        apply_dues(store, rows)?;
+        apply_dues(store, rows, progress)?;
     }
     if cap_available(&caps, "school") {
-        apply_school(store, rows)?;
+        apply_school(store, rows, progress)?;
     }
     if cap_available(&caps, "committee") {
-        apply_committee(store, rows, through)?;
+        apply_committee(store, rows, through, progress)?;
     }
     Ok(())
 }
@@ -872,7 +920,7 @@ fn mark_observed(
     }
 }
 
-fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+fn apply_dues(store: &Store, rows: &mut [HhFy], progress: &mut Reporter<'_>) -> Result<()> {
     let statement_cols = store.mirror_columns("BillingStatement__c")?;
     let line_cols = store.mirror_columns("BillingStatementLine__c")?;
     let s_id = resolve_col(&statement_cols, STATEMENT_FIELDS.id);
@@ -917,8 +965,12 @@ fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
         .filter_map(|s| s.issued_at.and_then(fy_of))
         .collect();
     mark_observed(rows, &observed_fys, |r| &mut r.renewal_observed);
-    for row in rows.iter_mut() {
-        let evidence = dues_evidence(&row.account_id, row.fy, &statements, &lines);
+    let index = DuesIndex::build(&statements, &lines);
+    let total = rows.len() as u64;
+    progress.tick(0, Some(total));
+    for (i, row) in rows.iter_mut().enumerate() {
+        progress.tick(i as u64 + 1, Some(total));
+        let evidence = index.evidence(&row.account_id, row.fy);
         match evidence.coverage {
             BillingCoverage::Present => {
                 row.anchor_dues = true;
@@ -935,7 +987,7 @@ fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
     Ok(())
 }
 
-fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+fn apply_school(store: &Store, rows: &mut [HhFy], progress: &mut Reporter<'_>) -> Result<()> {
     let cols = store.mirror_columns("Class_Enrolment__c")?;
     let hh = resolve_col(&cols, ENROLMENT_FIELDS.household);
     let is_nursery = resolve_col(&cols, ENROLMENT_FIELDS.is_nursery);
@@ -947,7 +999,10 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
     }
     let index = row_index(rows);
     let mut observed_fys = std::collections::HashSet::new();
-    for r in store.mirror_rows("Class_Enrolment__c")? {
+    let enrolment_rows = store.mirror_rows("Class_Enrolment__c")?;
+    let total = enrolment_rows.len() as u64;
+    for (i, r) in enrolment_rows.into_iter().enumerate() {
+        progress.tick(i as u64 + 1, Some(total));
         let Some(account_id) = field(&r, &hh) else {
             continue;
         };
@@ -979,7 +1034,12 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
     Ok(())
 }
 
-fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()> {
+fn apply_committee(
+    store: &Store,
+    rows: &mut [HhFy],
+    through: i32,
+    progress: &mut Reporter<'_>,
+) -> Result<()> {
     let cols = store.mirror_columns("Committee_Membership__c")?;
     let hh = resolve_col(&cols, COMMITTEE_FIELDS.household);
     let start = resolve_col(&cols, COMMITTEE_FIELDS.start);
@@ -996,7 +1056,10 @@ fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()>
             rows[*idx].anchor_committee = true;
         }
     };
-    for r in store.mirror_rows("Committee_Membership__c")? {
+    let committee_rows = store.mirror_rows("Committee_Membership__c")?;
+    let total = committee_rows.len() as u64;
+    for (i, r) in committee_rows.into_iter().enumerate() {
+        progress.tick(i as u64 + 1, Some(total));
         let Some(account_id) = field(&r, &hh) else {
             continue;
         };
@@ -1016,7 +1079,20 @@ fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()>
 }
 
 /// Rebuild `_m_household` from the Account mirror. One transaction; drop + create + insert.
+/// Rebuild the analytical mart with no progress reporting.
 pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
+    let mut sink = noop();
+    let mut progress = Reporter::new("rebuild", REBUILD_STEPS, &mut sink);
+    rebuild_with(store, &mut progress)
+}
+
+/// Number of phases `rebuild_with` reports (the `Reporter` must be built with this).
+pub const REBUILD_STEPS: u32 = 5;
+
+/// Rebuild the analytical mart, reporting phase and row-count progress through `progress`
+/// so a long post-sync rebuild is visibly working rather than appearing hung. Progress is
+/// a pure side effect: it never changes what is built.
+pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<RebuildInfo> {
     let present = store.mirror_columns("Account")?;
     if present.is_empty() {
         anyhow::bail!("Account is not synced; sync it before building insights");
@@ -1049,8 +1125,15 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
         .join(", ");
     let sql = format!("SELECT {select_list} FROM \"Account\" WHERE \"Type\" = 'Member Family'");
 
+    progress.phase("Reading membership records");
+    let total_rows: u64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM \"Account\" WHERE \"Type\" = 'Member Family'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? as u64;
     let rows: Vec<Hh> = {
         let mut st = store.conn().prepare(&sql)?;
+        let mut read: u64 = 0;
         let it = st.query_map([], |r| {
             let mut raw: [Option<String>; 16] = Default::default();
             for (i, slot) in raw.iter_mut().enumerate() {
@@ -1058,14 +1141,26 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
             }
             Ok(derive(&raw))
         })?;
-        it.collect::<std::result::Result<_, _>>()?
+        let mut out = Vec::with_capacity(total_rows as usize);
+        progress.tick(0, Some(total_rows));
+        for h in it {
+            out.push(h?);
+            read += 1;
+            progress.tick(read, Some(total_rows));
+        }
+        out
     };
 
+    progress.phase("Building yearly membership history");
     let mut household_fy = household_year_rows(&rows, current_fy());
     // Apply optional Relationship Anchor sources before opening the write transaction
     // (they read the mirror tables). Each source is capability-gated and contributes
     // nothing when its objects are not synced.
-    apply_anchor_sources(store, &mut household_fy)?;
+    progress.phase("Applying engagement sources");
+    apply_anchor_sources(store, &mut household_fy, progress)?;
+    progress.phase("Writing analysis tables");
+    let write_total = (rows.len() + household_fy.len()) as u64;
+    let mut written: u64 = 0;
     let tx = store.conn_mut().transaction()?;
     tx.execute_batch(&format!(
         "DROP TABLE IF EXISTS {MART}; DROP TABLE IF EXISTS {MART_FY}"
@@ -1110,6 +1205,8 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
                 h.resign_reason_group.clone().into(),
             ]);
             st.execute(rusqlite::params_from_iter(vals.iter()))?;
+            written += 1;
+            progress.tick(written, Some(write_total));
         }
     }
     {
@@ -1151,8 +1248,11 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
                 (row.committee_observed as i64).into(),
             ]);
             st.execute(rusqlite::params_from_iter(values.iter()))?;
+            written += 1;
+            progress.tick(written, Some(write_total));
         }
     }
+    progress.phase("Finalizing");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     tx.execute(
         "INSERT INTO _meta(key, value) VALUES('insights_built_at', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1167,6 +1267,7 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
         params![MART_SCHEMA_VERSION.to_string()],
     )?;
     tx.commit()?;
+    progress.finish();
     Ok(RebuildInfo {
         households: rows.len(),
         unavailable,
@@ -1436,7 +1537,48 @@ pub fn year1(hh: &[Hh], cur: i32) -> Vec<CohortYear1> {
         .collect()
 }
 
+/// Household-year rows grouped by account, built once per `views` call so the cohort and
+/// channel views find a household's years by hash lookup instead of scanning every row
+/// per member. Rows keep their input order within an account, so "any year matching" and
+/// "latest year" resolve exactly as the full scans did.
+pub struct HouseholdYearIndex<'a> {
+    by_account: std::collections::HashMap<&'a str, Vec<&'a HhFy>>,
+}
+
+impl<'a> HouseholdYearIndex<'a> {
+    pub fn build(rows: &'a [HhFy]) -> Self {
+        let mut by_account: std::collections::HashMap<&str, Vec<&HhFy>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            by_account
+                .entry(row.account_id.as_str())
+                .or_default()
+                .push(row);
+        }
+        Self { by_account }
+    }
+
+    /// Every row for `account_id`, in input order.
+    fn account_years(&self, account_id: &str) -> &[&'a HhFy] {
+        self.by_account
+            .get(account_id)
+            .map(|rows| rows.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether `account_id` was active at the end of fiscal year `fy`.
+    fn active_in(&self, account_id: &str, fy: i32) -> bool {
+        self.account_years(account_id)
+            .iter()
+            .any(|row| row.fy == fy && row.active_end_of_fy)
+    }
+}
+
 pub fn year1_from_household_years(rows: &[HhFy], cur: i32) -> Vec<CohortYear1> {
+    year1_indexed(rows, &HouseholdYearIndex::build(rows), cur)
+}
+
+pub fn year1_indexed(rows: &[HhFy], index: &HouseholdYearIndex<'_>, cur: i32) -> Vec<CohortYear1> {
     (FIRST_COHORT_FY..cur)
         .filter_map(|cohort| {
             let members: Vec<_> = rows
@@ -1448,13 +1590,7 @@ pub fn year1_from_household_years(rows: &[HhFy], cur: i32) -> Vec<CohortYear1> {
             }
             let kept = members
                 .iter()
-                .filter(|member| {
-                    rows.iter().any(|row| {
-                        row.account_id == member.account_id
-                            && row.fy == cohort + 1
-                            && row.active_end_of_fy
-                    })
-                })
+                .filter(|member| index.active_in(&member.account_id, cohort + 1))
                 .count() as i64;
             Some(CohortYear1 {
                 cohort,
@@ -1489,6 +1625,14 @@ pub fn cohort_matrix(hh: &[Hh], cur: i32) -> Vec<CohortCell> {
 }
 
 pub fn cohort_matrix_from_household_years(rows: &[HhFy], cur: i32) -> Vec<CohortCell> {
+    cohort_matrix_indexed(rows, &HouseholdYearIndex::build(rows), cur)
+}
+
+pub fn cohort_matrix_indexed(
+    rows: &[HhFy],
+    index: &HouseholdYearIndex<'_>,
+    cur: i32,
+) -> Vec<CohortCell> {
     let mut out = Vec::new();
     for cohort in FIRST_COHORT_FY..cur {
         let members: Vec<_> = rows
@@ -1504,13 +1648,7 @@ pub fn cohort_matrix_from_household_years(rows: &[HhFy], cur: i32) -> Vec<Cohort
             }
             let kept = members
                 .iter()
-                .filter(|member| {
-                    rows.iter().any(|row| {
-                        row.account_id == member.account_id
-                            && row.fy == cohort + k
-                            && row.active_end_of_fy
-                    })
-                })
+                .filter(|member| index.active_in(&member.account_id, cohort + k))
                 .count() as i64;
             out.push(CohortCell {
                 cohort,
@@ -1949,10 +2087,15 @@ pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
 
 // ── at-risk rules (fixed in code; tuning is a code change on purpose) ───────
 
-pub fn kpis_from_household_years(rows: &[HhFy], cur: i32, at_risk_count: i64) -> Kpis {
-    let y1 = year1_from_household_years(rows, cur);
-    let latest = y1.iter().filter(|row| row.cohort <= cur - 2).last();
-    let baseline: Vec<_> = y1.iter().filter(|row| row.cohort <= cur - 3).collect();
+/// `year1` is the already-computed `year1_indexed` view for the same rows and `cur`.
+pub fn kpis_from_household_years(
+    rows: &[HhFy],
+    year1: &[CohortYear1],
+    cur: i32,
+    at_risk_count: i64,
+) -> Kpis {
+    let latest = year1.iter().filter(|row| row.cohort <= cur - 2).last();
+    let baseline: Vec<_> = year1.iter().filter(|row| row.cohort <= cur - 3).collect();
     let year1_baseline_pct = if baseline.is_empty() {
         0.0
     } else {
@@ -1979,6 +2122,14 @@ pub fn kpis_from_household_years(rows: &[HhFy], cur: i32, at_risk_count: i64) ->
 }
 
 pub fn channels_from_household_years(rows: &[HhFy], cur: i32) -> Vec<ChannelRow> {
+    channels_indexed(rows, &HouseholdYearIndex::build(rows), cur)
+}
+
+pub fn channels_indexed(
+    rows: &[HhFy],
+    index: &HouseholdYearIndex<'_>,
+    cur: i32,
+) -> Vec<ChannelRow> {
     let joiners: Vec<_> = rows
         .iter()
         .filter(|row| row.joined_this_fy && row.fy >= cur - 12 && row.fy <= cur - 4)
@@ -1986,17 +2137,21 @@ pub fn channels_from_household_years(rows: &[HhFy], cur: i32) -> Vec<ChannelRow>
     let mut out: Vec<_> = CHANNELS
         .iter()
         .enumerate()
-        .filter_map(|(index, (key, _))| {
-            let members: Vec<_> = joiners.iter().filter(|row| row.entry_jobs[index]).collect();
+        .filter_map(|(channel, (key, _))| {
+            let members: Vec<_> = joiners.iter().filter(|row| row.entry_jobs[channel]).collect();
             if members.len() < CHANNEL_MIN_N {
                 return None;
             }
+            // The household's latest year; on a tied `fy`, `max_by_key` keeps the last
+            // row in input order, exactly as the full scan did.
             let outcomes: Vec<_> = members
                 .iter()
                 .map(|member| {
-                    rows.iter()
-                        .filter(|row| row.account_id == member.account_id)
+                    index
+                        .account_years(&member.account_id)
+                        .iter()
                         .max_by_key(|row| row.fy)
+                        .copied()
                 })
                 .collect();
             let n = members.len() as i64;
@@ -2297,8 +2452,11 @@ pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(Stri
 pub fn views(store: &Store, cur: i32) -> Result<Insights> {
     let hh = load(store)?;
     let household_years = load_household_years(store)?;
+    let index = HouseholdYearIndex::build(&household_years);
     let built_at = store.get_meta("insights_built_at")?;
-    let newest_source_sync_at = store.newest_sync_at()?;
+    // Only the objects the mart reads can make it stale; this mirrors the rebuild decision
+    // in `commands::ensure_fresh_with`, so the "stale" badge and the rebuild agree.
+    let newest_source_sync_at = store.newest_mart_source_sync_at()?;
     let stale = matches!((&built_at, &newest_source_sync_at), (Some(built), Some(source)) if source > built);
     let unavailable: Vec<String> = store
         .get_meta("insights_unavailable")?
@@ -2321,17 +2479,18 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
     } else {
         Vec::new()
     };
+    let year1 = year1_indexed(&household_years, &index, cur);
     Ok(Insights {
         built_at,
         newest_source_sync_at,
         stale,
         current_fy: cur,
         unavailable,
-        kpis: kpis_from_household_years(&household_years, cur, at_risk),
+        kpis: kpis_from_household_years(&household_years, &year1, cur, at_risk),
         trend: trend_from_household_years(&household_years, cur),
-        year1: year1_from_household_years(&household_years, cur),
-        cohort_matrix: cohort_matrix_from_household_years(&household_years, cur),
-        channels: channels_from_household_years(&household_years, cur),
+        cohort_matrix: cohort_matrix_indexed(&household_years, &index, cur),
+        channels: channels_indexed(&household_years, &index, cur),
+        year1,
         school: school(&hh, cur),
         reasons: reasons_from_household_years(&household_years, cur),
         multi_job: multi_job(&hh, cur),
@@ -2456,6 +2615,119 @@ mod tests {
             DuesClass::Sale
         );
         assert_eq!(dues_class(None, Some("Parking")), DuesClass::Other);
+    }
+
+    /// Reference implementation: the original per-household-year linear scan over every
+    /// statement and line. `DuesIndex` must reproduce it exactly, including the f64 sum
+    /// order of `dues_billed`.
+    fn dues_evidence_naive(
+        household_id: &str,
+        fiscal_year: i32,
+        statements: &[BillingStatement<'_>],
+        lines: &[BillingStatementLine<'_>],
+    ) -> DuesEvidence {
+        let matching: Vec<_> = statements
+            .iter()
+            .filter(|statement| {
+                statement.household_id == Some(household_id)
+                    && statement.issued_at.and_then(fy_of) == Some(fiscal_year)
+            })
+            .collect();
+        let qualifying: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                matching
+                    .iter()
+                    .any(|statement| line.statement_id == Some(statement.id))
+                    && dues_class(line.product_family, line.product_name) == DuesClass::Membership
+            })
+            .collect();
+        if qualifying.is_empty() {
+            return DuesEvidence {
+                coverage: BillingCoverage::Missing,
+                dues_billed: 0.0,
+                settlement: SettlementState::Unknown,
+            };
+        }
+        DuesEvidence {
+            coverage: BillingCoverage::Present,
+            dues_billed: qualifying.iter().filter_map(|line| line.amount).sum(),
+            settlement: combined_settlement(qualifying.iter().map(|line| line_settlement(line))),
+        }
+    }
+
+    #[test]
+    fn dues_index_matches_the_naive_scan_exactly() {
+        let stmt = |id: &'static str, hh: Option<&'static str>, at: Option<&'static str>| {
+            BillingStatement {
+                id,
+                household_id: hh,
+                issued_at: at,
+            }
+        };
+        let statements = [
+            stmt("s1", Some("hh-1"), Some("2024-07-01")), // hh-1 FY2025
+            stmt("s2", Some("hh-1"), Some("2024-09-15")), // hh-1 FY2025 (second statement)
+            stmt("s3", Some("hh-1"), Some("2023-07-01")), // hh-1 FY2024
+            stmt("s4", Some("hh-2"), Some("2024-07-01")), // hh-2 FY2025
+            stmt("s5", None, Some("2024-07-01")),         // no household: never matches
+            stmt("s6", Some("hh-3"), None),               // no date: never matches
+            stmt("s7", Some("hh-3"), Some("not-a-date")), // unparsable: never matches
+            stmt("", Some("hh-4"), Some("2024-07-01")),   // "" is a legal statement id
+            stmt("dup", Some("hh-5"), Some("2024-07-01")), // same id on two household-years
+            stmt("dup", Some("hh-6"), Some("2024-07-01")),
+            stmt("dup", Some("hh-5"), Some("2024-08-01")), // same id, same household-year twice
+        ];
+        let other = |statement_id: Option<&'static str>, amount: f64| BillingStatementLine {
+            statement_id,
+            product_family: Some("Fees"),
+            product_name: Some("Security Fee"),
+            amount: Some(amount),
+            received: Some(0.0),
+            balance: Some(amount),
+        };
+        let lines = [
+            // hh-1 FY2025: amounts whose f64 sum depends on order (0.1 + 0.2 + 0.3).
+            BillingStatementLine::dues("s1", 0.1, Some(0.1), Some(0.0)),
+            other(Some("s1"), 75.0),
+            BillingStatementLine::dues("s2", 0.2, Some(0.0), Some(0.2)),
+            BillingStatementLine::dues("s3", 400.0, Some(400.0), Some(0.0)),
+            BillingStatementLine::dues("s1", 0.3, None, None),
+            BillingStatementLine::dues("s4", 500.0, Some(100.0), Some(400.0)),
+            BillingStatementLine::dues("s5", 999.0, Some(999.0), Some(0.0)),
+            BillingStatementLine::dues("s6", 999.0, Some(999.0), Some(0.0)),
+            BillingStatementLine::dues("s7", 999.0, Some(999.0), Some(0.0)),
+            BillingStatementLine::dues("", 250.0, Some(250.0), Some(0.0)),
+            BillingStatementLine::dues("dup", 10.0, Some(10.0), Some(0.0)),
+            BillingStatementLine::dues("missing-parent", 999.0, Some(0.0), Some(999.0)),
+            BillingStatementLine {
+                statement_id: None,
+                ..BillingStatementLine::dues("s1", 999.0, Some(0.0), Some(999.0))
+            },
+            BillingStatementLine {
+                amount: None,
+                ..BillingStatementLine::dues("s2", 0.0, Some(0.0), Some(0.0))
+            },
+            other(None, 1.0),
+        ];
+        let index = DuesIndex::build(&statements, &lines);
+        let households = ["hh-1", "hh-2", "hh-3", "hh-4", "hh-5", "hh-6", "hh-7", ""];
+        let mut present = 0;
+        for household in households {
+            for fy in 2023..=2026 {
+                let naive = dues_evidence_naive(household, fy, &statements, &lines);
+                let indexed = index.evidence(household, fy);
+                assert_eq!(indexed, naive, "{household} FY{fy}");
+                assert_eq!(dues_evidence(household, fy, &statements, &lines), naive);
+                if naive.coverage == BillingCoverage::Present {
+                    present += 1;
+                }
+            }
+        }
+        assert_eq!(present, 6, "hh-1 x2, hh-2, hh-4, hh-5, hh-6");
+        let hh1 = index.evidence("hh-1", 2025);
+        assert_eq!(hh1.dues_billed.to_bits(), (0.1f64 + 0.2 + 0.3).to_bits());
+        assert_eq!(hh1.settlement, SettlementState::Unknown);
     }
 
     #[test]
@@ -2935,6 +3207,62 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_reports_five_phases_in_order_with_counts() {
+        use crate::progress::{ProgressEvent, Reporter};
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        let mut events: Vec<ProgressEvent> = Vec::new();
+        let mut sink = |e: &ProgressEvent| events.push(e.clone());
+        let mut reporter =
+            Reporter::new("rebuild", 5, &mut sink).with_min_interval(std::time::Duration::ZERO);
+        let info = rebuild_with(&mut s, &mut reporter).unwrap();
+
+        assert!(events.iter().all(|e| e.job == "rebuild" && e.steps == 5));
+        // Phase transitions (events without counters) arrive in the fixed order, 1..=5.
+        let phases: Vec<(u32, &str)> = events
+            .iter()
+            .filter(|e| e.done.is_none())
+            .map(|e| (e.step, e.phase.as_str()))
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                (1, "Reading membership records"),
+                (2, "Building yearly membership history"),
+                (3, "Applying engagement sources"),
+                (4, "Writing analysis tables"),
+                (5, "Finalizing"),
+                (5, "Finalizing"), // finish()
+            ]
+        );
+        // Steps never go backwards and the last event is terminal.
+        assert!(events.windows(2).all(|w| w[0].step <= w[1].step));
+        assert_eq!(events.last().unwrap().step, 5);
+        // Phase 1 counts Account rows: the terminal tick has done == total == seeded rows.
+        let read_ticks: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(|e| e.step == 1 && e.done.is_some())
+            .collect();
+        let last = read_ticks.last().expect("phase 1 ticks");
+        assert_eq!(last.done, Some(6));
+        assert_eq!(last.total, Some(6));
+        // Phase 4 writes every household and household-year row.
+        let write_last = events
+            .iter()
+            .filter(|e| e.step == 4 && e.done.is_some())
+            .last()
+            .expect("phase 4 ticks");
+        let fy_rows = load_household_years(&s).unwrap().len() as u64;
+        assert_eq!(write_last.done, Some(6 + fy_rows));
+        assert_eq!(write_last.total, Some(6 + fy_rows));
+
+        // Progress is a pure side effect: the rebuild result is unchanged.
+        let plain = rebuild(&mut s).unwrap();
+        assert_eq!(info.households, plain.households);
+        assert_eq!(info.unavailable, plain.unavailable);
+    }
+
+    #[test]
     fn source_capabilities_require_every_required_mirror_and_report_freshness() {
         let (_d, mut s) = mem();
         seed_account(&mut s, &fixture(), &ACCT_COLS);
@@ -2969,6 +3297,43 @@ mod tests {
         s.set_meta("insights_built_at", "2000-01-01T00:00:00Z")
             .unwrap();
         assert!(views(&s, 2026).unwrap().stale);
+    }
+
+    #[test]
+    fn only_a_sync_of_a_mart_source_makes_the_views_stale() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        s.set_meta("insights_built_at", "2027-01-01T00:00:00Z")
+            .unwrap();
+        let sync_at = |s: &Store, object: &str, at: &str| {
+            s.upsert_object(object, object, 0).unwrap();
+            s.conn()
+                .execute(
+                    "UPDATE _objects SET last_synced_at = ?2 WHERE name = ?1",
+                    params![object, at],
+                )
+                .unwrap();
+        };
+
+        // Contact is never read by the mart: a newer sync of it changes nothing.
+        sync_at(&s, "Contact", "2027-02-01T00:00:00Z");
+        let v = views(&s, 2026).unwrap();
+        assert!(!v.stale, "an unrelated sync must not mark the mart stale");
+        assert!(
+            v.newest_source_sync_at.as_deref() < Some("2027-01-01T00:00:00Z"),
+            "the reported source sync is the mart's own sources, not Contact's: {:?}",
+            v.newest_source_sync_at
+        );
+
+        // Account is a mart source: a newer sync of it does.
+        sync_at(&s, "Account", "2027-03-01T00:00:00Z");
+        let v = views(&s, 2026).unwrap();
+        assert!(v.stale);
+        assert_eq!(
+            v.newest_source_sync_at.as_deref(),
+            Some("2027-03-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -3381,6 +3746,248 @@ mod tests {
         );
         assert_eq!(t.first().unwrap().fy, 2005);
         assert_eq!(t.last().unwrap().fy, 2023);
+    }
+
+    // ── reference implementations of the household-year views ──────────────
+    // The original bodies: one linear scan of every row per member. The indexed
+    // versions must reproduce them exactly.
+
+    fn year1_reference(rows: &[HhFy], cur: i32) -> Vec<CohortYear1> {
+        (FIRST_COHORT_FY..cur)
+            .filter_map(|cohort| {
+                let members: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row.fy == cohort && row.joined_this_fy)
+                    .collect();
+                if members.is_empty() {
+                    return None;
+                }
+                let kept = members
+                    .iter()
+                    .filter(|member| {
+                        rows.iter().any(|row| {
+                            row.account_id == member.account_id
+                                && row.fy == cohort + 1
+                                && row.active_end_of_fy
+                        })
+                    })
+                    .count() as i64;
+                Some(CohortYear1 {
+                    cohort,
+                    n: members.len() as i64,
+                    pct_retained: pct(kept, members.len() as i64),
+                })
+            })
+            .collect()
+    }
+
+    fn cohort_matrix_reference(rows: &[HhFy], cur: i32) -> Vec<CohortCell> {
+        let mut out = Vec::new();
+        for cohort in FIRST_COHORT_FY..cur {
+            let members: Vec<_> = rows
+                .iter()
+                .filter(|row| row.fy == cohort && row.joined_this_fy)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            for k in 1..=MAX_K {
+                if cohort + k > cur {
+                    break;
+                }
+                let kept = members
+                    .iter()
+                    .filter(|member| {
+                        rows.iter().any(|row| {
+                            row.account_id == member.account_id
+                                && row.fy == cohort + k
+                                && row.active_end_of_fy
+                        })
+                    })
+                    .count() as i64;
+                out.push(CohortCell {
+                    cohort,
+                    n: members.len() as i64,
+                    k,
+                    pct_retained: pct(kept, members.len() as i64),
+                });
+            }
+        }
+        out
+    }
+
+    fn channels_reference(rows: &[HhFy], cur: i32) -> Vec<ChannelRow> {
+        let joiners: Vec<_> = rows
+            .iter()
+            .filter(|row| row.joined_this_fy && row.fy >= cur - 12 && row.fy <= cur - 4)
+            .collect();
+        let mut out: Vec<_> = CHANNELS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (key, _))| {
+                let members: Vec<_> = joiners.iter().filter(|row| row.entry_jobs[index]).collect();
+                if members.len() < CHANNEL_MIN_N {
+                    return None;
+                }
+                let outcomes: Vec<_> = members
+                    .iter()
+                    .map(|member| {
+                        rows.iter()
+                            .filter(|row| row.account_id == member.account_id)
+                            .max_by_key(|row| row.fy)
+                    })
+                    .collect();
+                let n = members.len() as i64;
+                let still_members = outcomes
+                    .iter()
+                    .filter(|row| row.is_some_and(|row| row.active_end_of_fy))
+                    .count() as i64;
+                let avg_tenure = outcomes
+                    .iter()
+                    .filter_map(|row| row.and_then(|row| row.tenure_years))
+                    .map(f64::from)
+                    .sum::<f64>()
+                    / n as f64;
+                let left_within_2y = outcomes
+                    .iter()
+                    .filter(|row| {
+                        row.is_some_and(|row| {
+                            row.resigned_this_fy && row.tenure_years.unwrap_or(i32::MAX) <= 2
+                        })
+                    })
+                    .count() as i64;
+                Some(ChannelRow {
+                    key: (*key).to_string(),
+                    label: channel_label(key),
+                    n,
+                    still_members,
+                    pct: pct(still_members, n),
+                    avg_tenure: (avg_tenure * 10.0).round() / 10.0,
+                    left_within_2y,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.pct
+                .partial_cmp(&a.pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    }
+
+    fn kpis_reference(rows: &[HhFy], cur: i32, at_risk_count: i64) -> Kpis {
+        let y1 = year1_reference(rows, cur);
+        let latest = y1.iter().filter(|row| row.cohort <= cur - 2).last();
+        let baseline: Vec<_> = y1.iter().filter(|row| row.cohort <= cur - 3).collect();
+        let year1_baseline_pct = if baseline.is_empty() {
+            0.0
+        } else {
+            (10.0 * baseline.iter().map(|row| row.pct_retained).sum::<f64>()
+                / baseline.len() as f64)
+                .round()
+                / 10.0
+        };
+        let count = |fy: i32, predicate: fn(&HhFy) -> bool| {
+            rows.iter()
+                .filter(|row| row.fy == fy && predicate(row))
+                .count() as i64
+        };
+        Kpis {
+            members_now: count(cur, |row| row.active_end_of_fy),
+            net_vs_prior_fy: count(cur, |row| row.active_end_of_fy)
+                - count(cur - 1, |row| row.active_end_of_fy),
+            joins_this_fy: count(cur, |row| row.joined_this_fy),
+            resigns_this_fy: count(cur, |row| row.resigned_this_fy),
+            year1_cohort: latest.map(|row| row.cohort).unwrap_or(cur - 1),
+            year1_pct: latest.map(|row| row.pct_retained).unwrap_or(0.0),
+            year1_baseline_pct,
+            at_risk_count,
+        }
+    }
+
+    /// A multi-cohort synthetic mart: 13 cohorts, four exit patterns, three entry
+    /// channels (channel 0 on every household so it clears `CHANNEL_MIN_N`), plus
+    /// households with no usable join date, which produce no rows at all.
+    fn synthetic_household_years(cur: i32) -> Vec<HhFy> {
+        let mut hh = Vec::new();
+        for i in 0..90usize {
+            let join = 2010 + (i % 13) as i32;
+            let mut household = match i % 4 {
+                0 => h(&format!("hh-{i}"), false, Some(join), Some(join + 1)),
+                1 => h(&format!("hh-{i}"), false, Some(join), Some(join + 3)),
+                2 => h(&format!("hh-{i}"), true, Some(join), None),
+                _ => h(&format!("hh-{i}"), false, Some(join), None),
+            };
+            household.ch[0] = true;
+            household.ch[1 + i % 3] = true;
+            household.join_reason = Some("synthetic".into());
+            hh.push(household);
+        }
+        hh.push(h("no-join-a", true, None, None));
+        hh.push(h("no-join-b", false, None, None));
+        household_year_rows(&hh, cur)
+    }
+
+    #[test]
+    fn indexed_household_year_views_match_the_reference_scans() {
+        let cur = 2026;
+        let rows = synthetic_household_years(cur);
+        assert!(rows.len() > 500, "dataset is non-trivial: {}", rows.len());
+        let index = HouseholdYearIndex::build(&rows);
+        let json = |v: &dyn ToJson| v.to_json();
+
+        let year1 = year1_indexed(&rows, &index, cur);
+        assert!(year1.len() >= 10);
+        assert_eq!(json(&year1), json(&year1_reference(&rows, cur)));
+        assert_eq!(
+            json(&year1_from_household_years(&rows, cur)),
+            json(&year1_reference(&rows, cur))
+        );
+
+        let matrix = cohort_matrix_indexed(&rows, &index, cur);
+        assert!(matrix.len() > 50);
+        assert_eq!(json(&matrix), json(&cohort_matrix_reference(&rows, cur)));
+        assert_eq!(
+            json(&cohort_matrix_from_household_years(&rows, cur)),
+            json(&cohort_matrix_reference(&rows, cur))
+        );
+
+        let channels = channels_indexed(&rows, &index, cur);
+        assert!(!channels.is_empty(), "channel 0 clears the minimum n");
+        assert_eq!(json(&channels), json(&channels_reference(&rows, cur)));
+        assert_eq!(
+            json(&channels_from_household_years(&rows, cur)),
+            json(&channels_reference(&rows, cur))
+        );
+
+        assert_eq!(
+            json(&kpis_from_household_years(&rows, &year1, cur, 7)),
+            json(&kpis_reference(&rows, cur, 7))
+        );
+
+        // Rows are keyed by account, not by position: shuffling the input order must not
+        // change the indexed result any more than it changes the reference.
+        let mut shuffled = rows.clone();
+        shuffled.reverse();
+        let index = HouseholdYearIndex::build(&shuffled);
+        assert_eq!(
+            json(&channels_indexed(&shuffled, &index, cur)),
+            json(&channels_reference(&shuffled, cur))
+        );
+        assert_eq!(
+            json(&cohort_matrix_indexed(&shuffled, &index, cur)),
+            json(&cohort_matrix_reference(&shuffled, cur))
+        );
+    }
+
+    /// Exact structural comparison for the `Serialize`-only view rows.
+    trait ToJson {
+        fn to_json(&self) -> serde_json::Value;
+    }
+    impl<T: Serialize> ToJson for T {
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::to_value(self).unwrap()
+        }
     }
 
     #[test]

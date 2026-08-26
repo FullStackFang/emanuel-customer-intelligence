@@ -1,13 +1,25 @@
 // @vitest-environment jsdom
 import type React from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-library/react";
 import type { PageProps } from "../App";
 import * as api from "../api";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+// `listen` returns a Promise<UnlistenFn>; mirror that, and capture callbacks per event name so
+// tests can emit backend events (`emit("insights:progress", payload)`).
+const listeners = vi.hoisted(() => new Map<string, Set<(e: { payload: unknown }) => void>>());
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((name: string, cb: (e: { payload: unknown }) => void) => {
+    if (!listeners.has(name)) listeners.set(name, new Set());
+    listeners.get(name)!.add(cb);
+    return Promise.resolve(() => { listeners.get(name)?.delete(cb); });
+  }),
+}));
+function emit(name: string, payload: unknown) {
+  act(() => { listeners.get(name)?.forEach((cb) => cb({ payload })); });
+}
 
 // Stub the charts module so jsdom never renders recharts; keep a TableView that
 // renders each cell so column content (e.g. household names) is assertable.
@@ -27,7 +39,7 @@ vi.mock("./insights/charts", () => {
   };
 });
 
-import InsightsPage from "./InsightsPage";
+import InsightsPage, { _resetInsightsSnapshot } from "./InsightsPage";
 
 const cap = (key: string, available: boolean): api.SourceCapability => ({
   key, available, required_objects: [], mirrored_columns: available ? ["A"] : [],
@@ -63,19 +75,28 @@ const fakeWatch: api.WatchListView = {
 
 const props = { status: { synced_rows: 100 } as unknown } as PageProps;
 
+/** A command whose promise never settles, for asserting in-flight UI. */
+const pending = () => new Promise<never>(() => {});
+const rebuildEvent = (over: Partial<api.InsightsProgress> = {}): api.InsightsProgress => ({
+  job: "rebuild", phase: "Reading membership records", step: 1, steps: 5, done: null, total: null, elapsed_ms: 0, ...over,
+});
+
+// Table values may be factories: they are called per invocation, so a rejected or
+// never-settling promise is created lazily and only when that command is actually called.
 function mockInvoke(over: Partial<Record<string, unknown>> = {}) {
   invoke.mockImplementation((cmd: string) => {
     const table: Record<string, unknown> = {
-      get_insights: fakeInsights, get_risk_summary: fakeRisk,
+      get_insights: fakeInsights, get_risk_summary: fakeRisk, get_insights_job: null,
       get_watch_list: fakeWatch, export_watch_list_csv: "C:/exports/watch.csv", ...over,
     };
-    return Promise.resolve(cmd in table ? table[cmd] : undefined);
+    const v = cmd in table ? table[cmd] : undefined;
+    return Promise.resolve(typeof v === "function" ? v() : v);
   });
 }
 
 describe("InsightsPage", () => {
-  beforeEach(() => { invoke.mockReset(); mockInvoke(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { invoke.mockReset(); mockInvoke(); listeners.clear(); _resetInsightsSnapshot(); });
+  afterEach(() => { cleanup(); vi.useRealTimers(); });
 
   it("loads aggregates and switches the visible tab section", async () => {
     render(<InsightsPage {...props} />);
@@ -120,5 +141,86 @@ describe("InsightsPage", () => {
     expect(screen.getByText(/No validated household ranking/)).toBeTruthy();
     // No load button when there is no validated ranking.
     expect(screen.queryByRole("button", { name: /Load named Watch List/ })).toBeNull();
+  });
+
+  it("shows a phase checklist with counts and elapsed time while a rebuild runs", async () => {
+    vi.useFakeTimers();
+    mockInvoke({ get_insights: pending });
+    render(<InsightsPage {...props} />);
+    expect(screen.getByText("Loading insights")).toBeTruthy();
+    emit("insights:progress", rebuildEvent({ done: 4000, total: 13030 }));
+    expect(screen.getByText("Building insights")).toBeTruthy();
+    expect(screen.getByText(/4,000 of 13,030/)).toBeTruthy();
+    expect(screen.getByText(/Step 1 of 5/)).toBeTruthy();
+    // Every phase is listed; the first is current, the rest pending.
+    expect(screen.getByText("Reading membership records").closest("li")!.getAttribute("data-state")).toBe("current");
+    expect(screen.getByText("Finalizing").closest("li")!.getAttribute("data-state")).toBe("pending");
+    act(() => { vi.advanceTimersByTime(61_000); });
+    expect(screen.getByText(/Step 1 of 5 · 1:01/)).toBeTruthy();
+    // No promised durations, just facts.
+    expect(screen.queryByText(/minute/)).toBeNull();
+  });
+
+  it("keeps the previous build on screen and shows an inline rebuild banner on revisit", async () => {
+    const { unmount } = render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    unmount();
+    // Revisit: the backend is rebuilding after a sync, so get_insights hangs and emits progress.
+    mockInvoke({ get_insights: pending });
+    render(<InsightsPage {...props} />);
+    expect(screen.getByText("Membership over time")).toBeTruthy();
+    expect(screen.queryByText(/Rebuilding insights from the latest sync/)).toBeNull();
+    emit("insights:progress", rebuildEvent({ phase: "Building yearly membership history", step: 2, done: 2019, total: 2027 }));
+    expect(screen.getByText("Membership over time")).toBeTruthy();
+    expect(screen.getByText(/Rebuilding insights from the latest sync/)).toBeTruthy();
+    expect(screen.getByText(/Building yearly membership history/)).toBeTruthy();
+    expect(screen.queryByText("Building insights")).toBeNull();
+    // The stale-copy lede never claims a manual rebuild is needed while one is running.
+    expect(screen.queryByText(/Rebuild Insights to refresh/)).toBeNull();
+  });
+
+  it("resumes live progress on mount when get_insights_job reports a running rebuild", async () => {
+    mockInvoke({
+      get_insights: pending,
+      get_insights_job: rebuildEvent({ phase: "Applying engagement sources", step: 3, elapsed_ms: 120_000 }),
+    });
+    render(<InsightsPage {...props} />);
+    await screen.findByText(/Step 3 of 5/);
+    expect(screen.getByText(/Step 3 of 5 · 2:0\d/)).toBeTruthy();
+    expect(screen.getByText("Applying engagement sources").closest("li")!.getAttribute("data-state")).toBe("current");
+    expect(screen.getByText("Reading membership records").closest("li")!.getAttribute("data-state")).toBe("done");
+  });
+
+  it("shows risk analysis step progress in the Risk tab and header until the summary arrives", async () => {
+    let resolveRisk!: (r: api.RiskSummary) => void;
+    mockInvoke({ get_risk_summary: () => new Promise<api.RiskSummary>((res) => { resolveRisk = res; }) });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    fireEvent.click(screen.getByRole("button", { name: "Risk" }));
+    expect(screen.getByText(/Analyzing churn risk/)).toBeTruthy();
+    emit("insights:progress", { job: "risk", phase: "Rolling validation", step: 2, steps: 4, done: 3, total: 14, elapsed_ms: 5000 });
+    expect(screen.getByText(/Risk analysis: step 2 of 4/)).toBeTruthy();
+    expect(screen.getByText(/Step 2 of 4/)).toBeTruthy();
+    expect(screen.getByText("Rolling validation").closest("li")!.getAttribute("data-state")).toBe("current");
+    expect(screen.getByText(/3 of 14/)).toBeTruthy();
+    await act(async () => { resolveRisk(fakeRisk); });
+    await screen.findByText("ROC-AUC");
+    expect(screen.queryByText(/Risk analysis/)).toBeNull();
+    expect(screen.queryByText(/Step 2 of 4/)).toBeNull();
+    expect(document.querySelector(".app-spinner")).toBeNull();
+  });
+
+  it("shows an error state with retry instead of a spinner when insights fail to load", async () => {
+    let calls = 0;
+    mockInvoke({ get_insights: () => (++calls === 1 ? Promise.reject(new Error("mirror locked")) : Promise.resolve(fakeInsights)) });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Insights could not load");
+    expect(screen.getByText(/mirror locked/)).toBeTruthy();
+    expect(screen.queryByText("Loading insights")).toBeNull();
+    expect(document.querySelector(".app-spinner")).toBeNull();
+    expect(document.querySelector(".app-progress")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await screen.findByText("Membership over time");
+    expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(2);
   });
 });

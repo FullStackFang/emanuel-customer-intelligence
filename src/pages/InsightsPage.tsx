@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { PageProps } from "../App";
 import * as api from "../api";
-import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, MenuButton } from "../design-system";
+import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
 import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsChart, TableView, TrendChart, Year1Chart } from "./insights/charts";
@@ -43,24 +43,140 @@ const VIEW_LABELS: Record<api.InsightView, string> = {
 /** Map a retention-style row to the horizontal-bar shape. */
 const bar = (label: string, pct: number, n: number, still: number) => ({ label, pct, n, still });
 
+// Phase lists mirror the backend's `insights:progress` contract; `step` indexes them 1-based.
+const REBUILD_PHASES = ["Reading membership records", "Building yearly membership history", "Applying engagement sources", "Writing analysis tables", "Finalizing"] as const;
+const RISK_PHASES = ["Building feature rows", "Rolling validation", "Fitting final model", "Scoring current households"] as const;
+
+const fmtElapsed = (ms: number) => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
+const monoStyle = { fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)", color: "var(--text-tertiary)" } as const;
+
+/**
+ * Live status of a backend job: a phase checklist with the current phase's counter, a
+ * progress bar (determinate once a phase reports a total), and `Step n of m · elapsed`.
+ * Before the first event it shows a single "reading" row so the user still sees time pass.
+ * `compact` collapses it to one line for the inline rebuild banner.
+ */
+function JobStatus({ labels, progress, elapsed, compact = false }: { labels: readonly string[]; progress: api.InsightsProgress | null; elapsed: string; compact?: boolean }) {
+  const counter = progress && progress.done != null && progress.total != null ? `${fmt(progress.done)} of ${fmt(progress.total)}` : null;
+  const spinner = <span className="app-spinner" style={{ width: "0.85em", height: "0.85em" }} aria-hidden />;
+  if (compact) {
+    return (
+      <div style={{ ...monoStyle, display: "flex", alignItems: "center", gap: "var(--space-2)", marginTop: "var(--space-2)" }}>
+        {spinner}
+        <span>{progress ? [progress.phase, counter, elapsed].filter(Boolean).join(" · ") : `Reading the local mirror… · ${elapsed}`}</span>
+      </div>
+    );
+  }
+  // Overall job fraction: completed phases plus the current phase's known share.
+  const pct = progress && progress.done != null && progress.total != null && progress.total > 0
+    ? Math.min(100, Math.round((((progress.step - 1) + progress.done / progress.total) / progress.steps) * 100))
+    : null;
+  const row = (label: string, state: "done" | "current" | "pending", detail?: string | null) => (
+    <li key={label} data-state={state} style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", color: state === "pending" ? "var(--text-tertiary)" : "var(--text-primary)" }}>
+      <span style={{ display: "inline-flex", width: 16, justifyContent: "center", color: state === "done" ? "var(--color-success-600, var(--text-secondary))" : "inherit" }}>
+        {state === "done" ? <Icon name="circle-check" size={16} /> : state === "current" ? spinner : <Icon name="circle" size={16} />}
+      </span>
+      <span>{label}</span>
+      {detail && <span style={monoStyle}>{detail}</span>}
+    </li>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", textAlign: "left" }}>
+      <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "var(--space-2)", fontSize: "var(--text-sm)" }}>
+        {progress === null
+          ? row("Reading the local mirror…", "current")
+          : labels.map((label, i) => {
+            const n = i + 1;
+            return row(label, n < progress.step ? "done" : n === progress.step ? "current" : "pending", n === progress.step ? counter : null);
+          })}
+      </ul>
+      <div className={`app-progress${pct !== null ? " is-determinate" : ""}`} role="progressbar" aria-valuenow={pct ?? undefined} aria-valuemin={0} aria-valuemax={100}>
+        {pct !== null && <div className="app-progress-fill" style={{ width: `${pct}%` }} />}
+      </div>
+      <div style={monoStyle}>{progress ? `Step ${progress.step} of ${progress.steps} · ${elapsed}` : elapsed}</div>
+    </div>
+  );
+}
+
+/**
+ * Session snapshot of the last loaded Insights data, kept at module scope so it survives the
+ * page unmounting on tab switches. Returning to Insights paints from this instantly and
+ * revalidates in the background, instead of reloading from scratch every time.
+ */
+let snapshot: { ins: api.Insights; risk: api.RiskSummary | null; riskFailed: boolean } | null = null;
+/** Test hook: clear the session snapshot so each case starts from a cold page. */
+export function _resetInsightsSnapshot() { snapshot = null; }
+
 export default function InsightsPage({ status }: PageProps) {
-  const [ins, setIns] = useState<api.Insights | null>(null);
-  const [risk, setRisk] = useState<api.RiskSummary | null>(null);
+  const [ins, setIns] = useState<api.Insights | null>(snapshot?.ins ?? null);
+  const [risk, setRisk] = useState<api.RiskSummary | null>(snapshot?.risk ?? null);
+  const [riskFailed, setRiskFailed] = useState(snapshot?.riskFailed ?? false);
   const [watch, setWatch] = useState<api.WatchListView | null>(null);
   const [tab, setTab] = useState<"overview" | "jobs" | "renewal" | "risk">("overview");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [exported, setExported] = useState<string | null>(null);
+  const [progress, setProgress] = useState<api.InsightsProgress | null>(null);
+  const [riskBusy, setRiskBusy] = useState(false);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  // Live job progress: the backend emits phase events only while a rebuild or risk fit runs,
+  // so this stays null on the cached paths. On mount, ask whether a job is already running so
+  // a remounted page (tab revisit) resumes its live status instead of showing nothing.
+  useEffect(() => {
+    let cancelled = false;
+    let un: (() => void) | undefined;
+    const onProgress = (p: api.InsightsProgress) => {
+      const at = Date.now();
+      setProgress(p);
+      setNow(at);
+      // Earliest known start wins: a job that began before this page mounted pulls the clock
+      // back, while events for a job we started ourselves keep our own start.
+      setStartedAt((s) => { const fromJob = at - p.elapsed_ms; return s === null || fromJob < s ? fromJob : s; });
+    };
+    void api.onInsightsProgress(onProgress).then((u) => { if (cancelled) u(); else un = u; });
+    api.getInsightsJob().then((p) => { if (p && !cancelled) onProgress(p); }).catch(() => {});
+    return () => { cancelled = true; un?.(); };
+  }, []);
+
+  // Elapsed-time ticker: only runs while something is in flight.
+  const ticking = busy === "load" || busy === "rebuild" || riskBusy || progress !== null;
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [ticking]);
+  const elapsed = fmtElapsed(startedAt === null ? 0 : now - startedAt);
 
   const load = useCallback(async (force = false) => {
-    setBusy(force ? "rebuild" : "load"); setErr(null); setWatch(null);
+    // Revalidate quietly when we already have data (a tab revisit): keep the current view
+    // on screen and don't show the loader. Only a first load or an explicit rebuild blanks.
+    const quiet = snapshot !== null && !force;
+    if (!quiet) { setBusy(force ? "rebuild" : "load"); setRisk(null); setRiskFailed(false); }
+    setErr(null); setWatch(null); setStartedAt(Date.now()); setNow(Date.now());
     try {
-      // Aggregate risk loads with the page so it composes into the PDF; a risk failure
-      // never blanks the whole page.
-      const [i, r] = await Promise.all([api.getInsights(force), api.getRiskSummary().catch(() => null)]);
-      setIns(i); setRisk(r);
-    } catch (e) { setErr(String(e)); }
-    finally { setBusy(null); }
+      // Render the membership views first: await get_insights, paint the page, then load
+      // the risk analysis independently into the Risk tab. The two backend commands share
+      // one store lock and cannot truly overlap, so awaiting insights first keeps the page
+      // from waiting behind the risk compute. A risk rejection resolves to a visible
+      // failure state (never a permanent spinner) and never blanks the lifecycle views.
+      const i = await api.getInsights(force);
+      setIns(i);
+      setProgress((p) => (p?.job === "rebuild" ? null : p));
+      snapshot = { ins: i, risk: snapshot?.risk ?? null, riskFailed: snapshot?.riskFailed ?? false };
+      setRiskBusy(true);
+      void api.getRiskSummary()
+        .then((r) => { setRisk(r); setRiskFailed(false); snapshot = { ins: i, risk: r, riskFailed: false }; })
+        .catch(() => { setRiskFailed(true); snapshot = { ins: i, risk: snapshot?.risk ?? null, riskFailed: true }; })
+        .finally(() => { setRiskBusy(false); setProgress((p) => (p?.job === "risk" ? null : p)); });
+    } catch (e) { setErr(String(e)); setProgress(null); }
+    finally { if (!quiet) setBusy(null); }
   }, []);
   useEffect(() => { void load(); }, [load]);
 
@@ -100,6 +216,9 @@ export default function InsightsPage({ status }: PageProps) {
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
   const anyAnchor = capOn("renewal") || capOn("school") || capOn("committee");
   const sectionClass = (key: typeof tab) => `insights-section${tab === key ? "" : " insights-section-hidden"}`;
+  const rebuilding = progress?.job === "rebuild" || busy === "rebuild";
+  const rebuildProgress = progress?.job === "rebuild" ? progress : null;
+  const riskProgress = progress?.job === "risk" ? progress : null;
 
   return (
     <div style={{ width: "100%", maxWidth: 1180, margin: "0 auto" }}>
@@ -117,8 +236,20 @@ export default function InsightsPage({ status }: PageProps) {
         } />
         <div style={{ fontSize: "var(--text-xs)", color: "var(--text-tertiary)", marginTop: "calc(-1 * var(--space-4))", marginBottom: "var(--space-4)" }}>
           Built {built} · fiscal years run June 1 – May 31 and are labeled by the year they end
+          {riskBusy && (
+            <span style={{ marginLeft: "var(--space-2)", display: "inline-flex", alignItems: "center", gap: "var(--space-1)" }}>
+              · <span className="app-spinner" style={{ width: "0.8em", height: "0.8em" }} aria-hidden />
+              {riskProgress ? `Risk analysis: step ${riskProgress.step} of ${riskProgress.steps} · ${elapsed}` : `Risk analysis running · ${elapsed}`}
+            </span>
+          )}
         </div>
-        {err && <Alert tone="error" style={{ marginBottom: "var(--space-4)" }}>{err}</Alert>}
+        {ins && rebuilding && (
+          <Alert tone="info" style={{ marginBottom: "var(--space-4)" }}>
+            Rebuilding insights from the latest sync — showing the previous build until it finishes.
+            <JobStatus compact labels={REBUILD_PHASES} progress={rebuildProgress} elapsed={elapsed} />
+          </Alert>
+        )}
+        {err && ins && <Alert tone="error" style={{ marginBottom: "var(--space-4)" }}>{err}</Alert>}
         {exported && (
           <Alert tone="success" style={{ marginBottom: "var(--space-4)" }}>
             Exported to <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)" }}>{exported}</span>{" "}
@@ -127,7 +258,23 @@ export default function InsightsPage({ status }: PageProps) {
         )}
       </div>
 
-      {!ins ? <EmptyState icon="loader" title="Loading insights" message="Reading the local mirror." action={undefined} /> : (
+      {!ins && err ? (
+        <Card style={{ marginTop: "var(--space-6)" }}>
+          <EmptyState icon="triangle-alert" title="Insights could not load" message={err} action={<Button onClick={() => void load()}>Try again</Button>} />
+        </Card>
+      ) : !ins ? (
+        <Card style={{ marginTop: "var(--space-6)", padding: "var(--space-8) var(--space-6)" }}>
+          <div style={{ maxWidth: 420, margin: "0 auto", display: "flex", flexDirection: "column", gap: "var(--space-4)" }}>
+            <div style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-lg)", fontWeight: "var(--font-semibold)", color: "var(--text-primary)", textAlign: "center" }}>
+              {rebuilding ? "Building insights" : "Loading insights"}
+            </div>
+            <JobStatus labels={REBUILD_PHASES} progress={rebuildProgress} elapsed={elapsed} />
+            <div style={{ fontSize: "var(--text-xs)", color: "var(--text-tertiary)", textAlign: "center" }}>
+              This happens once after each sync, then it's cached. You can use other pages meanwhile.
+            </div>
+          </div>
+        </Card>
+      ) : (
         <>
           <div className="insights-report-only" style={{ marginBottom: "var(--space-5)" }}>
             <div style={{ fontSize: "var(--text-2xs)", letterSpacing: "var(--tracking-wider)", textTransform: "uppercase", color: "var(--text-tertiary)", fontWeight: "var(--font-semibold)" }}>Temple Emanu-El · Customer Intelligence</div>
@@ -144,7 +291,7 @@ export default function InsightsPage({ status }: PageProps) {
 
           <Card className="insights-screen-only" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Lifecycle data coverage</CardTitle></CardHeader>
-            <Lede>{ins.stale ? "The local analysis is older than a source sync. Rebuild Insights to refresh it." : "Source availability is checked independently; unavailable sources are never treated as household behavior."}</Lede>
+            <Lede>{ins.stale && !rebuilding ? "The local analysis is older than a source sync; it rebuilds automatically the next time Insights loads." : "Source availability is checked independently; unavailable sources are never treated as household behavior."}</Lede>
             <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
               {ins.capabilities.map((capability) => (
                 <Badge key={capability.key} tone={capability.available ? "success" : "neutral"}>
@@ -391,8 +538,15 @@ export default function InsightsPage({ status }: PageProps) {
           <div className={sectionClass("risk")}>
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Validated churn risk</CardTitle></CardHeader>
-            {risk === null ? (
-              <Lede>Rolling validation is being computed, or could not be read from the local mirror.</Lede>
+            {riskFailed ? (
+              <Alert tone="warning" style={{ marginBottom: "var(--space-3)" }}>The churn risk analysis could not be computed from the local mirror. The membership views above are unaffected.</Alert>
+            ) : risk === null && riskBusy ? (
+              <>
+                <Lede>Analyzing churn risk. The membership views are already final.</Lede>
+                <JobStatus labels={RISK_PHASES} progress={riskProgress} elapsed={elapsed} />
+              </>
+            ) : risk === null ? (
+              <Lede>Waiting for insights to load…</Lede>
             ) : risk.available ? (
               <>
                 <Lede>A regularized logistic model of Addressable Churn passed rolling historical validation. Scores rank current households; they are associations from history, not predictions that any household will resign.</Lede>
