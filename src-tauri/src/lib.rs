@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod commands;
 pub mod config;
+pub mod insights;
 pub mod profile;
 pub mod salesforce;
 pub mod secrets;
