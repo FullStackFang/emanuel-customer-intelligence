@@ -368,6 +368,335 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+// ── views ───────────────────────────────────────────────────────────────────
+
+const FIRST_TREND_FY: i32 = 2005;
+const FIRST_COHORT_FY: i32 = 2010;
+const MAX_K: i32 = 8;
+const CHANNEL_MIN_N: usize = 20;
+
+#[derive(Serialize, Debug, Clone)]
+pub struct TrendRow {
+    pub fy: i32,
+    pub joins: i64,
+    pub resigns: i64,
+    pub active_end_of_fy: i64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct CohortYear1 {
+    pub cohort: i32,
+    pub n: i64,
+    pub pct_retained: f64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct CohortCell {
+    pub cohort: i32,
+    pub n: i64,
+    pub k: i32,
+    pub pct_retained: f64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct ChannelRow {
+    pub key: String,
+    pub label: String,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+    pub avg_tenure: f64,
+    pub left_within_2y: i64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct SchoolRow {
+    pub group: String,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct ReasonCell {
+    pub fy: i32,
+    pub reason: String,
+    pub n: i64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct Kpis {
+    pub members_now: i64,
+    pub net_vs_prior_fy: i64,
+    pub joins_this_fy: i64,
+    pub resigns_this_fy: i64,
+    pub year1_cohort: i32,
+    pub year1_pct: f64,
+    pub year1_baseline_pct: f64,
+    pub at_risk_count: i64,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct AtRiskRow {
+    pub account_id: String,
+    pub name: String,
+    pub tier: Option<String>,
+    pub join_fy: Option<i32>,
+    pub rules: Vec<String>,
+}
+#[derive(Serialize, Debug, Clone)]
+pub struct Insights {
+    pub built_at: Option<String>,
+    pub current_fy: i32,
+    pub unavailable: Vec<String>,
+    pub kpis: Kpis,
+    pub trend: Vec<TrendRow>,
+    pub year1: Vec<CohortYear1>,
+    pub cohort_matrix: Vec<CohortCell>,
+    pub channels: Vec<ChannelRow>,
+    pub school: Vec<SchoolRow>,
+    pub reasons: Vec<ReasonCell>,
+}
+
+/// Spell rule: a member in `fy` if joined by then and not resigned before/in it.
+/// A resigned household with no resign date counts only in its join year.
+pub fn member_in(h: &Hh, fy: i32) -> bool {
+    let Some(j) = h.join_fy else { return false };
+    if j > fy {
+        return false;
+    }
+    if h.resigned_unknown_date {
+        return fy == j;
+    }
+    match h.resign_fy {
+        Some(r) => r > fy,
+        None => true,
+    }
+}
+
+fn pct(num: i64, den: i64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        (1000.0 * num as f64 / den as f64).round() / 10.0
+    }
+}
+
+pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
+    (FIRST_TREND_FY..=cur)
+        .map(|fy| TrendRow {
+            fy,
+            joins: hh.iter().filter(|h| h.join_fy == Some(fy)).count() as i64,
+            resigns: hh.iter().filter(|h| h.resign_fy == Some(fy)).count() as i64,
+            active_end_of_fy: hh.iter().filter(|h| member_in(h, fy)).count() as i64,
+        })
+        .collect()
+}
+
+pub fn year1(hh: &[Hh], cur: i32) -> Vec<CohortYear1> {
+    (FIRST_COHORT_FY..cur)
+        .filter_map(|c| {
+            let cohort: Vec<&Hh> = hh.iter().filter(|h| h.join_fy == Some(c)).collect();
+            if cohort.is_empty() {
+                return None;
+            }
+            let kept = cohort.iter().filter(|h| member_in(h, c + 1)).count() as i64;
+            Some(CohortYear1 {
+                cohort: c,
+                n: cohort.len() as i64,
+                pct_retained: pct(kept, cohort.len() as i64),
+            })
+        })
+        .collect()
+}
+
+pub fn cohort_matrix(hh: &[Hh], cur: i32) -> Vec<CohortCell> {
+    let mut out = Vec::new();
+    for c in FIRST_COHORT_FY..cur {
+        let cohort: Vec<&Hh> = hh.iter().filter(|h| h.join_fy == Some(c)).collect();
+        if cohort.is_empty() {
+            continue;
+        }
+        for k in 1..=MAX_K {
+            if c + k > cur {
+                break;
+            }
+            let kept = cohort.iter().filter(|h| member_in(h, c + k)).count() as i64;
+            out.push(CohortCell {
+                cohort: c,
+                n: cohort.len() as i64,
+                k,
+                pct_retained: pct(kept, cohort.len() as i64),
+            });
+        }
+    }
+    out
+}
+
+/// Joiners old enough to judge: at least three full membership years, at most twelve.
+fn judgeable(h: &Hh, cur: i32) -> bool {
+    matches!(h.join_fy, Some(j) if j >= cur - 12 && j <= cur - 4)
+}
+
+fn tenure_years(h: &Hh, cur: i32) -> f64 {
+    let j = h.join_fy.unwrap_or(cur) as f64;
+    if h.is_current {
+        cur as f64 - j
+    } else if h.resigned_unknown_date {
+        1.0
+    } else {
+        h.resign_fy.map(|r| r as f64 - j).unwrap_or(1.0)
+    }
+}
+
+pub fn channels(hh: &[Hh], cur: i32) -> Vec<ChannelRow> {
+    let base: Vec<&Hh> = hh
+        .iter()
+        .filter(|h| judgeable(h, cur) && h.join_reason.is_some())
+        .collect();
+    let mut out: Vec<ChannelRow> = CHANNELS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (key, _))| {
+            let members: Vec<&&Hh> = base.iter().filter(|h| h.ch[i]).collect();
+            if members.len() < CHANNEL_MIN_N {
+                return None;
+            }
+            let n = members.len() as i64;
+            let still = members.iter().filter(|h| h.is_current).count() as i64;
+            let tenure: f64 = members.iter().map(|h| tenure_years(h, cur)).sum::<f64>() / n as f64;
+            let left2 = members
+                .iter()
+                .filter(|h| !h.is_current && tenure_years(h, cur) <= 2.0)
+                .count() as i64;
+            Some(ChannelRow {
+                key: key.to_string(),
+                label: channel_label(key),
+                n,
+                still_members: still,
+                pct: pct(still, n),
+                avg_tenure: (tenure * 10.0).round() / 10.0,
+                left_within_2y: left2,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.pct
+            .partial_cmp(&a.pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+fn channel_label(key: &str) -> String {
+    match key {
+        "religious_school" => "Religious school",
+        "nursery_school" => "Nursery school",
+        "affiliation" => "Affiliation",
+        "life_cycle" => "Life cycle event",
+        "family" => "To be with family",
+        "young_professionals" => "Young professionals",
+        "community" => "Community",
+        "hhd_tickets" => "High Holy Day tickets",
+        "streicker" => "Streicker",
+        "clergy" => "Clergy",
+        "worship" => "Worship services",
+        "move" => "Move or relocation",
+        other => other,
+    }
+    .to_string()
+}
+
+pub fn school(hh: &[Hh], cur: i32) -> Vec<SchoolRow> {
+    const GROUPS: [&str; 4] = [
+        "Both nursery and religious school",
+        "Religious school family",
+        "Nursery school family",
+        "No school history",
+    ];
+    let group_of = |h: &Hh| match (h.rs_family, h.ns_family) {
+        (true, true) => GROUPS[0],
+        (true, false) => GROUPS[1],
+        (false, true) => GROUPS[2],
+        (false, false) => GROUPS[3],
+    };
+    let base: Vec<&Hh> = hh.iter().filter(|h| judgeable(h, cur)).collect();
+    GROUPS
+        .iter()
+        .map(|g| {
+            let m: Vec<&&Hh> = base.iter().filter(|h| group_of(h) == *g).collect();
+            let n = m.len() as i64;
+            let still = m.iter().filter(|h| h.is_current).count() as i64;
+            SchoolRow {
+                group: g.to_string(),
+                n,
+                still_members: still,
+                pct: pct(still, n),
+            }
+        })
+        .collect()
+}
+
+pub fn reasons(hh: &[Hh], cur: i32) -> Vec<ReasonCell> {
+    let mut counts: std::collections::BTreeMap<(i32, String), i64> = Default::default();
+    for h in hh.iter().filter(|h| !h.is_current && h.is_resigned) {
+        if let Some(fy) = h.resign_fy {
+            if fy >= cur - 5 && fy <= cur {
+                *counts
+                    .entry((fy, h.resign_reason_group.clone()))
+                    .or_default() += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((fy, reason), n)| ReasonCell { fy, reason, n })
+        .collect()
+}
+
+pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
+    let active = |fy: i32| hh.iter().filter(|h| member_in(h, fy)).count() as i64;
+    let y1 = year1(hh, cur);
+    let latest = y1.last();
+    let baseline: Vec<&CohortYear1> = y1.iter().filter(|r| r.cohort <= cur - 3).collect();
+    let baseline_pct = if baseline.is_empty() {
+        0.0
+    } else {
+        (10.0 * baseline.iter().map(|r| r.pct_retained).sum::<f64>() / baseline.len() as f64)
+            .round()
+            / 10.0
+    };
+    Kpis {
+        members_now: hh.iter().filter(|h| h.is_current).count() as i64,
+        net_vs_prior_fy: active(cur) - active(cur - 1),
+        joins_this_fy: hh.iter().filter(|h| h.join_fy == Some(cur)).count() as i64,
+        resigns_this_fy: hh.iter().filter(|h| h.resign_fy == Some(cur)).count() as i64,
+        year1_cohort: latest.map(|r| r.cohort).unwrap_or(cur - 1),
+        year1_pct: latest.map(|r| r.pct_retained).unwrap_or(0.0),
+        year1_baseline_pct: baseline_pct,
+        at_risk_count,
+    }
+}
+
+/// Completed in Task 4; the stub keeps `views` compiling.
+pub fn at_risk_rows(_hh: &[Hh], _cur: i32) -> Vec<AtRiskRow> {
+    Vec::new()
+}
+
+pub fn views(store: &Store, cur: i32) -> Result<Insights> {
+    let hh = load(store)?;
+    let unavailable: Vec<String> = store
+        .get_meta("insights_unavailable")?
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let at_risk = at_risk_rows(&hh, cur).len() as i64;
+    Ok(Insights {
+        built_at: store.get_meta("insights_built_at")?,
+        current_fy: cur,
+        unavailable,
+        kpis: kpis(&hh, cur, at_risk),
+        trend: trend(&hh, cur),
+        year1: year1(&hh, cur),
+        cohort_matrix: cohort_matrix(&hh, cur),
+        channels: channels(&hh, cur),
+        school: school(&hh, cur),
+        reasons: reasons(&hh, cur),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +1036,186 @@ mod tests {
         rebuild(&mut s).unwrap();
         s.purge_mirror().unwrap();
         assert!(!s.table_exists(MART).unwrap());
+    }
+
+    fn h(id: &str, current: bool, join: Option<i32>, resign: Option<i32>) -> Hh {
+        Hh {
+            account_id: id.into(),
+            is_current: current,
+            is_resigned: !current,
+            join_fy: join,
+            cohort_fy: join,
+            resign_fy: if current { None } else { resign },
+            resigned_unknown_date: !current && resign.is_none(),
+            resign_reason_group: "(not coded)".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn membership_spell_rules() {
+        let cur = h("a", true, Some(2015), None);
+        assert!(member_in(&cur, 2015) && member_in(&cur, 2026));
+        assert!(!member_in(&cur, 2014));
+        let gone = h("b", false, Some(2015), Some(2020));
+        assert!(member_in(&gone, 2019) && !member_in(&gone, 2020));
+        let unknown = h("c", false, Some(2018), None);
+        assert!(
+            member_in(&unknown, 2018) && !member_in(&unknown, 2019),
+            "unknown resign date = lost after year 1"
+        );
+        let nojoin = h("d", true, None, None);
+        assert!(!member_in(&nojoin, 2026));
+    }
+
+    #[test]
+    fn trend_counts_joins_resigns_and_active() {
+        let hh = vec![
+            h("a", true, Some(2020), None),
+            h("b", false, Some(2020), Some(2022)),
+            h("c", false, Some(2021), Some(2022)),
+            h("d", true, Some(2022), None),
+        ];
+        let t = trend(&hh, 2023);
+        let row = |fy: i32| t.iter().find(|r| r.fy == fy).unwrap().clone();
+        assert_eq!(
+            (
+                row(2020).joins,
+                row(2020).resigns,
+                row(2020).active_end_of_fy
+            ),
+            (2, 0, 2)
+        );
+        assert_eq!((row(2021).joins, row(2021).active_end_of_fy), (1, 3));
+        assert_eq!(
+            (
+                row(2022).joins,
+                row(2022).resigns,
+                row(2022).active_end_of_fy
+            ),
+            (1, 2, 2)
+        );
+        assert_eq!(t.first().unwrap().fy, 2005);
+        assert_eq!(t.last().unwrap().fy, 2023);
+    }
+
+    #[test]
+    fn year1_and_cohort_matrix() {
+        let hh = vec![
+            h("a", true, Some(2020), None),
+            h("b", false, Some(2020), Some(2021)), // lost in year 1
+            h("c", false, Some(2020), Some(2023)), // lost in year 3
+            h("d", true, Some(2021), None),
+        ];
+        let y = year1(&hh, 2024);
+        let c2020 = y.iter().find(|r| r.cohort == 2020).unwrap();
+        assert_eq!((c2020.n, c2020.pct_retained), (3, 66.7));
+        let m = cohort_matrix(&hh, 2024);
+        let cell = |c: i32, k: i32| {
+            m.iter()
+                .find(|x| x.cohort == c && x.k == k)
+                .unwrap()
+                .pct_retained
+        };
+        assert_eq!(cell(2020, 1), 66.7);
+        assert_eq!(cell(2020, 2), 66.7);
+        assert_eq!(cell(2020, 3), 33.3);
+        assert_eq!(cell(2020, 4), 33.3);
+        assert!(m.iter().all(|x| x.cohort + x.k <= 2024), "no future cells");
+        assert!(m.iter().any(|x| x.cohort == 2021 && x.k == 3));
+        assert!(!m.iter().any(|x| x.cohort == 2021 && x.k == 4));
+    }
+
+    #[test]
+    fn channels_window_flags_and_threshold() {
+        let mut hh = Vec::new();
+        for i in 0..25 {
+            let mut x = h(&format!("rs{i}"), i % 5 != 0, Some(2016), Some(2019));
+            x.join_reason = Some("Religious School".into());
+            x.ch = channel_flags(x.join_reason.as_deref());
+            hh.push(x);
+        }
+        // too recent to count (joined within 3 years)
+        let mut recent = h("r", true, Some(2025), None);
+        recent.join_reason = Some("Religious School".into());
+        recent.ch = channel_flags(recent.join_reason.as_deref());
+        hh.push(recent);
+        // below the 20-household threshold
+        let mut c = h("c", true, Some(2016), None);
+        c.join_reason = Some("Clergy".into());
+        c.ch = channel_flags(c.join_reason.as_deref());
+        hh.push(c);
+        let ch = channels(&hh, 2026);
+        assert_eq!(ch.len(), 1);
+        assert_eq!(ch[0].key, "religious_school");
+        assert_eq!((ch[0].n, ch[0].still_members, ch[0].pct), (25, 20, 80.0));
+        assert_eq!(ch[0].left_within_2y, 0);
+        assert!((ch[0].avg_tenure - (20.0 * 10.0 + 5.0 * 3.0) / 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn school_groups_and_reasons() {
+        let mut a = h("a", true, Some(2016), None);
+        a.rs_family = true;
+        a.ns_family = true;
+        let mut b = h("b", false, Some(2017), Some(2024));
+        b.rs_family = true;
+        b.resign_reason_group = "Moved".into();
+        let c = h("c", false, Some(2018), Some(2025));
+        let hh = vec![a, b, c.clone()];
+        let s = school(&hh, 2026);
+        let g = |name: &str| s.iter().find(|r| r.group == name).unwrap();
+        assert_eq!(
+            (
+                g("Both nursery and religious school").n,
+                g("Both nursery and religious school").pct
+            ),
+            (1, 100.0)
+        );
+        assert_eq!(
+            (
+                g("Religious school family").n,
+                g("Religious school family").pct
+            ),
+            (1, 0.0)
+        );
+        assert_eq!(g("No school history").n, 1);
+        let r = reasons(&hh, 2026);
+        assert!(r
+            .iter()
+            .any(|x| x.fy == 2024 && x.reason == "Moved" && x.n == 1));
+        assert!(r
+            .iter()
+            .any(|x| x.fy == 2025 && x.reason == "(not coded)" && x.n == 1));
+    }
+
+    #[test]
+    fn kpis_summarize_the_latest_year() {
+        let hh = vec![
+            h("a", true, Some(2010), None),
+            h("b", true, Some(2025), None),
+            h("c", false, Some(2025), Some(2026)),
+            h("d", false, Some(2011), Some(2026)),
+        ];
+        let k = kpis(&hh, 2026, 7);
+        assert_eq!(k.members_now, 2);
+        assert_eq!(k.joins_this_fy, 0);
+        assert_eq!(k.resigns_this_fy, 2);
+        assert_eq!(k.net_vs_prior_fy, -2);
+        assert_eq!((k.year1_cohort, k.year1_pct), (2025, 50.0));
+        assert_eq!(k.at_risk_count, 7);
+    }
+
+    #[test]
+    fn views_end_to_end_from_the_mart() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let v = views(&s, 2026).unwrap();
+        assert_eq!(v.current_fy, 2026);
+        assert!(v.built_at.is_some());
+        assert_eq!(v.kpis.members_now, 4);
+        assert!(!v.trend.is_empty());
+        assert!(v.year1.iter().any(|r| r.cohort == 2015 && r.n == 2));
     }
 }
