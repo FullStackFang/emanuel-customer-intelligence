@@ -28,4 +28,21 @@ describe("api wrappers map 1:1 to Rust commands", () => {
   it("exposes only the allowlisted operators", () => {
     expect([...api.OPS]).toEqual(["=", "!=", ">", "<", ">=", "<=", "contains"]);
   });
+
+  it("insights wrappers use the exact command names", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.getInsights();
+    await api.getInsights(true);
+    await api.getAtRisk();
+    await api.exportInsightsCsv("trend");
+    await api.revealExport("C:\\x\\exports\\a.csv");
+    expect(invoke.mock.calls).toEqual([
+      ["get_insights", { forceRebuild: false }],
+      ["get_insights", { forceRebuild: true }],
+      ["get_at_risk"],
+      ["export_insights_csv", { view: "trend" }],
+      ["reveal_export", { path: "C:\\x\\exports\\a.csv" }],
+    ]);
+    expect([...api.INSIGHT_VIEWS]).toEqual(["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"]);
+  });
 });

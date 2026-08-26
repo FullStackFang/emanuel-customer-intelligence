@@ -27,6 +27,25 @@ export interface AuditRow {
   action: string; object: string | null; detail: string | null;
 }
 
+export interface Kpis {
+  members_now: number; net_vs_prior_fy: number; joins_this_fy: number; resigns_this_fy: number;
+  year1_cohort: number; year1_pct: number; year1_baseline_pct: number; at_risk_count: number;
+}
+export interface TrendRow { fy: number; joins: number; resigns: number; active_end_of_fy: number }
+export interface CohortYear1 { cohort: number; n: number; pct_retained: number }
+export interface CohortCell { cohort: number; n: number; k: number; pct_retained: number }
+export interface ChannelRow { key: string; label: string; n: number; still_members: number; pct: number; avg_tenure: number; left_within_2y: number }
+export interface SchoolRow { group: string; n: number; still_members: number; pct: number }
+export interface ReasonCell { fy: number; reason: string; n: number }
+export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
+export interface Insights {
+  built_at: string | null; current_fy: number; unavailable: string[]; kpis: Kpis;
+  trend: TrendRow[]; year1: CohortYear1[]; cohort_matrix: CohortCell[];
+  channels: ChannelRow[]; school: SchoolRow[]; reasons: ReasonCell[];
+}
+export const INSIGHT_VIEWS = ["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"] as const;
+export type InsightView = (typeof INSIGHT_VIEWS)[number];
+
 export const OPS = ["=", "!=", ">", "<", ">=", "<=", "contains"] as const;
 
 export const getStatus = () => invoke<StatusView>("get_status");
@@ -44,6 +63,11 @@ export const profileSelected = () => invoke<number>("profile_selected");
 export const querySegment = (req: SegmentReq) => invoke<SegmentResult>("query_segment", { req });
 export const getAudit = (limit: number, offset: number) => invoke<AuditRow[]>("get_audit", { limit, offset });
 export const purgeLocalData = () => invoke<void>("purge_local_data");
+
+export const getInsights = (forceRebuild = false) => invoke<Insights>("get_insights", { forceRebuild });
+export const getAtRisk = () => invoke<AtRiskRow[]>("get_at_risk");
+export const exportInsightsCsv = (view: InsightView) => invoke<string>("export_insights_csv", { view });
+export const revealExport = (path: string) => invoke<void>("reveal_export", { path });
 
 export const onScanProgress = (cb: (p: { done: number; total: number }) => void): Promise<UnlistenFn> =>
   listen<{ done: number; total: number }>("scan:progress", (e) => cb(e.payload));
