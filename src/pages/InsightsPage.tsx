@@ -23,6 +23,16 @@ function Unavailable({ column }: { column: string }) {
   return <EmptyState icon="database" title="Not available" message={`This view needs ${column} to be synced and not withheld.`} action={undefined} />;
 }
 
+const VIEW_LABELS: Record<api.InsightView, string> = {
+  trend: "Membership trend",
+  year1: "First-year retention",
+  cohort_matrix: "Cohort retention",
+  channels: "Stickiness by join reason",
+  school: "Stickiness by school history",
+  reasons: "Why people leave",
+  at_risk: "At-risk households",
+};
+
 export default function InsightsPage({ status }: PageProps) {
   const [ins, setIns] = useState<api.Insights | null>(null);
   const [atRisk, setAtRisk] = useState<api.AtRiskRow[] | null>(null);
@@ -65,12 +75,13 @@ export default function InsightsPage({ status }: PageProps) {
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
 
   return (
-    <div style={{ maxWidth: 1180 }}>
+    <div style={{ width: "100%", maxWidth: 1180, margin: "0 auto" }}>
       <PageTitle eyebrow="Customer Intelligence" title="Insights" actions={
         <>
+          <span style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)", alignSelf: "center" }}>Export</span>
           <Select value={exportView} onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportView(e.target.value as api.InsightView)}
-            options={api.INSIGHT_VIEWS.map((v) => ({ value: v, label: v.replace("_", " ") }))} children={undefined} />
-          <Button variant="secondary" disabled={busy !== null || !ins} onClick={() => void doExport()}>Export CSV</Button>
+            options={api.INSIGHT_VIEWS.map((v) => ({ value: v, label: VIEW_LABELS[v] }))} children={undefined} />
+          <Button variant="secondary" disabled={busy !== null || !ins} onClick={() => void doExport()}>Download CSV</Button>
           <Button variant="secondary" disabled={busy !== null} onClick={() => void load(true)}>{busy === "rebuild" ? "Rebuilding…" : "Rebuild"}</Button>
         </>
       } />

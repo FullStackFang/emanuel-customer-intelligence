@@ -1383,24 +1383,27 @@ mod tests {
     fn kpis_summarize_the_latest_year() {
         // a: current, joined 2010. b: current, joined 2024. c: resigned, joined 2024,
         // resigned FY2025. d: resigned, joined 2011, resigned FY2026 (this FY, in progress).
+        // e: current, joined 2025 (the in-progress FY's cohort).
+        // "e" joined in the in-progress year: the old y1.last() rule would report (2025, 100.0).
         let hh = vec![
             h("a", true, Some(2010), None),
             h("b", true, Some(2024), None),
             h("c", false, Some(2024), Some(2025)),
             h("d", false, Some(2011), Some(2026)),
+            h("e", true, Some(2025), None),
         ];
         let k = kpis(&hh, 2026, 7);
-        assert_eq!(k.members_now, 2, "a, b are current");
+        assert_eq!(k.members_now, 3, "a, b, e are current");
         assert_eq!(k.joins_this_fy, 0);
         assert_eq!(k.resigns_this_fy, 1, "only d resigned in FY2026");
         assert_eq!(
             k.net_vs_prior_fy, -1,
-            "active 2026={{a,b}}=2, active 2025={{a,b,d}}=3"
+            "active 2026={{a,b,e}}=3, active 2025={{a,b,d,e}}=4"
         );
         assert_eq!(
             (k.year1_cohort, k.year1_pct),
             (2024, 50.0),
-            "the FY2026 cohort (none here) is still mid-first-year; latest complete cohort is 2024"
+            "the FY2026 cohort (e, still mid-first-year) is excluded; latest complete cohort is 2024"
         );
         assert_eq!(k.at_risk_count, 7);
     }
