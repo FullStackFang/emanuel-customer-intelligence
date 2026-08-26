@@ -11,8 +11,7 @@ fn main() -> anyhow::Result<()> {
     let file = args.next().expect("arg2: .sql file containing one SELECT");
     let sql = std::fs::read_to_string(&file)?;
 
-    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?
-        .get_password()?;
+    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?.get_password()?;
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "key", format!("x'{key}'"))?;
 

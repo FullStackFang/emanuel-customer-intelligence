@@ -22,8 +22,7 @@ fn main() -> anyhow::Result<()> {
         kws.is_empty() || kws.iter().any(|k| l.contains(k.as_str()))
     };
 
-    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?
-        .get_password()?;
+    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?.get_password()?;
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "key", format!("x'{key}'"))?;
 
@@ -53,13 +52,23 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         n += 1;
-        let fill_s = fill.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or("-".into());
+        let fill_s = fill
+            .map(|f| format!("{:.0}%", f * 100.0))
+            .unwrap_or("-".into());
         let dist_s = distinct.map(|d| d.to_string()).unwrap_or("-".into());
-        let flag = if withheld { " [WITHHELD]" } else if sensitive { " [sensitive]" } else { "" };
+        let flag = if withheld {
+            " [WITHHELD]"
+        } else if sensitive {
+            " [sensitive]"
+        } else {
+            ""
+        };
         let top_s = top
             .map(|t| t.chars().take(160).collect::<String>())
             .unwrap_or_default();
-        println!("{field}  ({ty})  \"{label}\"{flag}\n    fill={fill_s} distinct={dist_s}  top={top_s}");
+        println!(
+            "{field}  ({ty})  \"{label}\"{flag}\n    fill={fill_s} distinct={dist_s}  top={top_s}"
+        );
     }
     println!("\n{n} matching fields on {object}");
     Ok(())

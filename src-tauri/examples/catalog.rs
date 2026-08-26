@@ -15,8 +15,7 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.to_lowercase())
         .collect();
 
-    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?
-        .get_password()?;
+    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?.get_password()?;
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "key", format!("x'{key}'"))?;
 

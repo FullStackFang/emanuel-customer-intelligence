@@ -29,20 +29,28 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?
-        .get_password()?;
+    let key = keyring::v1::Entry::new("emanuel-customer-intelligence", "db_key")?.get_password()?;
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "key", format!("x'{key}'"))?;
 
     let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {object}"), [], |r| r.get(0))?;
-    println!("{object}: {total} rows{}", by.as_ref().map(|b| format!("  (split by {b})")).unwrap_or_default());
+    println!(
+        "{object}: {total} rows{}",
+        by.as_ref()
+            .map(|b| format!("  (split by {b})"))
+            .unwrap_or_default()
+    );
 
     for spec in specs {
         let (field, year) = match spec.strip_suffix(":year") {
             Some(f) => (ident(f), true),
             None => (ident(&spec), false),
         };
-        let expr = if year { format!("substr({field},1,4)") } else { field.clone() };
+        let expr = if year {
+            format!("substr({field},1,4)")
+        } else {
+            field.clone()
+        };
         // Top-N per group (window function), so a --by split never lets one
         // group's long tail crowd out the other group's top values.
         let per_group = if year { 400 } else { 15 };
@@ -64,7 +72,9 @@ fn main() -> anyhow::Result<()> {
         })?;
         for row in rows {
             let (b, v, n) = row?;
-            let v = v.map(|s| s.chars().take(60).collect::<String>()).unwrap_or("<null>".into());
+            let v = v
+                .map(|s| s.chars().take(60).collect::<String>())
+                .unwrap_or("<null>".into());
             match b {
                 Some(b) => println!("  [{b}] {v}: {n}"),
                 None => println!("  {v}: {n}"),
