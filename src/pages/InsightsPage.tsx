@@ -58,6 +58,8 @@ export default function InsightsPage({ status }: PageProps) {
   }
 
   const missing = (col: string) => ins?.unavailable.includes(col) ?? false;
+  const schoolCols = ["FormerReligiousSchoolStudents__c", "ActiveReligiousSchoolStudents__c", "WasEverNSAffiliated__c"];
+  const missingSchoolCol = schoolCols.find(missing);
   const s = ins ? soWhat(ins) : null;
   const latestTwo = ins ? ins.year1.slice(-2).map((r) => r.cohort) : [];
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
@@ -79,14 +81,14 @@ export default function InsightsPage({ status }: PageProps) {
       {exported && (
         <Alert tone="success" style={{ marginBottom: "var(--space-4)" }}>
           Exported to <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--text-xs)" }}>{exported}</span>{" "}
-          <Button size="sm" variant="secondary" onClick={() => void api.revealExport(exported)}>Reveal</Button>
+          <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => { api.revealExport(exported).catch((e) => setErr(String(e))); }}>Reveal</Button>
         </Alert>
       )}
 
       {!ins ? <EmptyState icon="loader" title="Loading insights" message="Reading the local mirror." action={undefined} /> : (
         <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-5)" }}>
-            <Stat label="Member households" value={fmt(ins.kpis.members_now)} sub={`${ins.kpis.net_vs_prior_fy >= 0 ? "+" : ""}${fmt(ins.kpis.net_vs_prior_fy)} vs ${fyLabel(ins.current_fy - 1)}`} icon="users" tone="primary" />
+            <Stat label="Member households" value={fmt(ins.kpis.members_now)} sub={`${ins.kpis.net_vs_prior_fy >= 0 ? "+" : ""}${fmt(ins.kpis.net_vs_prior_fy)} vs ${fyLabel(ins.current_fy - 1)} · ${fyLabel(ins.current_fy)} in progress`} icon="users" tone="primary" />
             <Stat label={`Joins ${fyLabel(ins.current_fy)}`} value={fmt(ins.kpis.joins_this_fy)} sub="fiscal year to date" icon="user-plus" tone="success" />
             <Stat label={`Resignations ${fyLabel(ins.current_fy)}`} value={fmt(ins.kpis.resigns_this_fy)} sub="fiscal year to date" icon="user-minus" tone="neutral" />
             <Stat label="First-year retention" value={`${ins.kpis.year1_pct}%`} sub={`${fyLabel(ins.kpis.year1_cohort)} cohort · baseline ${ins.kpis.year1_baseline_pct}%`} icon="repeat" tone="primary" />
@@ -95,7 +97,7 @@ export default function InsightsPage({ status }: PageProps) {
 
           <Card style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Membership over time</CardTitle></CardHeader>
-            <Lede>Active member households at the end of each fiscal year, and the joins and resignations behind them.</Lede>
+            <Lede>Active member households at the end of each fiscal year, and the joins and resignations behind them. The current fiscal year is in progress.</Lede>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-4)" }}>
               <TrendChart rows={ins.trend} />
               <FlowsChart rows={ins.trend} />
@@ -111,7 +113,7 @@ export default function InsightsPage({ status }: PageProps) {
 
           <Card style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>First-year retention by cohort</CardTitle></CardHeader>
-            <Lede>Of the households that joined in each fiscal year, the share still members one year later. The two newest cohorts are highlighted.</Lede>
+            <Lede>Of the households that joined in each fiscal year, the share still members one year later. The two newest cohorts are highlighted. The newest cohort's first year is still in progress.</Lede>
             <Year1Chart rows={ins.year1} emphasize={latestTwo} />
             <SoWhat text={s!.year1} />
             <TableView rows={ins.year1} getRowKey={(r) => String(r.cohort)} columns={[
@@ -153,14 +155,18 @@ export default function InsightsPage({ status }: PageProps) {
 
           <Card style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Stickiness by school history</CardTitle></CardHeader>
-            <Lede>Same joiner window, grouped by whether the household ever had a child in nursery or religious school.</Lede>
-            <HBarChart rows={ins.school.map((g) => ({ label: g.group, pct: g.pct, n: g.n, still: g.still_members }))} />
-            <SoWhat text={s!.school} />
-            <TableView rows={ins.school} getRowKey={(r) => r.group} columns={[
-              { key: "g", header: "School history", render: (r) => r.group },
-              { key: "n", header: "Households", align: "right", render: (r) => fmt(r.n) },
-              { key: "p", header: "Share still members", align: "right", render: (r) => `${r.pct}%` },
-            ]} />
+            {missingSchoolCol ? <Unavailable column={missingSchoolCol} /> : (
+              <>
+                <Lede>Same joiner window, grouped by whether the household ever had a child in nursery or religious school.</Lede>
+                <HBarChart rows={ins.school.map((g) => ({ label: g.group, pct: g.pct, n: g.n, still: g.still_members }))} />
+                <SoWhat text={s!.school} />
+                <TableView rows={ins.school} getRowKey={(r) => r.group} columns={[
+                  { key: "g", header: "School history", render: (r) => r.group },
+                  { key: "n", header: "Households", align: "right", render: (r) => fmt(r.n) },
+                  { key: "p", header: "Share still members", align: "right", render: (r) => `${r.pct}%` },
+                ]} />
+              </>
+            )}
           </Card>
 
           <Card style={{ marginBottom: "var(--space-4)" }}>
@@ -181,15 +187,19 @@ export default function InsightsPage({ status }: PageProps) {
 
           <Card>
             <CardHeader><CardTitle>Households at risk</CardTitle></CardHeader>
-            <Lede>Current members matching a churn pattern: first year of membership, nursery-school-only joiners, introductory tiers aging out, or families whose religious-school years just ended. Viewing this list is recorded in the audit log.</Lede>
-            {atRisk === null
-              ? <Button variant="secondary" disabled={busy !== null} onClick={() => void showAtRisk()}>{busy === "risk" ? "Loading…" : `Show ${fmt(ins.kpis.at_risk_count)} households`}</Button>
-              : <TableView rows={atRisk} getRowKey={(r) => r.account_id} empty="No households match the at-risk rules." columns={[
-                  { key: "n", header: "Household", render: (r) => r.name },
-                  { key: "t", header: "Tier", render: (r) => r.tier ?? "—" },
-                  { key: "j", header: "Joined", render: (r) => (r.join_fy ? fyLabel(r.join_fy) : "—") },
-                  { key: "r", header: "Patterns", render: (r) => <span style={{ display: "inline-flex", gap: 4, flexWrap: "wrap" }}>{r.rules.map((k) => <Badge key={k} tone="warning">{RULE_LABELS[k] ?? k}</Badge>)}</span> },
-                ]} />}
+            {missing("Name") ? <Unavailable column="Name" /> : (
+              <>
+                <Lede>Current members matching a churn pattern: first year of membership, nursery-school-only joiners, introductory tiers aging out, or families whose religious-school years just ended. Viewing this list is recorded in the audit log.</Lede>
+                {atRisk === null
+                  ? <Button variant="secondary" disabled={busy !== null} onClick={() => void showAtRisk()}>{busy === "risk" ? "Loading…" : `Show ${fmt(ins.kpis.at_risk_count)} households`}</Button>
+                  : <TableView rows={atRisk} getRowKey={(r) => r.account_id} empty="No households match the at-risk rules." columns={[
+                      { key: "n", header: "Household", render: (r) => r.name },
+                      { key: "t", header: "Tier", render: (r) => r.tier ?? "—" },
+                      { key: "j", header: "Joined", render: (r) => (r.join_fy ? fyLabel(r.join_fy) : "—") },
+                      { key: "r", header: "Patterns", render: (r) => <span style={{ display: "inline-flex", gap: 4, flexWrap: "wrap" }}>{r.rules.map((k) => <Badge key={k} tone="warning">{RULE_LABELS[k] ?? k}</Badge>)}</span> },
+                    ]} />}
+              </>
+            )}
           </Card>
         </>
       )}

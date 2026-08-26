@@ -48,7 +48,7 @@ export function TrendChart({ rows }: { rows: TrendRow[] }) {
       <LineChart data={data} margin={{ top: 8, right: 24, bottom: 0, left: 0 }}>
         <CartesianGrid vertical={false} stroke={PALETTE.grid} />
         <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={3} />
-        <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={[2000, 3000]} tickFormatter={(v: number) => fmt(v)} width={48} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={["auto", "auto"]} tickFormatter={(v: number) => fmt(v)} width={48} />
         <Tooltip contentStyle={tooltipStyle} formatter={(v) => [fmt(Number(v)), "Member households"]} />
         <Line type="monotone" dataKey="active" stroke={PALETTE.emphasis} strokeWidth={2} dot={false} activeDot={{ r: 5, strokeWidth: 2, stroke: "#fff" }} isAnimationActive={false} />
       </LineChart>
@@ -65,7 +65,7 @@ export function FlowsChart({ rows }: { rows: TrendRow[] }) {
         <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={3} />
         <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
         <Tooltip contentStyle={tooltipStyle} />
-        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
         <Bar dataKey="Joins" fill={PALETTE.series[0]} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
         <Bar dataKey="Resignations" fill={PALETTE.series[1]} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
       </BarChart>
@@ -178,7 +178,7 @@ export function ReasonsChart({ cells }: { cells: ReasonCell[] }) {
         <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
         <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
         <Tooltip contentStyle={tooltipStyle} />
-        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
         {REASON_ORDER.map((r, i) => (
           <Bar key={r} dataKey={r} stackId="a" fill={PALETTE.series[i]} maxBarSize={24} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
         ))}

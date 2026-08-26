@@ -24,7 +24,7 @@ export function soWhat(ins: Insights) {
   const prev = ins.trend[ins.trend.length - 2];
   const k = ins.kpis;
   const trend = last && prev
-    ? `${fmt(last.active_end_of_fy)} member households at the end of ${fyLabel(last.fy)}, ${last.active_end_of_fy - prev.active_end_of_fy >= 0 ? "up" : "down"} ${fmt(Math.abs(last.active_end_of_fy - prev.active_end_of_fy))} on ${fyLabel(prev.fy)}; ${fmt(last.joins)} joined and ${fmt(last.resigns)} resigned.`
+    ? `${fmt(last.active_end_of_fy)} member households so far in ${fyLabel(last.fy)}, ${last.active_end_of_fy - prev.active_end_of_fy >= 0 ? "up" : "down"} ${fmt(Math.abs(last.active_end_of_fy - prev.active_end_of_fy))} on ${fyLabel(prev.fy)}; ${fmt(last.joins)} joined and ${fmt(last.resigns)} resigned to date.`
     : "Not enough history yet.";
   const year1 = `The ${fyLabel(k.year1_cohort)} cohort kept ${k.year1_pct}% of its households through the first year, against a ${k.year1_baseline_pct}% average for earlier cohorts.`;
   const five = ins.cohort_matrix.filter((c) => c.k === 5);

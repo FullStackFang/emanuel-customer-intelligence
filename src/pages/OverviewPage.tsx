@@ -96,10 +96,10 @@ export default function OverviewPage({ status, refresh }: PageProps) {
       <Modal open={confirmPurge} onClose={() => setConfirmPurge(false)} title="Purge local data?" size="sm"
         footer={<>
           <Button variant="secondary" onClick={() => setConfirmPurge(false)}>Cancel</Button>
-          <Button variant="danger" onClick={() => { setConfirmPurge(false); void run("purge", async () => { await api.purgeLocalData(); return "Local mirror deleted. Catalog and audit log kept."; }); }}>Purge</Button>
+          <Button variant="danger" onClick={() => { setConfirmPurge(false); void run("purge", async () => { await api.purgeLocalData(); return "Local mirror and exported CSVs deleted. Catalog and audit log kept."; }); }}>Purge</Button>
         </>}>
         <p style={{ margin: 0, color: "var(--text-secondary)" }}>
-          This deletes every mirrored row and profile from this computer. Your object selections and the audit log are kept. This action is recorded.
+          This deletes every mirrored row and profile, and any exported insights CSVs, from this computer. Your object selections and the audit log are kept. This action is recorded.
         </p>
       </Modal>
     </div>

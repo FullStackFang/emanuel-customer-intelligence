@@ -399,9 +399,20 @@ pub async fn get_audit(
 #[tauri::command]
 pub async fn purge_local_data(state: State<'_, AppState>) -> CmdResult<()> {
     let w = who(state.inner());
+    let dir = exports_dir(state.inner());
     with_store(state.inner(), |s| {
         s.purge_mirror()?;
-        s.audit(&w, "data.purge", None, None)
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        s.audit(
+            &w,
+            "data.purge",
+            None,
+            Some(serde_json::json!({"exports_deleted": true})),
+        )
     })
 }
 
@@ -483,13 +494,13 @@ pub async fn export_insights_csv(view: String, state: State<'_, AppState>) -> Cm
         std::fs::create_dir_all(&dir)?;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
         let path = dir.join(format!("insights-{view}-{stamp}.csv"));
-        std::fs::write(&path, text)?;
         s.audit(
             &w,
             "insights.export",
             None,
             Some(serde_json::json!({"view": view, "rows": rows})),
         )?;
+        std::fs::write(&path, text)?;
         Ok(path.to_string_lossy().into_owned())
     })
 }

@@ -227,7 +227,8 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
     if present.is_empty() {
         anyhow::bail!("Account is not synced; sync it before building insights");
     }
-    let have = |c: &str| present.iter().any(|p| p == c);
+    let allowed = store.allowed_fields("Account")?;
+    let have = |c: &str| present.iter().any(|p| p == c) && allowed.contains(c);
     for mandatory in ["Type", "IsATempleMember__c"] {
         if !have(mandatory) {
             anyhow::bail!("Account mirror is missing {mandatory}, which insights require");
@@ -526,7 +527,7 @@ pub fn cohort_matrix(hh: &[Hh], cur: i32) -> Vec<CohortCell> {
     out
 }
 
-/// Joiners old enough to judge: at least three full membership years, at most twelve.
+/// Joiners old enough to judge: at least four full membership years, at most twelve.
 fn judgeable(h: &Hh, cur: i32) -> bool {
     matches!(h.join_fy, Some(j) if j >= cur - 12 && j <= cur - 4)
 }
@@ -650,7 +651,9 @@ pub fn reasons(hh: &[Hh], cur: i32) -> Vec<ReasonCell> {
 pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
     let active = |fy: i32| hh.iter().filter(|h| member_in(h, fy)).count() as i64;
     let y1 = year1(hh, cur);
-    let latest = y1.last();
+    // The current-FY cohort (cur-1) is still mid-first-year; only present a cohort
+    // whose first year is fully complete as the headline "first-year retention".
+    let latest = y1.iter().filter(|r| r.cohort <= cur - 2).last();
     let baseline: Vec<&CohortYear1> = y1.iter().filter(|r| r.cohort <= cur - 3).collect();
     let baseline_pct = if baseline.is_empty() {
         0.0
@@ -1195,6 +1198,21 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_honors_withheld_fields_not_just_synced_columns() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        s.conn()
+            .execute(
+                "UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='Join_Reason__c'",
+                [],
+            )
+            .unwrap();
+        let info = rebuild(&mut s).unwrap();
+        assert_eq!(info.unavailable, vec!["Join_Reason__c".to_string()]);
+        assert!(load(&s).unwrap().iter().all(|h| h.join_reason.is_none()));
+    }
+
+    #[test]
     fn rebuild_fails_cleanly_when_account_is_not_synced() {
         let (_d, mut s) = mem();
         let err = rebuild(&mut s).unwrap_err().to_string();
@@ -1363,18 +1381,27 @@ mod tests {
 
     #[test]
     fn kpis_summarize_the_latest_year() {
+        // a: current, joined 2010. b: current, joined 2024. c: resigned, joined 2024,
+        // resigned FY2025. d: resigned, joined 2011, resigned FY2026 (this FY, in progress).
         let hh = vec![
             h("a", true, Some(2010), None),
-            h("b", true, Some(2025), None),
-            h("c", false, Some(2025), Some(2026)),
+            h("b", true, Some(2024), None),
+            h("c", false, Some(2024), Some(2025)),
             h("d", false, Some(2011), Some(2026)),
         ];
         let k = kpis(&hh, 2026, 7);
-        assert_eq!(k.members_now, 2);
+        assert_eq!(k.members_now, 2, "a, b are current");
         assert_eq!(k.joins_this_fy, 0);
-        assert_eq!(k.resigns_this_fy, 2);
-        assert_eq!(k.net_vs_prior_fy, -2);
-        assert_eq!((k.year1_cohort, k.year1_pct), (2025, 50.0));
+        assert_eq!(k.resigns_this_fy, 1, "only d resigned in FY2026");
+        assert_eq!(
+            k.net_vs_prior_fy, -1,
+            "active 2026={{a,b}}=2, active 2025={{a,b,d}}=3"
+        );
+        assert_eq!(
+            (k.year1_cohort, k.year1_pct),
+            (2024, 50.0),
+            "the FY2026 cohort (none here) is still mid-first-year; latest complete cohort is 2024"
+        );
         assert_eq!(k.at_risk_count, 7);
     }
 

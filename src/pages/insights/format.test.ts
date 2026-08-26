@@ -32,6 +32,7 @@ describe("insights formatting", () => {
     expect(s.year1).toContain("FY2025 cohort kept 66.7%");
     expect(s.year1).toContain("87.4%");
     expect(s.trend).toContain("2,490");
+    expect(s.trend).toContain("so far in FY2026");
     expect(s.channels).toContain("Clergy");
     expect(s.channels).toContain("Nursery school");
     expect(s.school).toContain("68.4%");

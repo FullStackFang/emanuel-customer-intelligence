@@ -33,6 +33,8 @@ sync + profile, a household mart (`_m_household`) is rebuilt from the synced, no
 Account columns; the page reads that table. Fiscal years run June 1 – May 31 and are labeled
 by the year they end. Viewing the at-risk list and exporting CSVs are recorded in the audit log;
 exports land in `%APPDATA%\org.emanuelnyc.customerintelligence\exports\`.
+Exported CSVs are plain files outside the encrypted mirror (the at-risk export contains
+household names); Purge local data deletes them along with the mirror.
 
 ## Verify
 `npm run typecheck && npm test && (cd src-tauri && cargo test)`
