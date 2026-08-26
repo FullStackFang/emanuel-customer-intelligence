@@ -68,29 +68,88 @@ pub fn channel_flags(join_reason: Option<&str>) -> [bool; 12] {
     out
 }
 
-/// Coded resign reason -> display group. First match wins, in this order.
-pub fn reason_group(raw: Option<&str>) -> &'static str {
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ExitOutcome {
+    Structural,
+    Conversion,
+    Addressable,
+    Administrative,
+}
+
+const EXIT_REASON_RULES: [(&str, &str, ExitOutcome); 10] = [
+    ("moved", "Moved", ExitOutcome::Structural),
+    ("deceased", "Deceased", ExitOutcome::Structural),
+    ("elderly", "Elderly / ill", ExitOutcome::Structural),
+    ("aged out", "Aged out", ExitOutcome::Conversion),
+    (
+        "introductory",
+        "Introductory tier ended",
+        ExitOutcome::Conversion,
+    ),
+    ("non-payment", "Non-payment", ExitOutcome::Addressable),
+    (
+        "no longer engaged",
+        "No longer engaged",
+        ExitOutcome::Addressable,
+    ),
+    ("financial", "Financial hardship", ExitOutcome::Addressable),
+    ("displeased", "Displeased", ExitOutcome::Addressable),
+    (
+        "another synagogue",
+        "Joined another synagogue",
+        ExitOutcome::Addressable,
+    ),
+];
+
+fn exit_outcome_label(outcome: ExitOutcome) -> &'static str {
+    match outcome {
+        ExitOutcome::Structural => "Structural Exit",
+        ExitOutcome::Conversion => "Conversion Loss",
+        ExitOutcome::Addressable => "Addressable Churn",
+        ExitOutcome::Administrative => "Administrative or Unknown Exit",
+    }
+}
+
+pub fn exit_labels(raw: Option<&str>) -> Vec<&'static str> {
     let Some(r) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return "(not coded)";
+        return Vec::new();
     };
     let l = r.to_lowercase();
-    const RULES: [(&str, &str); 9] = [
-        ("moved", "Moved"),
-        ("non-payment", "Non-payment"),
-        ("no longer engaged", "No longer engaged"),
-        ("deceased", "Deceased"),
-        ("aged out", "Young-adult tier aged out"),
-        ("another synagogue", "Joined another synagogue"),
-        ("elderly", "Elderly / ill"),
-        ("financial", "Financial hardship"),
-        ("displeased", "Displeased"),
-    ];
-    for (needle, group) in RULES {
-        if l.contains(needle) {
-            return group;
-        }
-    }
-    "Other"
+    EXIT_REASON_RULES
+        .iter()
+        .filter_map(|(needle, label, _)| l.contains(needle).then_some(*label))
+        .collect()
+}
+
+/// Primary Exit Outcome for a resignation reason. Structural Exit wins, then
+/// Conversion Loss, then Addressable Churn, then Administrative or Unknown Exit.
+pub fn reason_group(raw: Option<&str>) -> &'static str {
+    let labels = exit_labels(raw);
+    let outcome = if labels
+        .iter()
+        .any(|label| matches!(*label, "Moved" | "Deceased" | "Elderly / ill"))
+    {
+        ExitOutcome::Structural
+    } else if labels
+        .iter()
+        .any(|label| matches!(*label, "Aged out" | "Introductory tier ended"))
+    {
+        ExitOutcome::Conversion
+    } else if labels.iter().any(|label| {
+        matches!(
+            *label,
+            "Non-payment"
+                | "No longer engaged"
+                | "Financial hardship"
+                | "Displeased"
+                | "Joined another synagogue"
+        )
+    }) {
+        ExitOutcome::Addressable
+    } else {
+        ExitOutcome::Administrative
+    };
+    exit_outcome_label(outcome)
 }
 
 /// `LastYearAttendedRS__c` is "2025-2026" or "2007"; take the last 4-digit year.
@@ -102,7 +161,279 @@ pub fn parse_rs_year(s: Option<&str>) -> Option<i32> {
     s.rsplit('-').next()?.trim().parse::<i32>().ok()
 }
 
+/// Billing products are classified before testing for dues so security fees and other
+/// non-dues charges cannot accidentally become renewal evidence.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum DuesClass {
+    Membership,
+    SecurityFee,
+    Gift,
+    Tuition,
+    Event,
+    Sale,
+    Other,
+}
+
+pub fn dues_class(product_family: Option<&str>, product_name: Option<&str>) -> DuesClass {
+    let text = [product_family, product_name]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if text.contains("security") {
+        DuesClass::SecurityFee
+    } else if text.contains("tuition") {
+        DuesClass::Tuition
+    } else if text.contains("event") || text.contains("ticket") {
+        DuesClass::Event
+    } else if text.contains("sale") || text.contains("merchandise") || text.contains("shop") {
+        DuesClass::Sale
+    } else if text.contains("gift") || text.contains("donation") {
+        DuesClass::Gift
+    } else if text.contains("dues") || text.contains("membership") {
+        DuesClass::Membership
+    } else {
+        DuesClass::Other
+    }
+}
+
+/// Minimal normalized billing statement, ready for a future mirror-field adapter.
+#[derive(Debug, Copy, Clone)]
+pub struct BillingStatement<'a> {
+    pub id: &'a str,
+    pub household_id: Option<&'a str>,
+    pub issued_at: Option<&'a str>,
+    pub eventual_received: Option<f64>,
+    pub eventual_balance: Option<f64>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BillingStatementLine<'a> {
+    pub statement_id: Option<&'a str>,
+    pub product_family: Option<&'a str>,
+    pub product_name: Option<&'a str>,
+    pub amount: Option<f64>,
+}
+
+impl<'a> BillingStatementLine<'a> {
+    #[cfg(test)]
+    fn dues(statement_id: &'a str, amount: f64) -> Self {
+        Self {
+            statement_id: Some(statement_id),
+            product_family: Some("Membership"),
+            product_name: Some("Dues"),
+            amount: Some(amount),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum BillingCoverage {
+    Present,
+    Missing,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SettlementState {
+    Settled,
+    PartiallySettled,
+    Unsettled,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct DuesEvidence {
+    pub coverage: BillingCoverage,
+    pub dues_billed: f64,
+    pub settlement: SettlementState,
+}
+
+impl DuesEvidence {
+    pub fn settlement_label(self) -> &'static str {
+        match self.settlement {
+            SettlementState::Settled => "Eventual settlement: settled",
+            SettlementState::PartiallySettled => "Eventual settlement: partially settled",
+            SettlementState::Unsettled => "Eventual settlement: unsettled",
+            SettlementState::Unknown => "Eventual settlement: unknown",
+        }
+    }
+}
+
+fn statement_settlement(statement: &BillingStatement<'_>) -> SettlementState {
+    match (statement.eventual_received, statement.eventual_balance) {
+        (_, Some(balance)) if balance <= 0.0 => SettlementState::Settled,
+        (Some(received), Some(_)) if received > 0.0 => SettlementState::PartiallySettled,
+        (_, Some(_)) => SettlementState::Unsettled,
+        (Some(received), None) if received > 0.0 => SettlementState::PartiallySettled,
+        _ => SettlementState::Unknown,
+    }
+}
+
+fn combined_settlement(states: impl Iterator<Item = SettlementState>) -> SettlementState {
+    let states: Vec<_> = states.collect();
+    if states.is_empty() || states.contains(&SettlementState::Unknown) {
+        SettlementState::Unknown
+    } else if states
+        .iter()
+        .all(|state| *state == SettlementState::Settled)
+    {
+        SettlementState::Settled
+    } else if states
+        .iter()
+        .all(|state| *state == SettlementState::Unsettled)
+    {
+        SettlementState::Unsettled
+    } else {
+        SettlementState::PartiallySettled
+    }
+}
+
+/// Derive household-year dues evidence only through a statement that identifies the
+/// household. Final mirror balances and received amounts are expressly eventual states.
+pub fn dues_evidence(
+    household_id: &str,
+    fiscal_year: i32,
+    statements: &[BillingStatement<'_>],
+    lines: &[BillingStatementLine<'_>],
+) -> DuesEvidence {
+    let matching: Vec<_> = statements
+        .iter()
+        .filter(|statement| {
+            statement.household_id == Some(household_id)
+                && statement.issued_at.and_then(fy_of) == Some(fiscal_year)
+        })
+        .collect();
+    let qualifying: Vec<_> = lines
+        .iter()
+        .filter(|line| {
+            matching
+                .iter()
+                .any(|statement| line.statement_id == Some(statement.id))
+                && dues_class(line.product_family, line.product_name) == DuesClass::Membership
+        })
+        .collect();
+    if qualifying.is_empty() {
+        return DuesEvidence {
+            coverage: BillingCoverage::Missing,
+            dues_billed: 0.0,
+            settlement: SettlementState::Unknown,
+        };
+    }
+    DuesEvidence {
+        coverage: BillingCoverage::Present,
+        dues_billed: qualifying.iter().filter_map(|line| line.amount).sum(),
+        settlement: combined_settlement(
+            matching
+                .iter()
+                .map(|statement| statement_settlement(statement)),
+        ),
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SchoolType {
+    Nursery,
+    Religious,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RelationshipAnchor {
+    NurserySchool,
+    ReligiousSchool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum EnrollmentOutcome {
+    Confirmed,
+    Withdrawn,
+    Other,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct NormalizedEnrollment {
+    pub school: Option<SchoolType>,
+    pub outcome: EnrollmentOutcome,
+    pub anchor: Option<RelationshipAnchor>,
+}
+
+/// Normalize a school enrollment without treating a pending or withdrawn record as
+/// observed participation. The mirror adapter supplies the source-specific labels.
+pub fn normalize_enrollment(
+    school_name: Option<&str>,
+    status: Option<&str>,
+) -> NormalizedEnrollment {
+    let school = school_name.map(str::to_lowercase).and_then(|name| {
+        if name.contains("nursery") {
+            Some(SchoolType::Nursery)
+        } else if name.contains("religious") {
+            Some(SchoolType::Religious)
+        } else {
+            None
+        }
+    });
+    let outcome = match status.map(str::trim).filter(|status| !status.is_empty()) {
+        Some(status)
+            if status.eq_ignore_ascii_case("confirmed")
+                || status.eq_ignore_ascii_case("enrolled") =>
+        {
+            EnrollmentOutcome::Confirmed
+        }
+        Some(status) if status.eq_ignore_ascii_case("withdrawn") => EnrollmentOutcome::Withdrawn,
+        _ => EnrollmentOutcome::Other,
+    };
+    let anchor = match (school, outcome) {
+        (Some(SchoolType::Nursery), EnrollmentOutcome::Confirmed) => {
+            Some(RelationshipAnchor::NurserySchool)
+        }
+        (Some(SchoolType::Religious), EnrollmentOutcome::Confirmed) => {
+            Some(RelationshipAnchor::ReligiousSchool)
+        }
+        _ => None,
+    };
+    NormalizedEnrollment {
+        school,
+        outcome,
+        anchor,
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct NormalizedCommittee {
+    pub start_fy: Option<i32>,
+    pub end_fy: Option<i32>,
+    pub open_ended: bool,
+    pub current_active: bool,
+}
+
+fn is_far_future_placeholder(date: &str) -> bool {
+    date.get(0..4)
+        .and_then(|year| year.parse::<i32>().ok())
+        .is_some_and(|year| year >= 2100)
+}
+
+/// `IsActive__c` is the source of truth for current committee activity. End-date
+/// placeholders remain historical context only and are normalized to open-ended.
+pub fn normalize_committee(
+    started_at: Option<&str>,
+    ended_at: Option<&str>,
+    is_active: Option<&str>,
+) -> NormalizedCommittee {
+    let open_ended = ended_at.is_some_and(is_far_future_placeholder);
+    NormalizedCommittee {
+        start_fy: started_at.and_then(fy_of),
+        end_fy: (!open_ended).then(|| ended_at.and_then(fy_of)).flatten(),
+        open_ended,
+        current_active: matches!(is_active, Some("true") | Some("1")),
+    }
+}
+
 pub const MART: &str = "_m_household";
+pub const MART_FY: &str = "_m_household_fy";
+
+/// Bumped whenever the mart column layout changes so that existing databases with an
+/// older `_m_household_fy`/`_m_household` schema are rebuilt rather than read as-is.
+pub const MART_SCHEMA_VERSION: i64 = 2;
 
 /// Account columns the mart derives from. A missing one nulls what depends on it and is
 /// reported in `RebuildInfo::unavailable`; `Type` and `IsATempleMember__c` are mandatory.
@@ -129,6 +460,70 @@ pub const REQUIRED_COLUMNS: [&str; 16] = [
 pub struct RebuildInfo {
     pub households: usize,
     pub unavailable: Vec<String>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SourceCapability {
+    pub key: String,
+    pub available: bool,
+    pub required_objects: Vec<String>,
+    pub mirrored_columns: Vec<String>,
+    pub last_synced_at: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+const SOURCE_CAPABILITIES: [(&str, &[&str]); 4] = [
+    ("membership", &["Account"]),
+    (
+        "renewal",
+        &["BillingStatement__c", "BillingStatementLine__c"],
+    ),
+    ("school", &["Class_Enrolment__c"]),
+    ("committee", &["Committee_Membership__c"]),
+];
+
+/// Optional sources are usable only after every source table required by that
+/// capability has been synced. A selected-but-unsynced object is not evidence.
+pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
+    let objects = store.list_objects()?;
+    SOURCE_CAPABILITIES
+        .iter()
+        .map(|(key, required)| {
+            let source_rows: Vec<_> = required
+                .iter()
+                .filter_map(|name| objects.iter().find(|object| object.name == *name))
+                .collect();
+            let available = source_rows.len() == required.len()
+                && source_rows
+                    .iter()
+                    .all(|object| object.last_synced_at.is_some());
+            let last_synced_at = available
+                .then(|| {
+                    source_rows
+                        .iter()
+                        .filter_map(|object| object.last_synced_at.clone())
+                        .min()
+                })
+                .flatten();
+            let required_objects = required.iter().map(|name| (*name).to_string()).collect();
+            let mirrored_columns = required
+                .iter()
+                .map(|name| store.mirror_columns(name))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok(SourceCapability {
+                key: (*key).to_string(),
+                available,
+                required_objects,
+                mirrored_columns,
+                last_synced_at,
+                unavailable_reason: (!available)
+                    .then(|| format!("Select and sync {}", required.join(" and "))),
+            })
+        })
+        .collect()
 }
 
 /// One household from the mart. Everything the views need, nothing else.
@@ -217,8 +612,344 @@ fn derive(raw: &[Option<String>; 16]) -> Hh {
         ns_family: as_bool(ever_ns),
         active_rs_students: as_num(active_rs) as i64,
         last_rs_year: parse_rs_year(last_rs.as_deref()),
-        resign_reason_group: reason_group(resign_reason.as_deref()).to_string(),
+        resign_reason_group: if is_current {
+            "(not coded)".into()
+        } else {
+            reason_group(resign_reason.as_deref()).to_string()
+        },
     }
+}
+
+fn mart_fy_ddl() -> String {
+    let entry_jobs = CHANNELS
+        .iter()
+        .map(|(key, _)| format!("entry_job_{key} INTEGER NOT NULL DEFAULT 0"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CREATE TABLE _m_household_fy(
+       account_id TEXT NOT NULL, fy INTEGER NOT NULL,
+       active_end_of_fy INTEGER NOT NULL, joined_this_fy INTEGER NOT NULL, resigned_this_fy INTEGER NOT NULL,
+       tenure_years INTEGER, exit_outcome TEXT, entry_job_count INTEGER NOT NULL, {entry_jobs},
+       anchor_dues INTEGER NOT NULL DEFAULT 0, anchor_nursery INTEGER NOT NULL DEFAULT 0,
+       anchor_religious INTEGER NOT NULL DEFAULT 0, anchor_committee INTEGER NOT NULL DEFAULT 0,
+       dues_coverage_missing INTEGER NOT NULL DEFAULT 0, dues_settlement TEXT,
+       PRIMARY KEY(account_id, fy))")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HhFy {
+    pub account_id: String,
+    pub fy: i32,
+    pub active_end_of_fy: bool,
+    pub joined_this_fy: bool,
+    pub resigned_this_fy: bool,
+    pub tenure_years: Option<i32>,
+    pub exit_outcome: Option<String>,
+    pub entry_job_count: i64,
+    pub entry_jobs: [bool; 12],
+    // Relationship Anchors observed in this fiscal year (populated by the optional
+    // mirror sources; all false when a source is unavailable).
+    pub anchor_dues: bool,
+    pub anchor_nursery: bool,
+    pub anchor_religious: bool,
+    pub anchor_committee: bool,
+    /// Active this fiscal year with no qualifying dues line while Renewal is available:
+    /// billing coverage is missing, which is not evidence of non-renewal.
+    pub dues_coverage_missing: bool,
+    /// Eventual-settlement label for this fiscal year's dues, when billed.
+    pub dues_settlement: Option<String>,
+}
+
+impl HhFy {
+    /// Distinct Relationship Anchors this household held in this fiscal year.
+    pub fn anchor_count(&self) -> i64 {
+        [
+            self.anchor_dues,
+            self.anchor_nursery,
+            self.anchor_religious,
+            self.anchor_committee,
+        ]
+        .into_iter()
+        .filter(|held| *held)
+        .count() as i64
+    }
+}
+
+fn household_year_rows(hh: &[Hh], through_fy: i32) -> Vec<HhFy> {
+    hh.iter()
+        .flat_map(|household| {
+            let Some(join_fy) = household.join_fy else {
+                return Vec::new();
+            };
+            let end_fy = household.resign_fy.unwrap_or(through_fy).min(through_fy);
+            (join_fy..=end_fy)
+                .map(|fy| HhFy {
+                    account_id: household.account_id.clone(),
+                    fy,
+                    active_end_of_fy: member_in(household, fy),
+                    joined_this_fy: household.join_fy == Some(fy),
+                    resigned_this_fy: household.resign_fy == Some(fy),
+                    tenure_years: Some(fy - join_fy + 1),
+                    exit_outcome: household
+                        .resign_fy
+                        .filter(|resign_fy| *resign_fy == fy)
+                        .map(|_| household.resign_reason_group.clone()),
+                    entry_job_count: household.ch.iter().filter(|flag| **flag).count() as i64,
+                    entry_jobs: household.ch,
+                    // Anchors come from the optional mirror sources, applied after this base.
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+// ── Relationship Anchor ingestion (RECONCILE AT TASK 8.2) ───────────────────
+//
+// The optional Salesforce objects (BillingStatement__c, BillingStatementLine__c,
+// Class_Enrolment__c, Committee_Membership__c) are not yet synced, so their real
+// column names, household join keys, and fiscal-year fields are unconfirmed. Every
+// schema assumption lives in the `*_FIELDS` candidate lists below. Each source is
+// capability-gated, so until an object is actually synced its anchors stay empty and
+// dependent views report unavailable. When the objects sync (task 8.2), verify each
+// candidate against `store.mirror_columns(object)` and adjust the lists as needed.
+
+type Cands = &'static [&'static str];
+
+/// Candidate columns for a billing statement. `household` links to `Account.Id`.
+struct StatementFields {
+    id: Cands,
+    household: Cands,
+    date: Cands,
+    received: Cands,
+    balance: Cands,
+}
+const STATEMENT_FIELDS: StatementFields = StatementFields {
+    id: &["Id"],
+    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
+    date: &[
+        "Statement_Date__c",
+        "Issued_Date__c",
+        "Date__c",
+        "CreatedDate",
+    ],
+    received: &["Amount_Received__c", "Received__c", "Paid__c"],
+    balance: &["Balance__c", "Amount_Outstanding__c", "Outstanding__c"],
+};
+
+/// Candidate columns for a billing statement line. `parent` links to the statement Id.
+struct LineFields {
+    parent: Cands,
+    product_family: Cands,
+    product_name: Cands,
+    amount: Cands,
+}
+const LINE_FIELDS: LineFields = LineFields {
+    parent: &[
+        "BillingStatement__c",
+        "Statement__c",
+        "Billing_Statement__c",
+    ],
+    product_family: &["Product_Family__c", "Family__c", "ProductFamily"],
+    product_name: &["Product_Name__c", "Product__c", "Name"],
+    amount: &["Amount__c", "Line_Amount__c", "Total__c"],
+};
+
+/// Candidate columns for a class enrolment.
+struct EnrolmentFields {
+    household: Cands,
+    school_name: Cands,
+    status: Cands,
+    year: Cands,
+}
+const ENROLMENT_FIELDS: EnrolmentFields = EnrolmentFields {
+    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
+    school_name: &["Class_Name__c", "Program__c", "School__c", "Name"],
+    status: &["Status__c", "Enrolment_Status__c", "Enrollment_Status__c"],
+    year: &["School_Year__c", "Year__c", "Academic_Year__c"],
+};
+
+/// Candidate columns for a committee membership.
+struct CommitteeFields {
+    household: Cands,
+    start: Cands,
+    end: Cands,
+    is_active: Cands,
+}
+const COMMITTEE_FIELDS: CommitteeFields = CommitteeFields {
+    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
+    start: &["Start_Date__c", "Valid_From__c", "Effective_Date__c"],
+    end: &["End_Date__c", "Valid_To__c", "Expiration_Date__c"],
+    is_active: &["IsActive__c", "Active__c"],
+};
+
+/// First mirror column (case-insensitive) matching any candidate name.
+fn resolve_col(columns: &[String], candidates: &[&str]) -> Option<String> {
+    columns
+        .iter()
+        .find(|col| candidates.iter().any(|cand| col.eq_ignore_ascii_case(cand)))
+        .cloned()
+}
+
+fn cap_available(caps: &[SourceCapability], key: &str) -> bool {
+    caps.iter().any(|c| c.key == key && c.available)
+}
+
+/// Read a resolved field from a mirror row map.
+fn field<'a>(
+    row: &'a std::collections::HashMap<String, Option<String>>,
+    col: &Option<String>,
+) -> Option<&'a str> {
+    col.as_ref()
+        .and_then(|c| row.get(c))
+        .and_then(|v| v.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Populate Relationship Anchors on the household-year rows from the optional mirror
+/// sources. Capability-gated: an unsynced source leaves its anchors empty.
+fn apply_anchor_sources(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+    let caps = source_capabilities(store)?;
+    let through = current_fy();
+    if cap_available(&caps, "renewal") {
+        apply_dues(store, rows)?;
+    }
+    if cap_available(&caps, "school") {
+        apply_school(store, rows)?;
+    }
+    if cap_available(&caps, "committee") {
+        apply_committee(store, rows, through)?;
+    }
+    Ok(())
+}
+
+/// (account_id, fy) -> row index, so a mirror row can find its household-year.
+fn row_index(rows: &[HhFy]) -> std::collections::HashMap<(String, i32), usize> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| ((r.account_id.clone(), r.fy), i))
+        .collect()
+}
+
+fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+    let statement_cols = store.mirror_columns("BillingStatement__c")?;
+    let line_cols = store.mirror_columns("BillingStatementLine__c")?;
+    let s_id = resolve_col(&statement_cols, STATEMENT_FIELDS.id);
+    let s_hh = resolve_col(&statement_cols, STATEMENT_FIELDS.household);
+    let s_date = resolve_col(&statement_cols, STATEMENT_FIELDS.date);
+    let s_recv = resolve_col(&statement_cols, STATEMENT_FIELDS.received);
+    let s_bal = resolve_col(&statement_cols, STATEMENT_FIELDS.balance);
+    let l_parent = resolve_col(&line_cols, LINE_FIELDS.parent);
+    let l_fam = resolve_col(&line_cols, LINE_FIELDS.product_family);
+    let l_name = resolve_col(&line_cols, LINE_FIELDS.product_name);
+    let l_amt = resolve_col(&line_cols, LINE_FIELDS.amount);
+    // Without the household and parent join keys there is no defensible link to a
+    // household-year; leave dues anchors empty rather than guess.
+    if s_id.is_none() || s_hh.is_none() || l_parent.is_none() {
+        return Ok(());
+    }
+    let statement_rows = store.mirror_rows("BillingStatement__c")?;
+    let line_rows = store.mirror_rows("BillingStatementLine__c")?;
+    let statements: Vec<BillingStatement<'_>> = statement_rows
+        .iter()
+        .map(|r| BillingStatement {
+            id: field(r, &s_id).unwrap_or_default(),
+            household_id: field(r, &s_hh),
+            issued_at: field(r, &s_date),
+            eventual_received: field(r, &s_recv).and_then(|v| v.parse().ok()),
+            eventual_balance: field(r, &s_bal).and_then(|v| v.parse().ok()),
+        })
+        .collect();
+    let lines: Vec<BillingStatementLine<'_>> = line_rows
+        .iter()
+        .map(|r| BillingStatementLine {
+            statement_id: field(r, &l_parent),
+            product_family: field(r, &l_fam),
+            product_name: field(r, &l_name),
+            amount: field(r, &l_amt).and_then(|v| v.parse().ok()),
+        })
+        .collect();
+    for row in rows.iter_mut() {
+        let evidence = dues_evidence(&row.account_id, row.fy, &statements, &lines);
+        match evidence.coverage {
+            BillingCoverage::Present => {
+                row.anchor_dues = true;
+                row.dues_settlement = Some(evidence.settlement_label().to_string());
+            }
+            // Active membership with no qualifying dues line is missing coverage, which
+            // the spec forbids interpreting as non-renewal.
+            BillingCoverage::Missing if row.active_end_of_fy => {
+                row.dues_coverage_missing = true;
+            }
+            BillingCoverage::Missing => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
+    let cols = store.mirror_columns("Class_Enrolment__c")?;
+    let hh = resolve_col(&cols, ENROLMENT_FIELDS.household);
+    let name = resolve_col(&cols, ENROLMENT_FIELDS.school_name);
+    let status = resolve_col(&cols, ENROLMENT_FIELDS.status);
+    let year = resolve_col(&cols, ENROLMENT_FIELDS.year);
+    if hh.is_none() || year.is_none() {
+        return Ok(());
+    }
+    let index = row_index(rows);
+    for r in store.mirror_rows("Class_Enrolment__c")? {
+        let Some(account_id) = field(&r, &hh) else {
+            continue;
+        };
+        // Enrolment school-year strings run "2024-2025"; the fiscal year is the end year.
+        let Some(fy) = parse_rs_year(field(&r, &year)) else {
+            continue;
+        };
+        let enrolment = normalize_enrollment(field(&r, &name), field(&r, &status));
+        let Some(idx) = index.get(&(account_id.to_string(), fy)) else {
+            continue;
+        };
+        match enrolment.anchor {
+            Some(RelationshipAnchor::NurserySchool) => rows[*idx].anchor_nursery = true,
+            Some(RelationshipAnchor::ReligiousSchool) => rows[*idx].anchor_religious = true,
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()> {
+    let cols = store.mirror_columns("Committee_Membership__c")?;
+    let hh = resolve_col(&cols, COMMITTEE_FIELDS.household);
+    let start = resolve_col(&cols, COMMITTEE_FIELDS.start);
+    let end = resolve_col(&cols, COMMITTEE_FIELDS.end);
+    let is_active = resolve_col(&cols, COMMITTEE_FIELDS.is_active);
+    if hh.is_none() {
+        return Ok(());
+    }
+    let index = row_index(rows);
+    let mut mark = |account_id: &str, fy: i32| {
+        if let Some(idx) = index.get(&(account_id.to_string(), fy)) {
+            rows[*idx].anchor_committee = true;
+        }
+    };
+    for r in store.mirror_rows("Committee_Membership__c")? {
+        let Some(account_id) = field(&r, &hh) else {
+            continue;
+        };
+        let committee =
+            normalize_committee(field(&r, &start), field(&r, &end), field(&r, &is_active));
+        if let Some(start_fy) = committee.start_fy {
+            let end_fy = committee.end_fy.unwrap_or(through).min(through);
+            for fy in start_fy..=end_fy {
+                mark(account_id, fy);
+            }
+        } else if committee.current_active {
+            mark(account_id, through);
+        }
+    }
+    Ok(())
 }
 
 /// Rebuild `_m_household` from the Account mirror. One transaction; drop + create + insert.
@@ -267,9 +998,17 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
         it.collect::<std::result::Result<_, _>>()?
     };
 
+    let mut household_fy = household_year_rows(&rows, current_fy());
+    // Apply optional Relationship Anchor sources before opening the write transaction
+    // (they read the mirror tables). Each source is capability-gated and contributes
+    // nothing when its objects are not synced.
+    apply_anchor_sources(store, &mut household_fy)?;
     let tx = store.conn_mut().transaction()?;
-    tx.execute_batch(&format!("DROP TABLE IF EXISTS {MART}"))?;
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {MART}; DROP TABLE IF EXISTS {MART_FY}"
+    ))?;
     tx.execute_batch(&mart_ddl())?;
+    tx.execute_batch(&mart_fy_ddl())?;
     {
         let flag_cols = CHANNELS
             .iter()
@@ -310,6 +1049,43 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
             st.execute(rusqlite::params_from_iter(vals.iter()))?;
         }
     }
+    {
+        let flag_cols = CHANNELS
+            .iter()
+            .map(|(key, _)| format!("entry_job_{key}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let flag_marks = vec!["?"; CHANNELS.len()].join(", ");
+        let mut st = tx.prepare(&format!(
+            "INSERT INTO _m_household_fy(account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
+             tenure_years, exit_outcome, entry_job_count, {flag_cols},
+             anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
+             dues_coverage_missing, dues_settlement)
+             VALUES(?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?,?)"
+        ))?;
+        for row in &household_fy {
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                row.account_id.clone().into(),
+                row.fy.into(),
+                (row.active_end_of_fy as i64).into(),
+                (row.joined_this_fy as i64).into(),
+                (row.resigned_this_fy as i64).into(),
+                row.tenure_years.into(),
+                row.exit_outcome.clone().into(),
+                row.entry_job_count.into(),
+            ];
+            values.extend(row.entry_jobs.iter().map(|flag| (*flag as i64).into()));
+            values.extend([
+                (row.anchor_dues as i64).into(),
+                (row.anchor_nursery as i64).into(),
+                (row.anchor_religious as i64).into(),
+                (row.anchor_committee as i64).into(),
+                (row.dues_coverage_missing as i64).into(),
+                row.dues_settlement.clone().into(),
+            ]);
+            st.execute(rusqlite::params_from_iter(values.iter()))?;
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     tx.execute(
         "INSERT INTO _meta(key, value) VALUES('insights_built_at', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -318,6 +1094,10 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
     tx.execute(
         "INSERT INTO _meta(key, value) VALUES('insights_unavailable', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![serde_json::to_string(&unavailable)?],
+    )?;
+    tx.execute(
+        "INSERT INTO _meta(key, value) VALUES('insights_schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![MART_SCHEMA_VERSION.to_string()],
     )?;
     tx.commit()?;
     Ok(RebuildInfo {
@@ -419,6 +1199,61 @@ pub struct ReasonCell {
     pub reason: String,
     pub n: i64,
 }
+/// Retention for households grouped by how many Entry Jobs they stated.
+#[derive(Serialize, Debug, Clone)]
+pub struct MultiJobRow {
+    pub bucket: String,
+    pub jobs: i64,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+    pub avg_tenure: f64,
+}
+/// Primary Exit Outcome counts within a tenure-at-exit band.
+#[derive(Serialize, Debug, Clone)]
+pub struct OutcomeByTenureRow {
+    pub tenure_bucket: String,
+    pub outcome: String,
+    pub n: i64,
+}
+/// Retention by completed fiscal years since Religious School ended.
+#[derive(Serialize, Debug, Clone)]
+pub struct SchoolGapRow {
+    pub bucket: String,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+}
+/// Dues state for one fiscal year. Settlement counts are eventual states, not as-of
+/// history. Coverage-missing means active-with-no-dues-line, never proven non-renewal.
+#[derive(Serialize, Debug, Clone)]
+pub struct DuesRow {
+    pub fy: i32,
+    pub active: i64,
+    pub billed: i64,
+    pub coverage_missing: i64,
+    pub settled: i64,
+    pub partially_settled: i64,
+    pub unsettled: i64,
+}
+/// Retention of households that recently held one kind of Relationship Anchor.
+#[derive(Serialize, Debug, Clone)]
+pub struct AnchorTypeRow {
+    pub key: String,
+    pub label: String,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+}
+/// Retention by how many distinct Relationship Anchors a household recently held.
+#[derive(Serialize, Debug, Clone)]
+pub struct AnchorCountRow {
+    pub anchors: i64,
+    pub label: String,
+    pub n: i64,
+    pub still_members: i64,
+    pub pct: f64,
+}
 #[derive(Serialize, Debug, Clone)]
 pub struct Kpis {
     pub members_now: i64,
@@ -441,6 +1276,9 @@ pub struct AtRiskRow {
 #[derive(Serialize, Debug, Clone)]
 pub struct Insights {
     pub built_at: Option<String>,
+    pub newest_source_sync_at: Option<String>,
+    pub stale: bool,
+    pub capabilities: Vec<SourceCapability>,
     pub current_fy: i32,
     pub unavailable: Vec<String>,
     pub kpis: Kpis,
@@ -450,6 +1288,13 @@ pub struct Insights {
     pub channels: Vec<ChannelRow>,
     pub school: Vec<SchoolRow>,
     pub reasons: Vec<ReasonCell>,
+    pub multi_job: Vec<MultiJobRow>,
+    pub outcome_by_tenure: Vec<OutcomeByTenureRow>,
+    pub school_progression: Vec<SchoolRow>,
+    pub school_gap: Vec<SchoolGapRow>,
+    pub dues: Vec<DuesRow>,
+    pub anchor_type: Vec<AnchorTypeRow>,
+    pub anchor_count: Vec<AnchorCountRow>,
 }
 
 /// Spell rule: a member in `fy` if joined by then and not resigned before/in it.
@@ -487,6 +1332,26 @@ pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
         .collect()
 }
 
+pub fn trend_from_household_years(rows: &[HhFy], cur: i32) -> Vec<TrendRow> {
+    (FIRST_TREND_FY..=cur)
+        .map(|fy| TrendRow {
+            fy,
+            joins: rows
+                .iter()
+                .filter(|row| row.fy == fy && row.joined_this_fy)
+                .count() as i64,
+            resigns: rows
+                .iter()
+                .filter(|row| row.fy == fy && row.resigned_this_fy)
+                .count() as i64,
+            active_end_of_fy: rows
+                .iter()
+                .filter(|row| row.fy == fy && row.active_end_of_fy)
+                .count() as i64,
+        })
+        .collect()
+}
+
 pub fn year1(hh: &[Hh], cur: i32) -> Vec<CohortYear1> {
     (FIRST_COHORT_FY..cur)
         .filter_map(|c| {
@@ -499,6 +1364,35 @@ pub fn year1(hh: &[Hh], cur: i32) -> Vec<CohortYear1> {
                 cohort: c,
                 n: cohort.len() as i64,
                 pct_retained: pct(kept, cohort.len() as i64),
+            })
+        })
+        .collect()
+}
+
+pub fn year1_from_household_years(rows: &[HhFy], cur: i32) -> Vec<CohortYear1> {
+    (FIRST_COHORT_FY..cur)
+        .filter_map(|cohort| {
+            let members: Vec<_> = rows
+                .iter()
+                .filter(|row| row.fy == cohort && row.joined_this_fy)
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let kept = members
+                .iter()
+                .filter(|member| {
+                    rows.iter().any(|row| {
+                        row.account_id == member.account_id
+                            && row.fy == cohort + 1
+                            && row.active_end_of_fy
+                    })
+                })
+                .count() as i64;
+            Some(CohortYear1 {
+                cohort,
+                n: members.len() as i64,
+                pct_retained: pct(kept, members.len() as i64),
             })
         })
         .collect()
@@ -521,6 +1415,41 @@ pub fn cohort_matrix(hh: &[Hh], cur: i32) -> Vec<CohortCell> {
                 n: cohort.len() as i64,
                 k,
                 pct_retained: pct(kept, cohort.len() as i64),
+            });
+        }
+    }
+    out
+}
+
+pub fn cohort_matrix_from_household_years(rows: &[HhFy], cur: i32) -> Vec<CohortCell> {
+    let mut out = Vec::new();
+    for cohort in FIRST_COHORT_FY..cur {
+        let members: Vec<_> = rows
+            .iter()
+            .filter(|row| row.fy == cohort && row.joined_this_fy)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        for k in 1..=MAX_K {
+            if cohort + k > cur {
+                break;
+            }
+            let kept = members
+                .iter()
+                .filter(|member| {
+                    rows.iter().any(|row| {
+                        row.account_id == member.account_id
+                            && row.fy == cohort + k
+                            && row.active_end_of_fy
+                    })
+                })
+                .count() as i64;
+            out.push(CohortCell {
+                cohort,
+                n: members.len() as i64,
+                k,
+                pct_retained: pct(kept, members.len() as i64),
             });
         }
     }
@@ -648,6 +1577,283 @@ pub fn reasons(hh: &[Hh], cur: i32) -> Vec<ReasonCell> {
         .collect()
 }
 
+// ── Jobs views ──────────────────────────────────────────────────────────────
+
+/// Fixed tenure bands, indexed so ordering stays stable across rebuilds.
+const TENURE_BUCKETS: [&str; 4] = ["1-2y", "3-5y", "6-10y", "11+y"];
+
+fn tenure_bucket_index(years: f64) -> usize {
+    if years <= 2.0 {
+        0
+    } else if years <= 5.0 {
+        1
+    } else if years <= 10.0 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Count the recognized Entry Jobs a household stated.
+fn entry_job_count(h: &Hh) -> usize {
+    h.ch.iter().filter(|flag| **flag).count()
+}
+
+/// Retention by number of stated Entry Jobs. A household with more than one
+/// recognized joining reason is an association, not proof of stronger intent.
+pub fn multi_job(hh: &[Hh], cur: i32) -> Vec<MultiJobRow> {
+    let base: Vec<&Hh> = hh
+        .iter()
+        .filter(|h| judgeable(h, cur) && h.join_reason.is_some())
+        .collect();
+    [(1, "1 job"), (2, "2 jobs"), (3, "3+ jobs")]
+        .into_iter()
+        .filter_map(|(jobs, label)| {
+            let members: Vec<&&Hh> = base
+                .iter()
+                .filter(|h| {
+                    let count = entry_job_count(h);
+                    if jobs == 3 {
+                        count >= 3
+                    } else {
+                        count == jobs as usize
+                    }
+                })
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let n = members.len() as i64;
+            let still = members.iter().filter(|h| h.is_current).count() as i64;
+            let tenure = members.iter().map(|h| tenure_years(h, cur)).sum::<f64>() / n as f64;
+            Some(MultiJobRow {
+                bucket: label.to_string(),
+                jobs,
+                n,
+                still_members: still,
+                pct: pct(still, n),
+                avg_tenure: (tenure * 10.0).round() / 10.0,
+            })
+        })
+        .collect()
+}
+
+/// Primary Exit Outcome composition by tenure at exit, so churn among short-tenure
+/// households can be compared against longer relationships.
+pub fn outcome_by_tenure(hh: &[Hh], cur: i32) -> Vec<OutcomeByTenureRow> {
+    let mut counts: std::collections::BTreeMap<(usize, String), i64> = Default::default();
+    for h in hh.iter().filter(|h| !h.is_current && h.is_resigned) {
+        let bucket = tenure_bucket_index(tenure_years(h, cur));
+        *counts
+            .entry((bucket, h.resign_reason_group.clone()))
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((bucket, outcome), n)| OutcomeByTenureRow {
+            tenure_bucket: TENURE_BUCKETS[bucket].to_string(),
+            outcome,
+            n,
+        })
+        .collect()
+}
+
+/// Nursery-to-Religious-School progression: of Nursery School families, how many
+/// also became Religious School families, and how each group retained.
+pub fn school_progression(hh: &[Hh], cur: i32) -> Vec<SchoolRow> {
+    let base: Vec<&Hh> = hh
+        .iter()
+        .filter(|h| judgeable(h, cur) && h.ns_family)
+        .collect();
+    let group = |label: &str, members: Vec<&&Hh>| {
+        let n = members.len() as i64;
+        let still = members.iter().filter(|h| h.is_current).count() as i64;
+        SchoolRow {
+            group: label.to_string(),
+            n,
+            still_members: still,
+            pct: pct(still, n),
+        }
+    };
+    vec![
+        group(
+            "Nursery → Religious school",
+            base.iter().filter(|h| h.rs_family).collect(),
+        ),
+        group(
+            "Nursery school only",
+            base.iter().filter(|h| !h.rs_family).collect(),
+        ),
+    ]
+}
+
+/// Retention by completed fiscal years since a Religious School family's last active
+/// year. Only households whose Religious School has ended (no active students) qualify.
+pub fn school_gap(hh: &[Hh], cur: i32) -> Vec<SchoolGapRow> {
+    const BUCKETS: [(&str, i32, i32); 4] = [
+        ("0-1y", 0, 1),
+        ("2-3y", 2, 3),
+        ("4-6y", 4, 6),
+        ("7+y", 7, i32::MAX),
+    ];
+    let base: Vec<&Hh> = hh
+        .iter()
+        .filter(|h| h.rs_family && h.active_rs_students == 0 && h.last_rs_year.is_some())
+        .collect();
+    BUCKETS
+        .into_iter()
+        .filter_map(|(label, lo, hi)| {
+            let members: Vec<&&Hh> = base
+                .iter()
+                .filter(|h| {
+                    let gap = cur - h.last_rs_year.unwrap();
+                    gap >= lo && gap <= hi
+                })
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let n = members.len() as i64;
+            let still = members.iter().filter(|h| h.is_current).count() as i64;
+            Some(SchoolGapRow {
+                bucket: label.to_string(),
+                n,
+                still_members: still,
+                pct: pct(still, n),
+            })
+        })
+        .collect()
+}
+
+// ── Renewal & Engagement views ──────────────────────────────────────────────
+
+/// The recent-anchor window: households anchored in these completed fiscal years,
+/// measured against whether they are still active in the current fiscal year.
+const ANCHOR_WINDOW: i32 = 8;
+
+/// Dues state by fiscal year, over active households. Settlement labels are eventual,
+/// so counts describe final settlement, not the household's state during the year.
+pub fn dues(rows: &[HhFy], cur: i32) -> Vec<DuesRow> {
+    (cur - 5..=cur)
+        .filter_map(|fy| {
+            let year: Vec<_> = rows
+                .iter()
+                .filter(|r| r.fy == fy && r.active_end_of_fy)
+                .collect();
+            if year.is_empty() {
+                return None;
+            }
+            let label_count = |label: &str| {
+                year.iter()
+                    .filter(|r| r.dues_settlement.as_deref() == Some(label))
+                    .count() as i64
+            };
+            Some(DuesRow {
+                fy,
+                active: year.len() as i64,
+                billed: year.iter().filter(|r| r.anchor_dues).count() as i64,
+                coverage_missing: year.iter().filter(|r| r.dues_coverage_missing).count() as i64,
+                settled: label_count("Eventual settlement: settled"),
+                partially_settled: label_count("Eventual settlement: partially settled"),
+                unsettled: label_count("Eventual settlement: unsettled"),
+            })
+        })
+        .collect()
+}
+
+/// Account ids active at the end of the current fiscal year.
+fn active_now(rows: &[HhFy], cur: i32) -> std::collections::HashSet<&str> {
+    rows.iter()
+        .filter(|r| r.fy == cur && r.active_end_of_fy)
+        .map(|r| r.account_id.as_str())
+        .collect()
+}
+
+/// Retention by anchor type: of households that held an anchor in the recent window,
+/// how many are still active now. Only anchor types with an available source appear.
+pub fn anchor_type(rows: &[HhFy], cur: i32, caps: &[SourceCapability]) -> Vec<AnchorTypeRow> {
+    let active = active_now(rows, cur);
+    let defs: [(&str, &str, &str, fn(&HhFy) -> bool); 4] = [
+        ("dues", "Dues renewal", "renewal", |r| r.anchor_dues),
+        ("nursery", "Nursery school", "school", |r| r.anchor_nursery),
+        ("religious", "Religious school", "school", |r| {
+            r.anchor_religious
+        }),
+        ("committee", "Committee", "committee", |r| {
+            r.anchor_committee
+        }),
+    ];
+    defs.into_iter()
+        .filter(|(_, _, cap, _)| cap_available(caps, cap))
+        .filter_map(|(key, label, _, held)| {
+            let holders: std::collections::HashSet<&str> = rows
+                .iter()
+                .filter(|r| r.fy >= cur - ANCHOR_WINDOW && r.fy <= cur - 1 && held(r))
+                .map(|r| r.account_id.as_str())
+                .collect();
+            if holders.is_empty() {
+                return None;
+            }
+            let n = holders.len() as i64;
+            let still = holders.iter().filter(|id| active.contains(*id)).count() as i64;
+            Some(AnchorTypeRow {
+                key: key.to_string(),
+                label: label.to_string(),
+                n,
+                still_members: still,
+                pct: pct(still, n),
+            })
+        })
+        .collect()
+}
+
+/// Retention by anchor count: bucket households by the most anchors they held in any
+/// recent fiscal year, then measure how many are still active now.
+pub fn anchor_count(rows: &[HhFy], cur: i32) -> Vec<AnchorCountRow> {
+    let active = active_now(rows, cur);
+    let mut depth: std::collections::HashMap<&str, i64> = Default::default();
+    for r in rows
+        .iter()
+        .filter(|r| r.fy >= cur - ANCHOR_WINDOW && r.fy <= cur - 1)
+    {
+        let entry = depth.entry(r.account_id.as_str()).or_insert(0);
+        *entry = (*entry).max(r.anchor_count());
+    }
+    [
+        (0, "0 anchors"),
+        (1, "1 anchor"),
+        (2, "2 anchors"),
+        (3, "3+ anchors"),
+    ]
+    .into_iter()
+    .filter_map(|(anchors, label)| {
+        let members: Vec<&&str> = depth
+            .iter()
+            .filter(|(_, held)| {
+                if anchors == 3 {
+                    **held >= 3
+                } else {
+                    **held == anchors
+                }
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if members.is_empty() {
+            return None;
+        }
+        let n = members.len() as i64;
+        let still = members.iter().filter(|id| active.contains(**id)).count() as i64;
+        Some(AnchorCountRow {
+            anchors,
+            label: label.to_string(),
+            n,
+            still_members: still,
+            pct: pct(still, n),
+        })
+    })
+    .collect()
+}
+
 pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
     let active = |fy: i32| hh.iter().filter(|h| member_in(h, fy)).count() as i64;
     let y1 = year1(hh, cur);
@@ -676,7 +1882,95 @@ pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
 
 // ── at-risk rules (fixed in code; tuning is a code change on purpose) ───────
 
-const INTRO_TIERS: [&str; 3] = ["Young Adult Member", "Young Professionals", "Downtown"];
+pub fn kpis_from_household_years(rows: &[HhFy], cur: i32, at_risk_count: i64) -> Kpis {
+    let y1 = year1_from_household_years(rows, cur);
+    let latest = y1.iter().filter(|row| row.cohort <= cur - 2).last();
+    let baseline: Vec<_> = y1.iter().filter(|row| row.cohort <= cur - 3).collect();
+    let year1_baseline_pct = if baseline.is_empty() {
+        0.0
+    } else {
+        (10.0 * baseline.iter().map(|row| row.pct_retained).sum::<f64>() / baseline.len() as f64)
+            .round()
+            / 10.0
+    };
+    let count = |fy: i32, predicate: fn(&HhFy) -> bool| {
+        rows.iter()
+            .filter(|row| row.fy == fy && predicate(row))
+            .count() as i64
+    };
+    Kpis {
+        members_now: count(cur, |row| row.active_end_of_fy),
+        net_vs_prior_fy: count(cur, |row| row.active_end_of_fy)
+            - count(cur - 1, |row| row.active_end_of_fy),
+        joins_this_fy: count(cur, |row| row.joined_this_fy),
+        resigns_this_fy: count(cur, |row| row.resigned_this_fy),
+        year1_cohort: latest.map(|row| row.cohort).unwrap_or(cur - 1),
+        year1_pct: latest.map(|row| row.pct_retained).unwrap_or(0.0),
+        year1_baseline_pct,
+        at_risk_count,
+    }
+}
+
+pub fn channels_from_household_years(rows: &[HhFy], cur: i32) -> Vec<ChannelRow> {
+    let joiners: Vec<_> = rows
+        .iter()
+        .filter(|row| row.joined_this_fy && row.fy >= cur - 12 && row.fy <= cur - 4)
+        .collect();
+    let mut out: Vec<_> = CHANNELS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, _))| {
+            let members: Vec<_> = joiners.iter().filter(|row| row.entry_jobs[index]).collect();
+            if members.len() < CHANNEL_MIN_N {
+                return None;
+            }
+            let outcomes: Vec<_> = members
+                .iter()
+                .map(|member| {
+                    rows.iter()
+                        .filter(|row| row.account_id == member.account_id)
+                        .max_by_key(|row| row.fy)
+                })
+                .collect();
+            let n = members.len() as i64;
+            let still_members = outcomes
+                .iter()
+                .filter(|row| row.is_some_and(|row| row.active_end_of_fy))
+                .count() as i64;
+            let avg_tenure = outcomes
+                .iter()
+                .filter_map(|row| row.and_then(|row| row.tenure_years))
+                .map(f64::from)
+                .sum::<f64>()
+                / n as f64;
+            let left_within_2y = outcomes
+                .iter()
+                .filter(|row| {
+                    row.is_some_and(|row| {
+                        row.resigned_this_fy && row.tenure_years.unwrap_or(i32::MAX) <= 2
+                    })
+                })
+                .count() as i64;
+            Some(ChannelRow {
+                key: (*key).to_string(),
+                label: channel_label(key),
+                n,
+                still_members,
+                pct: pct(still_members, n),
+                avg_tenure: (avg_tenure * 10.0).round() / 10.0,
+                left_within_2y,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.pct
+            .partial_cmp(&a.pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+pub const INTRO_TIERS: [&str; 3] = ["Young Adult Member", "Young Professionals", "Downtown"];
 
 pub fn at_risk_rows(hh: &[Hh], cur: i32) -> Vec<AtRiskRow> {
     let idx = |k: &str| {
@@ -711,7 +2005,7 @@ pub fn at_risk_rows(hh: &[Hh], cur: i32) -> Vec<AtRiskRow> {
             {
                 rules.push("rs_ended");
             }
-            if rules.is_empty() {
+            if rules.len() < 2 {
                 return None;
             }
             Some(AtRiskRow {
@@ -733,7 +2027,7 @@ pub fn at_risk(store: &Store, cur: i32) -> Result<Vec<AtRiskRow>> {
 
 // ── CSV ─────────────────────────────────────────────────────────────────────
 
-pub const VIEWS: [&str; 7] = [
+pub const VIEWS: [&str; 14] = [
     "trend",
     "year1",
     "cohort_matrix",
@@ -741,6 +2035,13 @@ pub const VIEWS: [&str; 7] = [
     "school",
     "reasons",
     "at_risk",
+    "multi_job",
+    "outcome_by_tenure",
+    "school_progression",
+    "school_gap",
+    "dues",
+    "anchor_type",
+    "anchor_count",
 ];
 
 fn csv_cell(s: &str) -> String {
@@ -824,6 +2125,89 @@ pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(Stri
                 .map(|r| vec![s(&r.fy), r.reason.clone(), s(&r.n)])
                 .collect(),
         ),
+        "multi_job" => csv(
+            &[
+                "bucket",
+                "jobs",
+                "households",
+                "still_members",
+                "pct",
+                "avg_tenure_years",
+            ],
+            ins.multi_job
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.bucket.clone(),
+                        s(&r.jobs),
+                        s(&r.n),
+                        s(&r.still_members),
+                        s(&r.pct),
+                        s(&r.avg_tenure),
+                    ]
+                })
+                .collect(),
+        ),
+        "outcome_by_tenure" => csv(
+            &["tenure_bucket", "outcome", "n"],
+            ins.outcome_by_tenure
+                .iter()
+                .map(|r| vec![r.tenure_bucket.clone(), r.outcome.clone(), s(&r.n)])
+                .collect(),
+        ),
+        "school_progression" => csv(
+            &["group", "households", "still_members", "pct"],
+            ins.school_progression
+                .iter()
+                .map(|r| vec![r.group.clone(), s(&r.n), s(&r.still_members), s(&r.pct)])
+                .collect(),
+        ),
+        "school_gap" => csv(
+            &["bucket", "households", "still_members", "pct"],
+            ins.school_gap
+                .iter()
+                .map(|r| vec![r.bucket.clone(), s(&r.n), s(&r.still_members), s(&r.pct)])
+                .collect(),
+        ),
+        "dues" => csv(
+            &[
+                "fy",
+                "active",
+                "billed",
+                "coverage_missing",
+                "settled",
+                "partially_settled",
+                "unsettled",
+            ],
+            ins.dues
+                .iter()
+                .map(|r| {
+                    vec![
+                        s(&r.fy),
+                        s(&r.active),
+                        s(&r.billed),
+                        s(&r.coverage_missing),
+                        s(&r.settled),
+                        s(&r.partially_settled),
+                        s(&r.unsettled),
+                    ]
+                })
+                .collect(),
+        ),
+        "anchor_type" => csv(
+            &["anchor", "households", "still_members", "pct"],
+            ins.anchor_type
+                .iter()
+                .map(|r| vec![r.label.clone(), s(&r.n), s(&r.still_members), s(&r.pct)])
+                .collect(),
+        ),
+        "anchor_count" => csv(
+            &["anchors", "households", "still_members", "pct"],
+            ins.anchor_count
+                .iter()
+                .map(|r| vec![r.label.clone(), s(&r.n), s(&r.still_members), s(&r.pct)])
+                .collect(),
+        ),
         "at_risk" => csv(
             &["account_id", "name", "tier", "join_fy", "rules"],
             at_risk
@@ -845,22 +2229,52 @@ pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(Stri
 
 pub fn views(store: &Store, cur: i32) -> Result<Insights> {
     let hh = load(store)?;
+    let household_years = load_household_years(store)?;
+    let built_at = store.get_meta("insights_built_at")?;
+    let newest_source_sync_at = store.newest_sync_at()?;
+    let stale = matches!((&built_at, &newest_source_sync_at), (Some(built), Some(source)) if source > built);
     let unavailable: Vec<String> = store
         .get_meta("insights_unavailable")?
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let at_risk = at_risk_rows(&hh, cur).len() as i64;
+    let capabilities = source_capabilities(store)?;
+    // Renewal & Engagement views read optional anchor sources; keep them empty when the
+    // source is unavailable so absent data is never shown as household behavior.
+    let dues_view = if cap_available(&capabilities, "renewal") {
+        dues(&household_years, cur)
+    } else {
+        Vec::new()
+    };
+    let any_anchor = ["renewal", "school", "committee"]
+        .iter()
+        .any(|key| cap_available(&capabilities, key));
+    let anchor_count_view = if any_anchor {
+        anchor_count(&household_years, cur)
+    } else {
+        Vec::new()
+    };
     Ok(Insights {
-        built_at: store.get_meta("insights_built_at")?,
+        built_at,
+        newest_source_sync_at,
+        stale,
         current_fy: cur,
         unavailable,
-        kpis: kpis(&hh, cur, at_risk),
-        trend: trend(&hh, cur),
-        year1: year1(&hh, cur),
-        cohort_matrix: cohort_matrix(&hh, cur),
-        channels: channels(&hh, cur),
+        kpis: kpis_from_household_years(&household_years, cur, at_risk),
+        trend: trend_from_household_years(&household_years, cur),
+        year1: year1_from_household_years(&household_years, cur),
+        cohort_matrix: cohort_matrix_from_household_years(&household_years, cur),
+        channels: channels_from_household_years(&household_years, cur),
         school: school(&hh, cur),
-        reasons: reasons(&hh, cur),
+        reasons: reasons_from_household_years(&household_years, cur),
+        multi_job: multi_job(&hh, cur),
+        outcome_by_tenure: outcome_by_tenure(&hh, cur),
+        school_progression: school_progression(&hh, cur),
+        school_gap: school_gap(&hh, cur),
+        dues: dues_view,
+        anchor_type: anchor_type(&household_years, cur, &capabilities),
+        anchor_count: anchor_count_view,
+        capabilities,
     })
 }
 
@@ -911,20 +2325,33 @@ mod tests {
 
     #[test]
     fn reason_group_buckets_in_priority_order() {
-        assert_eq!(reason_group(Some("Moved;No Longer Engaged")), "Moved");
-        assert_eq!(reason_group(Some("Non-payment")), "Non-payment");
         assert_eq!(
-            reason_group(Some("CJM / AM Aged Out")),
-            "Young-adult tier aged out"
+            exit_labels(Some("Moved; No Longer Engaged")),
+            vec!["Moved", "No longer engaged"]
         );
+        assert_eq!(reason_group(Some("Moved; Non-payment")), "Structural Exit");
+        assert_eq!(reason_group(Some("CJM / AM Aged Out")), "Conversion Loss");
         assert_eq!(
             reason_group(Some("Joined Another Synagogue")),
-            "Joined another synagogue"
+            "Addressable Churn"
         );
-        assert_eq!(reason_group(Some("Elderly / Ill")), "Elderly / ill");
-        assert_eq!(reason_group(Some("Something new")), "Other");
-        assert_eq!(reason_group(Some("")), "(not coded)");
-        assert_eq!(reason_group(None), "(not coded)");
+        assert_eq!(reason_group(Some("Elderly / Ill")), "Structural Exit");
+        assert_eq!(
+            reason_group(Some("Something new")),
+            "Administrative or Unknown Exit"
+        );
+        assert_eq!(reason_group(Some("")), "Administrative or Unknown Exit");
+        assert_eq!(reason_group(None), "Administrative or Unknown Exit");
+    }
+    #[test]
+    fn exit_outcomes_need_multi_label_primary_precedence() {
+        assert_eq!(
+            exit_labels(Some("Moved; Non-payment")),
+            vec!["Moved", "Non-payment"]
+        );
+        assert_eq!(reason_group(Some("Moved; Non-payment")), "Structural Exit");
+        assert_eq!(reason_group(Some("Aged out")), "Conversion Loss");
+        assert_eq!(reason_group(Some("")), "Administrative or Unknown Exit");
     }
 
     #[test]
@@ -933,6 +2360,156 @@ mod tests {
         assert_eq!(parse_rs_year(Some("2007")), Some(2007));
         assert_eq!(parse_rs_year(Some("")), None);
         assert_eq!(parse_rs_year(None), None);
+    }
+
+    #[test]
+    fn membership_dues_exclude_non_dues_product_families() {
+        assert_eq!(
+            dues_class(Some("Membership"), Some("Annual Membership Dues")),
+            DuesClass::Membership
+        );
+        assert_eq!(
+            dues_class(Some("Membership"), Some("Membership Security Fee")),
+            DuesClass::SecurityFee
+        );
+        assert_eq!(
+            dues_class(Some("Gift"), Some("High Holiday Gift")),
+            DuesClass::Gift
+        );
+        assert_eq!(
+            dues_class(Some("School"), Some("Religious School Tuition")),
+            DuesClass::Tuition
+        );
+        assert_eq!(
+            dues_class(Some("Events"), Some("Gala Tickets")),
+            DuesClass::Event
+        );
+        assert_eq!(
+            dues_class(Some("Sales"), Some("Gift Shop Sale")),
+            DuesClass::Sale
+        );
+        assert_eq!(dues_class(None, Some("Parking")), DuesClass::Other);
+    }
+
+    #[test]
+    fn dues_evidence_joins_lines_through_statements_and_marks_coverage() {
+        let statements = [BillingStatement {
+            id: "stmt-1",
+            household_id: Some("hh-1"),
+            issued_at: Some("2024-07-01"),
+            eventual_received: Some(500.0),
+            eventual_balance: Some(0.0),
+        }];
+        let lines = [
+            BillingStatementLine {
+                statement_id: Some("stmt-1"),
+                product_family: Some("Membership"),
+                product_name: Some("Annual Membership Dues"),
+                amount: Some(500.0),
+            },
+            BillingStatementLine {
+                statement_id: Some("stmt-1"),
+                product_family: Some("Fees"),
+                product_name: Some("Security Fee"),
+                amount: Some(75.0),
+            },
+            BillingStatementLine {
+                statement_id: Some("missing-parent"),
+                product_family: Some("Membership"),
+                product_name: Some("Annual Membership Dues"),
+                amount: Some(999.0),
+            },
+        ];
+
+        let evidence = dues_evidence("hh-1", 2025, &statements, &lines);
+        assert_eq!(evidence.coverage, BillingCoverage::Present);
+        assert_eq!(evidence.dues_billed, 500.0);
+        assert_eq!(evidence.settlement, SettlementState::Settled);
+        assert_eq!(
+            dues_evidence("hh-2", 2025, &statements, &lines).coverage,
+            BillingCoverage::Missing
+        );
+    }
+
+    #[test]
+    fn dues_evidence_labels_final_mirror_values_as_eventual_settlement() {
+        let statements = [
+            BillingStatement {
+                id: "partial",
+                household_id: Some("hh-1"),
+                issued_at: Some("2024-06-01"),
+                eventual_received: Some(100.0),
+                eventual_balance: Some(400.0),
+            },
+            BillingStatement {
+                id: "unknown",
+                household_id: Some("hh-2"),
+                issued_at: Some("2024-06-01"),
+                eventual_received: None,
+                eventual_balance: None,
+            },
+        ];
+        let lines = [
+            BillingStatementLine::dues("partial", 500.0),
+            BillingStatementLine::dues("unknown", 500.0),
+        ];
+
+        let partial = dues_evidence("hh-1", 2025, &statements, &lines);
+        assert_eq!(partial.settlement, SettlementState::PartiallySettled);
+        assert_eq!(
+            partial.settlement_label(),
+            "Eventual settlement: partially settled"
+        );
+
+        let unknown = dues_evidence("hh-2", 2025, &statements, &lines);
+        assert_eq!(unknown.settlement, SettlementState::Unknown);
+
+        let missing = dues_evidence("hh-3", 2025, &statements, &lines);
+        assert_eq!(missing.coverage, BillingCoverage::Missing);
+        assert_eq!(missing.settlement, SettlementState::Unknown);
+    }
+
+    #[test]
+    fn enrollment_normalization_distinguishes_confirmed_anchors_from_withdrawals() {
+        let nursery = normalize_enrollment(Some("Nursery School Pre-K"), Some("Confirmed"));
+        assert_eq!(nursery.school, Some(SchoolType::Nursery));
+        assert_eq!(nursery.outcome, EnrollmentOutcome::Confirmed);
+        assert_eq!(nursery.anchor, Some(RelationshipAnchor::NurserySchool));
+
+        let religious = normalize_enrollment(Some("Religious School Grade 3"), Some("Enrolled"));
+        assert_eq!(religious.school, Some(SchoolType::Religious));
+        assert_eq!(religious.anchor, Some(RelationshipAnchor::ReligiousSchool));
+
+        let withdrawn = normalize_enrollment(Some("Religious School Grade 3"), Some("Withdrawn"));
+        assert_eq!(withdrawn.school, Some(SchoolType::Religious));
+        assert_eq!(withdrawn.outcome, EnrollmentOutcome::Withdrawn);
+        assert_eq!(withdrawn.anchor, None, "withdrawal is not an anchor");
+
+        let pending = normalize_enrollment(Some("Nursery School Pre-K"), Some("Pending"));
+        assert_eq!(pending.outcome, EnrollmentOutcome::Other);
+        assert_eq!(pending.anchor, None);
+    }
+
+    #[test]
+    fn committee_normalization_treats_far_future_end_dates_as_open_and_respects_is_active() {
+        let current = normalize_committee(Some("2024-06-01"), Some("2199-12-31"), Some("true"));
+        assert_eq!(current.start_fy, Some(2025));
+        assert_eq!(current.end_fy, None);
+        assert!(current.open_ended);
+        assert!(current.current_active);
+
+        let inactive = normalize_committee(Some("2024-06-01"), None, Some("false"));
+        assert_eq!(inactive.start_fy, Some(2025));
+        assert!(!inactive.open_ended);
+        assert!(inactive.end_fy.is_none());
+        assert!(!inactive.current_active, "IsActive__c is authoritative");
+
+        let ended = normalize_committee(Some("2023-06-01"), Some("2024-05-31"), Some("true"));
+        assert_eq!(ended.end_fy, Some(2024));
+        assert!(
+            ended.current_active,
+            "date history does not override IsActive__c"
+        );
     }
 
     use crate::salesforce::Row;
@@ -985,6 +2562,27 @@ mod tests {
         }
         let cols: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
         s.replace_mirror("Account", &cols, rows).unwrap();
+    }
+
+    /// Seed one synthetic optional-source mirror table and mark it synced.
+    fn seed_object(s: &mut Store, object: &str, cols: &[&str], rows: &[Row]) {
+        s.upsert_object(object, object, rows.len() as i64).unwrap();
+        for c in cols {
+            s.upsert_field(object, c, "string", c, false).unwrap();
+        }
+        let owned: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+        s.replace_mirror(object, &owned, rows).unwrap();
+    }
+
+    /// Build a mirror row from (column, value) pairs; "" means NULL.
+    fn row(pairs: &[(&str, &str)]) -> Row {
+        let mut m = Row::new();
+        for (k, v) in pairs {
+            if !v.is_empty() {
+                m.insert((*k).into(), serde_json::Value::String((*v).into()));
+            }
+        }
+        m
     }
 
     fn fixture() -> Vec<Row> {
@@ -1103,15 +2701,15 @@ mod tests {
                 "",
                 "",
             ]),
-            // current, joined last FY (FY2026 = Jun 2025) via nursery school only
+            // current, joined last FY (FY2025 = Jul 2024) via nursery school only
             acct([
                 "001G",
                 "Green",
                 "Member Family",
                 "true",
                 "false",
-                "2025-07-01",
-                "2025-07-01",
+                "2024-07-01",
+                "2024-07-01",
                 "",
                 "Voting Member",
                 "MAIN",
@@ -1149,7 +2747,7 @@ mod tests {
         let b = by("001B");
         assert_eq!(b.resign_fy, Some(2020));
         assert!(b.ch[0] && b.ch[1]);
-        assert_eq!(b.resign_reason_group, "Non-payment");
+        assert_eq!(b.resign_reason_group, "Addressable Churn");
         assert!(b.ns_family);
 
         let c = by("001C");
@@ -1171,6 +2769,15 @@ mod tests {
 
         assert!(s.get_meta("insights_built_at").unwrap().is_some());
         assert!(s.table_exists(MART).unwrap());
+        assert!(s.table_exists(MART_FY).unwrap());
+        let fy_rows = load_household_years(&s).unwrap();
+        assert!(fy_rows.iter().any(|row| {
+            row.account_id == "001B"
+                && row.fy == 2020
+                && row.resigned_this_fy
+                && !row.active_end_of_fy
+                && row.exit_outcome.as_deref() == Some("Addressable Churn")
+        }));
     }
 
     #[test]
@@ -1198,6 +2805,43 @@ mod tests {
     }
 
     #[test]
+    fn source_capabilities_require_every_required_mirror_and_report_freshness() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        for object in ["BillingStatement__c", "BillingStatementLine__c"] {
+            s.upsert_object(object, object, 0).unwrap();
+            s.upsert_field(object, "Id", "id", "Id", false).unwrap();
+            s.replace_mirror(object, &["Id".into()], &[]).unwrap();
+        }
+
+        let capabilities = source_capabilities(&s).unwrap();
+        let get = |key: &str| {
+            capabilities
+                .iter()
+                .find(|capability| capability.key == key)
+                .unwrap()
+        };
+        assert!(get("membership").available);
+        assert!(get("renewal").available);
+        assert!(!get("school").available);
+        assert_eq!(
+            get("school").unavailable_reason.as_deref(),
+            Some("Select and sync Class_Enrolment__c")
+        );
+        assert!(!get("committee").available);
+
+        rebuild(&mut s).unwrap();
+        let insight = views(&s, 2026).unwrap();
+        assert!(insight.newest_source_sync_at.is_some());
+        assert!(!insight.stale, "rebuild follows the source sync");
+        assert_eq!(insight.capabilities, capabilities);
+
+        s.set_meta("insights_built_at", "2000-01-01T00:00:00Z")
+            .unwrap();
+        assert!(views(&s, 2026).unwrap().stale);
+    }
+
+    #[test]
     fn rebuild_honors_withheld_fields_not_just_synced_columns() {
         let (_d, mut s) = mem();
         seed_account(&mut s, &fixture(), &ACCT_COLS);
@@ -1213,10 +2857,303 @@ mod tests {
     }
 
     #[test]
+    fn current_spell_suppresses_old_exit_evidence() {
+        let (_d, mut s) = mem();
+        let mut rows = fixture();
+        rows.push(acct([
+            "001H",
+            "Hale",
+            "Member Family",
+            "true",
+            "false",
+            "2018-06-01",
+            "2016-06-01",
+            "2017-05-31",
+            "Voting Member",
+            "MAIN",
+            "",
+            "Moved; Non-payment",
+            "0",
+            "0",
+            "false",
+            "",
+        ]));
+        seed_account(&mut s, &rows, &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let hh = load(&s).unwrap();
+        let h = hh.iter().find(|h| h.account_id == "001H").unwrap();
+        assert_eq!(h.resign_fy, None);
+        assert_eq!(h.resign_reason_group, "(not coded)");
+    }
+
+    #[test]
+    fn encrypted_lifecycle_fixture_covers_each_membership_outcome() {
+        let (_d, mut s) = mem();
+        let mut rows = fixture();
+        rows.extend([
+            acct([
+                "001I",
+                "Intro",
+                "Member Family",
+                "false",
+                "true",
+                "2020-06-01",
+                "2020-06-01",
+                "2022-06-01",
+                "Young Professionals",
+                "MAIN",
+                "Young Professionals",
+                "Aged out",
+                "0",
+                "0",
+                "false",
+                "",
+            ]),
+            acct([
+                "001J",
+                "Unknown",
+                "Member Family",
+                "false",
+                "true",
+                "2020-06-01",
+                "2020-06-01",
+                "2022-06-01",
+                "Voting Member",
+                "MAIN",
+                "",
+                "Administrative",
+                "0",
+                "0",
+                "false",
+                "",
+            ]),
+        ]);
+        seed_account(&mut s, &rows, &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let rows = load(&s).unwrap();
+        let outcome = |id: &str| {
+            rows.iter()
+                .find(|row| row.account_id == id)
+                .unwrap()
+                .resign_reason_group
+                .as_str()
+        };
+        assert_eq!(outcome("001B"), "Addressable Churn");
+        assert_eq!(outcome("001D"), "Structural Exit");
+        assert_eq!(outcome("001I"), "Conversion Loss");
+        assert_eq!(outcome("001J"), "Administrative or Unknown Exit");
+        assert!(rows
+            .iter()
+            .any(|row| row.account_id == "001C" && row.rejoined && row.is_current));
+        assert!(load_household_years(&s)
+            .unwrap()
+            .iter()
+            .any(|row| row.account_id == "001A" && row.active_end_of_fy));
+    }
+
+    /// Two current households; A joined FY2021, B joined FY2020.
+    fn anchor_accounts() -> Vec<Row> {
+        vec![
+            acct([
+                "accA",
+                "A Family",
+                "Member Family",
+                "true",
+                "false",
+                "2020-06-01",
+                "2020-06-01",
+                "",
+                "Voting Member",
+                "MAIN",
+                "",
+                "",
+                "0",
+                "0",
+                "false",
+                "",
+            ]),
+            acct([
+                "accB",
+                "B Family",
+                "Member Family",
+                "true",
+                "false",
+                "2019-06-01",
+                "2019-06-01",
+                "",
+                "Voting Member",
+                "MAIN",
+                "",
+                "",
+                "0",
+                "0",
+                "false",
+                "",
+            ]),
+        ]
+    }
+
+    #[test]
+    fn anchors_populate_from_optional_mirror_sources() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &anchor_accounts(), &ACCT_COLS);
+        // Renewal: A billed membership dues in FY2025 (statement dated Sep 2024), settled.
+        seed_object(
+            &mut s,
+            "BillingStatement__c",
+            &[
+                "Id",
+                "Account__c",
+                "Statement_Date__c",
+                "Amount_Received__c",
+                "Balance__c",
+            ],
+            &[row(&[
+                ("Id", "st1"),
+                ("Account__c", "accA"),
+                ("Statement_Date__c", "2024-09-01"),
+                ("Amount_Received__c", "1000"),
+                ("Balance__c", "0"),
+            ])],
+        );
+        seed_object(
+            &mut s,
+            "BillingStatementLine__c",
+            &[
+                "Id",
+                "BillingStatement__c",
+                "Product_Family__c",
+                "Product_Name__c",
+                "Amount__c",
+            ],
+            &[row(&[
+                ("Id", "ln1"),
+                ("BillingStatement__c", "st1"),
+                ("Product_Family__c", "Membership"),
+                ("Product_Name__c", "Dues"),
+                ("Amount__c", "1000"),
+            ])],
+        );
+        // School: A confirmed Religious School enrolment for the 2024-2025 year (FY2025).
+        seed_object(
+            &mut s,
+            "Class_Enrolment__c",
+            &[
+                "Id",
+                "Account__c",
+                "Class_Name__c",
+                "Status__c",
+                "School_Year__c",
+            ],
+            &[row(&[
+                ("Id", "en1"),
+                ("Account__c", "accA"),
+                ("Class_Name__c", "Religious School Grade 3"),
+                ("Status__c", "Confirmed"),
+                ("School_Year__c", "2024-2025"),
+            ])],
+        );
+        // Committee: B active from FY2025 with a far-future placeholder end date.
+        seed_object(
+            &mut s,
+            "Committee_Membership__c",
+            &[
+                "Id",
+                "Account__c",
+                "Start_Date__c",
+                "End_Date__c",
+                "IsActive__c",
+            ],
+            &[row(&[
+                ("Id", "cm1"),
+                ("Account__c", "accB"),
+                ("Start_Date__c", "2024-06-01"),
+                ("End_Date__c", "2199-12-31"),
+                ("IsActive__c", "true"),
+            ])],
+        );
+        rebuild(&mut s).unwrap();
+
+        let years = load_household_years(&s).unwrap();
+        let at = |id: &str, fy: i32| {
+            years
+                .iter()
+                .find(|r| r.account_id == id && r.fy == fy)
+                .unwrap()
+        };
+        let a25 = at("accA", 2025);
+        assert!(a25.anchor_dues && a25.anchor_religious && !a25.anchor_committee);
+        assert_eq!(
+            a25.dues_settlement.as_deref(),
+            Some("Eventual settlement: settled")
+        );
+        assert_eq!(a25.anchor_count(), 2);
+        let b25 = at("accB", 2025);
+        assert!(b25.anchor_committee && !b25.anchor_dues);
+        // Open-ended committee membership stays active in later fiscal years.
+        assert!(at("accB", 2026).anchor_committee);
+
+        let cur = current_fy();
+        let caps = source_capabilities(&s).unwrap();
+        let dues = dues(&years, cur);
+        let fy25 = dues.iter().find(|d| d.fy == 2025).unwrap();
+        assert_eq!((fy25.billed, fy25.settled), (1, 1));
+        assert!(
+            fy25.coverage_missing >= 1,
+            "B is active in FY2025 with no dues line"
+        );
+        let anchors = anchor_type(&years, cur, &caps);
+        let keys: Vec<&str> = anchors.iter().map(|a| a.key.as_str()).collect();
+        assert!(
+            keys.contains(&"dues") && keys.contains(&"religious") && keys.contains(&"committee")
+        );
+        let counts = anchor_count(&years, cur);
+        assert!(
+            counts.iter().any(|c| c.anchors == 2 && c.n == 1),
+            "A held two anchors"
+        );
+        assert!(
+            counts.iter().any(|c| c.anchors == 1 && c.n == 1),
+            "B held one anchor"
+        );
+    }
+
+    #[test]
+    fn unavailable_optional_sources_leave_anchors_and_views_empty() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &anchor_accounts(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        assert!(load_household_years(&s)
+            .unwrap()
+            .iter()
+            .all(|r| r.anchor_count() == 0 && r.dues_settlement.is_none()));
+        let v = views(&s, current_fy()).unwrap();
+        assert!(v.dues.is_empty() && v.anchor_type.is_empty() && v.anchor_count.is_empty());
+        assert!(v
+            .capabilities
+            .iter()
+            .any(|c| c.key == "renewal" && !c.available));
+    }
+
+    #[test]
     fn rebuild_fails_cleanly_when_account_is_not_synced() {
         let (_d, mut s) = mem();
         let err = rebuild(&mut s).unwrap_err().to_string();
         assert!(err.contains("Account"), "{err}");
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_the_prior_household_and_household_year_marts() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let prior_households = load(&s).unwrap().len();
+        let prior_years = load_household_years(&s).unwrap().len();
+        s.conn().execute("DROP TABLE Account", []).unwrap();
+
+        assert!(rebuild(&mut s).is_err());
+        assert_eq!(load(&s).unwrap().len(), prior_households);
+        assert_eq!(load_household_years(&s).unwrap().len(), prior_years);
     }
 
     #[test]
@@ -1226,6 +3163,7 @@ mod tests {
         rebuild(&mut s).unwrap();
         s.purge_mirror().unwrap();
         assert!(!s.table_exists(MART).unwrap());
+        assert!(!s.table_exists(MART_FY).unwrap());
     }
 
     fn h(id: &str, current: bool, join: Option<i32>, resign: Option<i32>) -> Hh {
@@ -1298,9 +3236,15 @@ mod tests {
             h("d", true, Some(2021), None),
         ];
         let y = year1(&hh, 2024);
+        let yearly = household_year_rows(&hh, 2024);
+        assert_eq!(year1_from_household_years(&yearly, 2024).len(), y.len());
         let c2020 = y.iter().find(|r| r.cohort == 2020).unwrap();
         assert_eq!((c2020.n, c2020.pct_retained), (3, 66.7));
         let m = cohort_matrix(&hh, 2024);
+        assert_eq!(
+            cohort_matrix_from_household_years(&yearly, 2024).len(),
+            m.len()
+        );
         let cell = |c: i32, k: i32| {
             m.iter()
                 .find(|x| x.cohort == c && x.k == k)
@@ -1350,8 +3294,10 @@ mod tests {
         a.ns_family = true;
         let mut b = h("b", false, Some(2017), Some(2024));
         b.rs_family = true;
-        b.resign_reason_group = "Moved".into();
+        b.resign_reason_group = "Structural Exit".into();
         let c = h("c", false, Some(2018), Some(2025));
+        let mut c = c;
+        c.resign_reason_group = "Administrative or Unknown Exit".into();
         let hh = vec![a, b, c.clone()];
         let s = school(&hh, 2026);
         let g = |name: &str| s.iter().find(|r| r.group == name).unwrap();
@@ -1373,10 +3319,125 @@ mod tests {
         let r = reasons(&hh, 2026);
         assert!(r
             .iter()
-            .any(|x| x.fy == 2024 && x.reason == "Moved" && x.n == 1));
+            .any(|x| x.fy == 2024 && x.reason == "Structural Exit" && x.n == 1));
         assert!(r
             .iter()
-            .any(|x| x.fy == 2025 && x.reason == "(not coded)" && x.n == 1));
+            .any(|x| x.fy == 2025 && x.reason == "Administrative or Unknown Exit" && x.n == 1));
+    }
+
+    fn with_reason(id: &str, current: bool, join: i32, resign: Option<i32>, reason: &str) -> Hh {
+        let mut x = h(id, current, Some(join), resign);
+        x.join_reason = Some(reason.into());
+        x.ch = channel_flags(Some(reason));
+        x
+    }
+
+    #[test]
+    fn multi_job_buckets_by_stated_job_count() {
+        let cur = 2026;
+        let hh = vec![
+            with_reason("one", true, 2016, None, "Religious School"),
+            with_reason("two", true, 2016, None, "Community and Young Professionals"),
+            with_reason(
+                "three",
+                false,
+                2016,
+                Some(2020),
+                "Religious School, Nursery School and Community",
+            ),
+        ];
+        let rows = multi_job(&hh, cur);
+        let get = |bucket: &str| rows.iter().find(|r| r.bucket == bucket).unwrap();
+        assert_eq!((get("1 job").n, get("1 job").still_members), (1, 1));
+        assert_eq!((get("2 jobs").n, get("2 jobs").still_members), (1, 1));
+        // "three" stated three recognized jobs and has since resigned.
+        assert_eq!(
+            (
+                get("3+ jobs").n,
+                get("3+ jobs").still_members,
+                get("3+ jobs").pct
+            ),
+            (1, 0, 0.0)
+        );
+        assert_eq!(get("1 job").avg_tenure, 10.0, "current, joined 2016");
+    }
+
+    #[test]
+    fn outcome_by_tenure_buckets_exits_by_tenure_at_exit() {
+        let mut a = h("a", false, Some(2018), Some(2019)); // 1 year tenure
+        a.resign_reason_group = "Addressable Churn".into();
+        let mut b = h("b", false, Some(2010), Some(2018)); // 8 years
+        b.resign_reason_group = "Structural Exit".into();
+        let mut c = h("c", false, Some(2000), Some(2020)); // 20 years
+        c.resign_reason_group = "Addressable Churn".into();
+        let rows = outcome_by_tenure(&[a, b, c], 2026);
+        let has = |bucket: &str, outcome: &str| {
+            rows.iter()
+                .any(|r| r.tenure_bucket == bucket && r.outcome == outcome && r.n == 1)
+        };
+        assert!(has("1-2y", "Addressable Churn"));
+        assert!(has("6-10y", "Structural Exit"));
+        assert!(has("11+y", "Addressable Churn"));
+    }
+
+    #[test]
+    fn school_progression_splits_nursery_families_and_ignores_non_nursery() {
+        let mut progressed = h("p", true, Some(2016), None);
+        progressed.ns_family = true;
+        progressed.rs_family = true;
+        let mut only = h("o", false, Some(2016), Some(2020));
+        only.ns_family = true;
+        let mut not_nursery = h("n", true, Some(2016), None);
+        not_nursery.rs_family = true; // no nursery history -> excluded
+        let rows = school_progression(&[progressed, only, not_nursery], 2026);
+        let g = |name: &str| rows.iter().find(|r| r.group == name).unwrap();
+        assert_eq!(
+            (
+                g("Nursery → Religious school").n,
+                g("Nursery → Religious school").still_members,
+                g("Nursery → Religious school").pct
+            ),
+            (1, 1, 100.0)
+        );
+        assert_eq!(
+            (g("Nursery school only").n, g("Nursery school only").pct),
+            (1, 0.0)
+        );
+    }
+
+    #[test]
+    fn school_gap_buckets_years_since_religious_school() {
+        let ended = |id: &str, current: bool, last: i32| {
+            let mut x = h(
+                id,
+                current,
+                Some(2010),
+                if current { None } else { Some(2024) },
+            );
+            x.rs_family = true;
+            x.active_rs_students = 0;
+            x.last_rs_year = Some(last);
+            x
+        };
+        let mut still_enrolled = ended("busy", true, 2025);
+        still_enrolled.active_rs_students = 2; // school not over -> excluded
+        let rows = school_gap(
+            &[
+                ended("a", true, 2025),  // gap 1
+                ended("b", false, 2023), // gap 3
+                ended("c", true, 2016),  // gap 10
+                still_enrolled,
+            ],
+            2026,
+        );
+        let g = |bucket: &str| rows.iter().find(|r| r.bucket == bucket).unwrap();
+        assert_eq!((g("0-1y").n, g("0-1y").still_members), (1, 1));
+        assert_eq!((g("2-3y").n, g("2-3y").still_members), (1, 0));
+        assert_eq!((g("7+y").n, g("7+y").still_members), (1, 1));
+        assert!(
+            !rows.iter().any(|r| r.bucket == "4-6y"),
+            "no household there"
+        );
     }
 
     #[test]
@@ -1416,7 +3477,9 @@ mod tests {
         let v = views(&s, 2026).unwrap();
         assert_eq!(v.current_fy, 2026);
         assert!(v.built_at.is_some());
-        assert_eq!(v.kpis.members_now, 4);
+        // 4 current members, but Katz (001E) has a placeholder join date and no valid
+        // join FY, so the household-year mart cannot place it on the fiscal timeline.
+        assert_eq!(v.kpis.members_now, 3);
         assert!(!v.trend.is_empty());
         assert!(v.year1.iter().any(|r| r.cohort == 2015 && r.n == 2));
     }
@@ -1435,11 +3498,16 @@ mod tests {
         rs_done.rs_family = true;
         rs_done.active_rs_students = 0;
         rs_done.last_rs_year = Some(2025);
+        let mut old_rs_done = h("old-rs", true, Some(2012), None);
+        old_rs_done.name = Some("Old RS Done".into());
+        old_rs_done.rs_family = true;
+        old_rs_done.active_rs_students = 0;
+        old_rs_done.last_rs_year = Some(2016);
         let mut safe = h("ok", true, Some(2012), None);
         safe.name = Some("Safe".into());
         let mut gone = h("gone", false, Some(2025), Some(2026));
         gone.name = Some("Gone".into());
-        let rows = at_risk_rows(&[ns_only, intro, rs_done, safe, gone], cur);
+        let rows = at_risk_rows(&[ns_only, intro, rs_done, old_rs_done, safe, gone], cur);
         let get = |id: &str| {
             rows.iter()
                 .find(|r| r.account_id == id)
@@ -1449,8 +3517,13 @@ mod tests {
             get("ns"),
             Some(vec!["first_year".to_string(), "new_ns_only".to_string()])
         );
-        assert_eq!(get("yp"), Some(vec!["intro_tier_aging".to_string()]));
-        assert_eq!(get("rs"), Some(vec!["rs_ended".to_string()]));
+        assert_eq!(get("yp"), None, "one weak churn signal is not enough");
+        assert_eq!(get("rs"), None, "one weak churn signal is not enough");
+        assert_eq!(
+            get("old-rs"),
+            None,
+            "old school-end history is not current risk"
+        );
         assert_eq!(get("ok"), None);
         assert_eq!(get("gone"), None, "only current members can be at risk");
         assert_eq!(rows[0].account_id, "ns", "most rules first");
@@ -1497,4 +3570,64 @@ mod tests {
             "must exist"
         );
     }
+}
+
+pub fn reasons_from_household_years(rows: &[HhFy], cur: i32) -> Vec<ReasonCell> {
+    let mut counts: std::collections::BTreeMap<(i32, String), i64> = Default::default();
+    for row in rows
+        .iter()
+        .filter(|row| row.resigned_this_fy && row.fy >= cur - 5 && row.fy <= cur)
+    {
+        *counts
+            .entry((
+                row.fy,
+                row.exit_outcome
+                    .clone()
+                    .unwrap_or_else(|| "Administrative or Unknown Exit".into()),
+            ))
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((fy, reason), n)| ReasonCell { fy, reason, n })
+        .collect()
+}
+
+pub fn load_household_years(store: &Store) -> Result<Vec<HhFy>> {
+    let flag_cols = CHANNELS
+        .iter()
+        .map(|(key, _)| format!("entry_job_{key}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = store.conn().prepare(&format!(
+        "SELECT account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
+         tenure_years, exit_outcome, entry_job_count, {flag_cols},
+         anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
+         dues_coverage_missing, dues_settlement FROM _m_household_fy ORDER BY account_id, fy"
+    ))?;
+    let rows = st.query_map([], |row| {
+        let mut entry_jobs = [false; 12];
+        for (index, job) in entry_jobs.iter_mut().enumerate() {
+            *job = row.get::<_, i64>(8 + index)? != 0;
+        }
+        let anchor = 8 + entry_jobs.len(); // first anchor column index
+        Ok(HhFy {
+            account_id: row.get(0)?,
+            fy: row.get(1)?,
+            active_end_of_fy: row.get::<_, i64>(2)? != 0,
+            joined_this_fy: row.get::<_, i64>(3)? != 0,
+            resigned_this_fy: row.get::<_, i64>(4)? != 0,
+            tenure_years: row.get(5)?,
+            exit_outcome: row.get(6)?,
+            entry_job_count: row.get(7)?,
+            entry_jobs,
+            anchor_dues: row.get::<_, i64>(anchor)? != 0,
+            anchor_nursery: row.get::<_, i64>(anchor + 1)? != 0,
+            anchor_religious: row.get::<_, i64>(anchor + 2)? != 0,
+            anchor_committee: row.get::<_, i64>(anchor + 3)? != 0,
+            dues_coverage_missing: row.get::<_, i64>(anchor + 4)? != 0,
+            dues_settlement: row.get(anchor + 5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }

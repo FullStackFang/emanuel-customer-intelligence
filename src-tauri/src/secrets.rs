@@ -63,6 +63,12 @@ impl Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The OS keyring is a shared external resource, so a parallel `cargo test` must not
+    /// interleave these tests' get/set/delete calls. Serialize them on one lock, and
+    /// recover from poisoning so one failing test does not cascade into the other.
+    static KEYRING: Mutex<()> = Mutex::new(());
 
     fn test_secrets() -> Secrets {
         Secrets::new("emanuel-customer-intelligence-test")
@@ -70,6 +76,7 @@ mod tests {
 
     #[test]
     fn roundtrip_and_delete() {
+        let _guard = KEYRING.lock().unwrap_or_else(|e| e.into_inner());
         let s = test_secrets();
         s.delete("rt").unwrap();
         assert_eq!(s.get("rt").unwrap(), None);
@@ -81,6 +88,7 @@ mod tests {
 
     #[test]
     fn db_key_is_generated_once_and_is_64_hex() {
+        let _guard = KEYRING.lock().unwrap_or_else(|e| e.into_inner());
         let s = test_secrets();
         s.delete(DB_KEY).unwrap();
         let k1 = s.db_key().unwrap();

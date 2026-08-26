@@ -37,13 +37,32 @@ export interface CohortCell { cohort: number; n: number; k: number; pct_retained
 export interface ChannelRow { key: string; label: string; n: number; still_members: number; pct: number; avg_tenure: number; left_within_2y: number }
 export interface SchoolRow { group: string; n: number; still_members: number; pct: number }
 export interface ReasonCell { fy: number; reason: string; n: number }
+export interface MultiJobRow { bucket: string; jobs: number; n: number; still_members: number; pct: number; avg_tenure: number }
+export interface OutcomeByTenureRow { tenure_bucket: string; outcome: string; n: number }
+export interface SchoolGapRow { bucket: string; n: number; still_members: number; pct: number }
+export interface DuesRow { fy: number; active: number; billed: number; coverage_missing: number; settled: number; partially_settled: number; unsettled: number }
+export interface AnchorTypeRow { key: string; label: string; n: number; still_members: number; pct: number }
+export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
+export interface SourceCapability {
+  key: string; available: boolean; required_objects: string[];
+  mirrored_columns: string[];
+  last_synced_at: string | null; unavailable_reason: string | null;
+}
 export interface Insights {
-  built_at: string | null; current_fy: number; unavailable: string[]; kpis: Kpis;
+  built_at: string | null; newest_source_sync_at: string | null; stale: boolean;
+  capabilities: SourceCapability[]; current_fy: number; unavailable: string[]; kpis: Kpis;
   trend: TrendRow[]; year1: CohortYear1[]; cohort_matrix: CohortCell[];
   channels: ChannelRow[]; school: SchoolRow[]; reasons: ReasonCell[];
+  multi_job: MultiJobRow[]; outcome_by_tenure: OutcomeByTenureRow[];
+  school_progression: SchoolRow[]; school_gap: SchoolGapRow[];
+  dues: DuesRow[]; anchor_type: AnchorTypeRow[]; anchor_count: AnchorCountRow[];
 }
-export const INSIGHT_VIEWS = ["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"] as const;
+export const INSIGHT_VIEWS = [
+  "trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk",
+  "multi_job", "outcome_by_tenure", "school_progression", "school_gap",
+  "dues", "anchor_type", "anchor_count",
+] as const;
 export type InsightView = (typeof INSIGHT_VIEWS)[number];
 
 export const OPS = ["=", "!=", ">", "<", ">=", "<=", "contains"] as const;
@@ -68,8 +87,27 @@ export const getInsights = (forceRebuild = false) => invoke<Insights>("get_insig
 export const getAtRisk = () => invoke<AtRiskRow[]>("get_at_risk");
 export const exportInsightsCsv = (view: InsightView) => invoke<string>("export_insights_csv", { view });
 export const revealExport = (path: string) => invoke<void>("reveal_export", { path });
-export const exportInsightsPdf = (includeAtRisk: boolean) =>
-  invoke<string>("export_insights_pdf", { includeAtRisk });
+export const exportInsightsPdf = () => invoke<string>("export_insights_pdf");
+
+// ── Validated membership risk ────────────────────────────────────────────────
+export interface YearSummary { test_fy: number; households: number; exits: number; sufficient: boolean }
+export interface FamilyCoverageView { family: string; train: number; score: number; kept: boolean }
+export interface RiskSummary {
+  available: boolean; unavailable_reason: string | null;
+  roc_auc: number; top_decile_lift: number; brier: number; baseline_brier: number;
+  years: YearSummary[]; coverage: FamilyCoverageView[]; removed_families: string[];
+  model_first_fy: number | null; model_last_fy: number | null; watch_list_count: number;
+}
+export interface EvidenceView { class: string; detail: string }
+export interface WatchRowView { account_id: string; name: string; score: number; evidence: EvidenceView[] }
+export interface WatchListView {
+  available: boolean; unavailable_reason: string | null;
+  model_first_fy: number | null; model_last_fy: number | null;
+  baseline_rate: number; confidence: number; rows: WatchRowView[];
+}
+export const getRiskSummary = () => invoke<RiskSummary>("get_risk_summary");
+export const getWatchList = () => invoke<WatchListView>("get_watch_list");
+export const exportWatchListCsv = () => invoke<string>("export_watch_list_csv");
 
 export const onScanProgress = (cb: (p: { done: number; total: number }) => void): Promise<UnlistenFn> =>
   listen<{ done: number; total: number }>("scan:progress", (e) => cb(e.payload));

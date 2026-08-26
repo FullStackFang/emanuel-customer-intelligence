@@ -4,7 +4,7 @@ import {
   Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import type { RenderableText } from "recharts";
-import type { CohortCell, CohortYear1, ReasonCell, TrendRow } from "../../api";
+import type { CohortCell, CohortYear1, DuesRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
 import { Table } from "../../design-system";
 import { fmt, fyLabel, heatInk, heatStep } from "./format";
 
@@ -32,9 +32,9 @@ export interface TableProps<T> {
 }
 export const TypedTable = Table as unknown as <T>(props: TableProps<T>) => React.JSX.Element;
 
-export function TableView<T>({ forceOpen, ...props }: TableProps<T> & { forceOpen?: boolean }) {
+export function TableView<T>(props: TableProps<T>) {
   return (
-    <details open={forceOpen || undefined} style={{ marginTop: "var(--space-3)" }}>
+    <details style={{ marginTop: "var(--space-3)" }}>
       <summary style={{ cursor: "pointer", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>Table view</summary>
       <div style={{ marginTop: "var(--space-2)" }}><TypedTable {...props} /></div>
     </details>
@@ -152,6 +152,61 @@ export function HBarChart({ rows, emphasize }: { rows: HBarRow[]; emphasize?: st
         <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: HBarRow }) => [`${v}% (${fmt(item.payload?.still ?? 0)} of ${fmt(item.payload?.n ?? 0)})`, "Still members"]} />
         <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[0, 4, 4, 0]} maxBarSize={18} isAnimationActive={false} />
         <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[0, 4, 4, 0]} maxBarSize={18} isAnimationActive={false} label={{ position: "right", fontSize: 12, fill: PALETTE.ink, formatter: (v: RenderableText) => `${v}%` }} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Primary Exit Outcomes, most-addressable first. Colors follow PALETTE.series. */
+export const OUTCOME_ORDER = [
+  "Addressable Churn",
+  "Conversion Loss",
+  "Structural Exit",
+  "Administrative or Unknown Exit",
+];
+const TENURE_ORDER = ["1-2y", "3-5y", "6-10y", "11+y"];
+
+/** Exit-outcome composition by tenure at exit: a stacked count per tenure band. */
+export function OutcomeByTenureChart({ rows }: { rows: OutcomeByTenureRow[] }) {
+  const data = TENURE_ORDER.map((bucket) => {
+    const row: Record<string, number | string> = { bucket };
+    for (const outcome of OUTCOME_ORDER) {
+      row[outcome] = rows
+        .filter((r) => r.tenure_bucket === bucket && r.outcome === outcome)
+        .reduce((a, r) => a + r.n, 0);
+    }
+    return row;
+  });
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="35%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="bucket" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
+        <Tooltip contentStyle={tooltipStyle} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        {OUTCOME_ORDER.map((o, i) => (
+          <Bar key={o} dataKey={o} stackId="a" fill={PALETTE.series[i]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1} radius={i === OUTCOME_ORDER.length - 1 ? [4, 4, 0, 0] : undefined} />
+        ))}
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Dues renewal state per fiscal year: billed vs. coverage-missing among active households.
+    Coverage-missing is unknown billing, never proven non-renewal. */
+export function DuesChart({ rows }: { rows: DuesRow[] }) {
+  const data = rows.map((r) => ({ fy: fyLabel(r.fy), Billed: r.billed, "Coverage missing": r.coverage_missing }));
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="35%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
+        <Tooltip contentStyle={tooltipStyle} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Bar dataKey="Billed" stackId="a" fill={PALETTE.series[4]} maxBarSize={28} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
+        <Bar dataKey="Coverage missing" stackId="a" fill={PALETTE.other} maxBarSize={28} radius={[4, 4, 0, 0]} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
       </BarChart>
     </ResponsiveContainer>
   );

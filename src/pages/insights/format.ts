@@ -18,6 +18,14 @@ export const RULE_LABELS: Record<string, string> = {
   rs_ended: "Religious school ended",
 };
 
+/** Watch List evidence classes, phrased as observations, never as causes or predictions. */
+export const EVIDENCE_LABELS: Record<string, string> = {
+  recent_religious_school_end: "Religious school recently ended",
+  intro_tier_aging: "Introductory tier aging",
+  new_household: "New household",
+  lost_engagement_anchor: "Recent engagement drop",
+};
+
 /** One plain sentence per card, built from the numbers so it never goes stale. */
 export function soWhat(ins: Insights) {
   const last = ins.trend[ins.trend.length - 1];

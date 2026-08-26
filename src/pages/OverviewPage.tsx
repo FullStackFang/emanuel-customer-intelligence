@@ -57,7 +57,7 @@ export default function OverviewPage({ status, refresh }: PageProps) {
   const onPrimary = step === "scan" ? doScan : doSync;
 
   return (
-    <div style={{ maxWidth: 1100 }}>
+    <div style={{ width: "100%", maxWidth: 1100, margin: "0 auto" }}>
       <PageTitle eyebrow="Customer Intelligence" title="Overview" actions={
         <Button variant="secondary" disabled={busy !== null} onClick={doScan}>Rescan metadata</Button>
       } />

@@ -16,4 +16,5 @@ export { Input } from './components/forms/Input.jsx';
 export { Select } from './components/forms/Select.jsx';
 export { Textarea } from './components/forms/Textarea.jsx';
 export { Tabs } from './components/navigation/Tabs.jsx';
+export { Menu, MenuButton } from './components/overlay/Menu.jsx';
 export { Modal } from './components/overlay/Modal.jsx';

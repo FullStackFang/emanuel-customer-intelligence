@@ -5,6 +5,7 @@
 
 import React from 'react';
 import { Icon } from '../../components/core/Icon.jsx';
+import { Menu } from '../../components/overlay/Menu.jsx';
 import logoUrl from '../../../assets/emanuel_logo.png';
 
 /* ── App frame: sapphire gradient header + white top nav ────────────────── */
@@ -79,61 +80,18 @@ function NavButton({ item, active, onNav }) {
 
 /* Nav item with a dropdown of sub-pages (e.g. Admin → User Management). */
 function NavMenu({ item, active, onNav }) {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef(null);
   const isActive = item.children.some((c) => c.key === active);
-
-  React.useEffect(() => {
-    if (!open) return undefined;
-    const close = (e) => { if (!ref.current?.contains(e.target)) setOpen(false); };
-    const onEsc = (e) => { if (e.key === 'Escape') setOpen(false); };
-    document.addEventListener('mousedown', close);
-    document.addEventListener('keydown', onEsc);
-    return () => {
-      document.removeEventListener('mousedown', close);
-      document.removeEventListener('keydown', onEsc);
-    };
-  }, [open]);
+  const items = item.children.map((c) => ({ key: c.key, label: c.label, icon: c.icon, active: c.key === active, onSelect: () => onNav(c.key) }));
 
   return (
-    <div ref={ref} style={{ position: 'relative' }}>
-      <button onClick={() => setOpen((v) => !v)} aria-expanded={open} aria-haspopup="menu"
-        style={navButtonStyle(isActive)}>
+    <Menu items={items} trigger={({ open, toggle }) => (
+      <button onClick={toggle} aria-expanded={open} aria-haspopup="menu" style={navButtonStyle(isActive)}>
         <Icon name={item.icon} size={16} />
         {item.label}
         <Icon name="chevron-down" size={14} />
         {isActive && <span style={{ position: 'absolute', bottom: -1, left: 'var(--space-2)', right: 'var(--space-2)', height: 2, background: 'var(--color-primary-500)', borderRadius: 'var(--radius-full)' }} />}
       </button>
-
-      {open && (
-        <div role="menu" style={{
-          position: 'absolute', top: 'calc(100% + 4px)', left: 0, minWidth: 210,
-          background: 'var(--bg-primary)', border: '1px solid var(--border-default)',
-          borderRadius: 'var(--radius-lg)', boxShadow: 'var(--shadow-lg)',
-          padding: 'var(--space-1)', zIndex: 'var(--z-dropdown)',
-        }}>
-          {item.children.map((c) => {
-            const childActive = c.key === active;
-            return (
-              <button key={c.key} role="menuitem"
-                onClick={() => { setOpen(false); onNav(c.key); }}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 'var(--space-2)', width: '100%',
-                  height: 36, padding: '0 var(--space-3)', border: 'none', cursor: 'pointer',
-                  borderRadius: 'var(--radius-md)', textAlign: 'left',
-                  fontFamily: 'var(--font-body)', fontSize: 'var(--text-sm)',
-                  fontWeight: childActive ? 'var(--font-semibold)' : 'var(--font-medium)',
-                  color: childActive ? 'var(--color-primary-600)' : 'var(--text-secondary)',
-                  background: childActive ? 'var(--color-primary-50)' : 'transparent',
-                }}>
-                <Icon name={c.icon} size={16} />
-                {c.label}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
+    )} />
   );
 }
 

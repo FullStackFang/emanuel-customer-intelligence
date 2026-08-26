@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { fyLabel, heatStep, heatInk, soWhat, RULE_LABELS } from "./format";
+import { fyLabel, heatStep, heatInk, soWhat, RULE_LABELS, EVIDENCE_LABELS } from "./format";
 import type { Insights } from "../../api";
 
 const base: Insights = {
-  built_at: "2026-08-25T20:00:00Z", current_fy: 2026, unavailable: [],
+  built_at: "2026-08-25T20:00:00Z", newest_source_sync_at: "2026-08-25T20:00:00Z", stale: false,
+  capabilities: [], current_fy: 2026, unavailable: [],
   kpis: { members_now: 2490, net_vs_prior_fy: -62, joins_this_fy: 244, resigns_this_fy: 306,
     year1_cohort: 2025, year1_pct: 66.7, year1_baseline_pct: 87.4, at_risk_count: 12 },
   trend: [{ fy: 2025, joins: 321, resigns: 328, active_end_of_fy: 2552 }, { fy: 2026, joins: 244, resigns: 306, active_end_of_fy: 2490 }],
@@ -13,6 +14,8 @@ const base: Insights = {
              { key: "nursery_school", label: "Nursery school", n: 122, still_members: 32, pct: 26.2, avg_tenure: 4.6, left_within_2y: 34 }],
   school: [{ group: "Both nursery and religious school", n: 98, still_members: 67, pct: 68.4 }, { group: "No school history", n: 1115, still_members: 443, pct: 39.7 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 90 }, { fy: 2026, reason: "Moved", n: 51 }],
+  multi_job: [], outcome_by_tenure: [], school_progression: [], school_gap: [],
+  dues: [], anchor_type: [], anchor_count: [],
 };
 
 describe("insights formatting", () => {
@@ -42,5 +45,13 @@ describe("insights formatting", () => {
 
   it("has a label for every at-risk rule", () => {
     expect(Object.keys(RULE_LABELS).sort()).toEqual(["first_year", "intro_tier_aging", "new_ns_only", "rs_ended"]);
+  });
+
+  it("labels every Watch List evidence class without causal language", () => {
+    for (const cls of ["recent_religious_school_end", "intro_tier_aging", "new_household", "lost_engagement_anchor"]) {
+      const label = EVIDENCE_LABELS[cls];
+      expect(label).toBeTruthy();
+      expect(label.toLowerCase()).not.toMatch(/will|cause|because|predict/);
+    }
   });
 });

@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::insights::{self, AtRiskRow, Insights};
 use crate::llm;
 use crate::profile;
+use crate::risk;
 use crate::salesforce::SfClient;
 use crate::secrets::{Secrets, TOKENS};
 use crate::segment::{self, SegmentReq, SegmentResult};
@@ -427,7 +428,8 @@ fn exports_dir(state: &AppState) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("exports"))
 }
 
-/// Rebuild the mart if it is missing or older than the newest sync.
+/// Rebuild the mart if it is missing, older than the newest sync, or built by a prior
+/// mart schema (e.g. before new columns were added to `_m_household_fy`).
 fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
     let built = s.get_meta("insights_built_at")?;
     let newest = s.newest_sync_at()?;
@@ -436,7 +438,11 @@ fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
         (Some(b), Some(n)) => n > b, // ISO-8601 strings compare chronologically
         (Some(_), None) => false,
     };
-    if force || stale || !s.table_exists(insights::MART)? {
+    let schema_current = s
+        .get_meta("insights_schema_version")?
+        .and_then(|v| v.parse::<i64>().ok())
+        == Some(insights::MART_SCHEMA_VERSION);
+    if force || stale || !schema_current || !s.table_exists(insights::MART)? {
         let info = insights::rebuild(s)?;
         s.audit(
             w,
@@ -472,6 +478,71 @@ pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>
             Some(serde_json::json!({"count": rows.len()})),
         )?;
         Ok(rows)
+    })
+}
+
+/// Rebuild if needed, then run the validated churn analysis from the freshest mart.
+fn analyze_risk(s: &mut Store, w: &Who) -> anyhow::Result<(risk::RiskModel, risk::WatchList)> {
+    ensure_fresh(s, w, false)?;
+    let cur = insights::current_fy();
+    let hh = insights::load(s)?;
+    let years = insights::load_household_years(s)?;
+    let caps = insights::source_capabilities(s)?;
+    Ok(risk::analyze(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA))
+}
+
+/// Aggregate Risk view: validation results and backtests only. No household names, so it
+/// is not audited as named access.
+#[tauri::command]
+pub async fn get_risk_summary(state: State<'_, AppState>) -> CmdResult<risk::RiskSummary> {
+    let w = who(state.inner());
+    with_store(state.inner(), |s| {
+        let (model, list) = analyze_risk(s, &w)?;
+        Ok(risk::risk_summary(&model, &list))
+    })
+}
+
+/// Named Watch List: loaded only on explicit request and audited. The audit records the
+/// result count and availability, never a household name or risk-feature value.
+#[tauri::command]
+pub async fn get_watch_list(state: State<'_, AppState>) -> CmdResult<risk::WatchListView> {
+    let w = who(state.inner());
+    with_store(state.inner(), |s| {
+        let (model, list) = analyze_risk(s, &w)?;
+        let view = risk::watch_list_view(&model, &list);
+        s.audit(
+            &w,
+            "risk.watch_list.load",
+            None,
+            Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
+        )?;
+        Ok(view)
+    })
+}
+
+/// Export the named Watch List to the app's exports directory. Audited like a load; the
+/// CSV carries evidence classes only, never raw risk-feature values.
+#[tauri::command]
+pub async fn export_watch_list_csv(state: State<'_, AppState>) -> CmdResult<String> {
+    let w = who(state.inner());
+    let dir = exports_dir(state.inner());
+    with_store(state.inner(), |s| {
+        let (model, list) = analyze_risk(s, &w)?;
+        let view = risk::watch_list_view(&model, &list);
+        if !view.available {
+            return Err(anyhow::anyhow!("No validated household ranking to export"));
+        }
+        std::fs::create_dir_all(&dir)?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
+        let path = dir.join(format!("watch-list-{stamp}.csv"));
+        s.audit(
+            &w,
+            "risk.watch_list.export",
+            None,
+            Some(serde_json::json!({"count": view.rows.len()})),
+        )?;
+        std::fs::write(&path, risk::watch_list_csv(&view))?;
+        Ok(path.to_string_lossy().into_owned())
     })
 }
 
@@ -517,24 +588,16 @@ pub async fn reveal_export(path: String, state: State<'_, AppState>) -> CmdResul
 }
 
 #[tauri::command]
-pub async fn export_insights_pdf(
-    include_at_risk: bool,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> CmdResult<String> {
+pub async fn export_insights_pdf(app: AppHandle, state: State<'_, AppState>) -> CmdResult<String> {
     let w = who(state.inner());
     let dir = exports_dir(state.inner());
     std::fs::create_dir_all(&dir).map_err(err)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
     let path = dir.join(format!("insights-report-{stamp}.pdf"));
     // Audit first (fail-closed), then render. No store lock is held across the await.
+    // The report is summary-only (KPIs, charts, highlights); it never carries household names.
     with_store(state.inner(), |s| {
-        s.audit(
-            &w,
-            "insights.export_pdf",
-            None,
-            Some(serde_json::json!({"includes_names": include_at_risk})),
-        )
+        s.audit(&w, "insights.export_pdf", None, None)
     })?;
     let window = app
         .get_webview_window("main")
@@ -599,10 +662,7 @@ pub async fn set_llm_key(
 }
 
 #[tauri::command]
-pub async fn clear_llm_key(
-    state: State<'_, AppState>,
-    provider: llm::Provider,
-) -> CmdResult<()> {
+pub async fn clear_llm_key(state: State<'_, AppState>, provider: llm::Provider) -> CmdResult<()> {
     if let Some(name) = provider.key_name() {
         state.secrets.delete(name).map_err(err)?;
     }

@@ -43,7 +43,7 @@ export default function SegmentsPage({ status }: PageProps) {
   const max = result?.breakdown.reduce((m, [, n]) => Math.max(m, n), 0) || 1;
 
   return (
-    <div style={{ maxWidth: 1000 }}>
+    <div style={{ width: "100%", maxWidth: 1000, margin: "0 auto" }}>
       <PageTitle eyebrow="Customer Intelligence" title="Segments" actions={undefined} />
       {err && <Alert tone="error" style={{ marginBottom: "var(--space-4)" }}>{err}</Alert>}
       <Card style={{ marginBottom: "var(--space-4)" }}>

@@ -39,7 +39,10 @@ impl Provider {
 
     /// Only cloud providers that authenticate with a key strictly require one.
     pub fn requires_key(&self) -> bool {
-        matches!(self, Provider::Anthropic | Provider::OpenAi | Provider::Google)
+        matches!(
+            self,
+            Provider::Anthropic | Provider::OpenAi | Provider::Google
+        )
     }
 
     /// Conservative: everything except a local Ollama is treated as cloud, so the
@@ -90,11 +93,21 @@ impl ProviderConfig {
     }
 }
 
-fn dflt_anthropic() -> ProviderConfig { ProviderConfig::default_for(Provider::Anthropic) }
-fn dflt_openai() -> ProviderConfig { ProviderConfig::default_for(Provider::OpenAi) }
-fn dflt_google() -> ProviderConfig { ProviderConfig::default_for(Provider::Google) }
-fn dflt_ollama() -> ProviderConfig { ProviderConfig::default_for(Provider::Ollama) }
-fn dflt_custom() -> ProviderConfig { ProviderConfig::default_for(Provider::Custom) }
+fn dflt_anthropic() -> ProviderConfig {
+    ProviderConfig::default_for(Provider::Anthropic)
+}
+fn dflt_openai() -> ProviderConfig {
+    ProviderConfig::default_for(Provider::OpenAi)
+}
+fn dflt_google() -> ProviderConfig {
+    ProviderConfig::default_for(Provider::Google)
+}
+fn dflt_ollama() -> ProviderConfig {
+    ProviderConfig::default_for(Provider::Ollama)
+}
+fn dflt_custom() -> ProviderConfig {
+    ProviderConfig::default_for(Provider::Custom)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LlmSettings {
@@ -275,14 +288,24 @@ pub fn build_test_request(
 pub async fn run_test(p: Provider, c: &ProviderConfig, key: Option<&str>) -> TestResult {
     let req = match build_test_request(p, c, key) {
         Ok(r) => r,
-        Err(e) => return TestResult { ok: false, detail: e },
+        Err(e) => {
+            return TestResult {
+                ok: false,
+                detail: e,
+            }
+        }
     };
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(c.timeout_secs.max(1)))
         .build()
     {
         Ok(c) => c,
-        Err(e) => return TestResult { ok: false, detail: e.to_string() },
+        Err(e) => {
+            return TestResult {
+                ok: false,
+                detail: e.to_string(),
+            }
+        }
     };
     let mut rb = client.request(req.method, &req.url);
     for (k, v) in req.headers {
@@ -300,7 +323,10 @@ pub async fn run_test(p: Provider, c: &ProviderConfig, key: Option<&str>) -> Tes
             ok: false,
             detail: format!("HTTP {}", resp.status().as_u16()),
         },
-        Err(e) => TestResult { ok: false, detail: e.to_string() },
+        Err(e) => TestResult {
+            ok: false,
+            detail: e.to_string(),
+        },
     }
 }
 
@@ -347,15 +373,30 @@ mod tests {
         let settings = LlmSettings::default();
         let view = settings.to_view(&secrets).unwrap();
 
-        let openai = view.providers.iter().find(|p| p.provider == Provider::OpenAi).unwrap();
-        let anthropic = view.providers.iter().find(|p| p.provider == Provider::Anthropic).unwrap();
-        let ollama = view.providers.iter().find(|p| p.provider == Provider::Ollama).unwrap();
+        let openai = view
+            .providers
+            .iter()
+            .find(|p| p.provider == Provider::OpenAi)
+            .unwrap();
+        let anthropic = view
+            .providers
+            .iter()
+            .find(|p| p.provider == Provider::Anthropic)
+            .unwrap();
+        let ollama = view
+            .providers
+            .iter()
+            .find(|p| p.provider == Provider::Ollama)
+            .unwrap();
         assert!(openai.has_key);
         assert!(!anthropic.has_key);
         assert!(!ollama.has_key, "keyless provider is always has_key=false");
 
         let serialized = serde_json::to_string(&view).unwrap();
-        assert!(!serialized.contains("sk-secret-123"), "view must not contain key material");
+        assert!(
+            !serialized.contains("sk-secret-123"),
+            "view must not contain key material"
+        );
 
         secrets.delete("llm_key_openai").unwrap();
     }
@@ -379,7 +420,10 @@ mod tests {
 
     #[test]
     fn provider_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&Provider::OpenAi).unwrap(), "\"openai\"");
+        assert_eq!(
+            serde_json::to_string(&Provider::OpenAi).unwrap(),
+            "\"openai\""
+        );
         let p: Provider = serde_json::from_str("\"custom\"").unwrap();
         assert_eq!(p, Provider::Custom);
     }
@@ -392,14 +436,20 @@ mod tests {
         assert_eq!(s.ollama.base_url, "http://localhost:11434");
         assert_eq!(s.anthropic.base_url, "https://api.anthropic.com");
         assert!(s.custom.base_url.is_empty());
-        assert_eq!(s.config(Provider::Ollama).base_url, "http://localhost:11434");
+        assert_eq!(
+            s.config(Provider::Ollama).base_url,
+            "http://localhost:11434"
+        );
     }
 
     #[test]
     fn validate_gates_cloud_on_ack() {
         let mut s = LlmSettings::default();
         s.active_provider = Some(Provider::Anthropic);
-        assert!(s.validate().is_err(), "cloud provider without ack must fail");
+        assert!(
+            s.validate().is_err(),
+            "cloud provider without ack must fail"
+        );
         s.cloud_egress_ack = true;
         assert!(s.validate().is_ok());
 
@@ -434,13 +484,22 @@ mod tests {
         let r = build_test_request(Provider::OpenAi, &c, Some("k")).unwrap();
         assert_eq!(r.method, reqwest::Method::GET);
         assert_eq!(r.url, "https://api.openai.com/v1/models");
-        assert!(r.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+        assert!(r
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer k"));
 
         // Google: key in header, never the URL.
         let c = ProviderConfig::default_for(Provider::Google);
         let r = build_test_request(Provider::Google, &c, Some("k")).unwrap();
-        assert_eq!(r.url, "https://generativelanguage.googleapis.com/v1beta/models");
-        assert!(r.headers.iter().any(|(k, v)| k == "x-goog-api-key" && v == "k"));
+        assert_eq!(
+            r.url,
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        assert!(r
+            .headers
+            .iter()
+            .any(|(k, v)| k == "x-goog-api-key" && v == "k"));
         assert!(!r.url.contains("key="), "key must never ride in the URL");
 
         // Ollama: GET tags, no key, no auth header.
@@ -456,10 +515,16 @@ mod tests {
         c.base_url = "http://localhost:1234/v1/".into(); // trailing slash
         let r = build_test_request(Provider::Custom, &c, None).unwrap();
         assert_eq!(r.url, "http://localhost:1234/v1/models");
-        assert!(r.headers.iter().all(|(k, _)| k != "Authorization"), "no key -> no auth");
+        assert!(
+            r.headers.iter().all(|(k, _)| k != "Authorization"),
+            "no key -> no auth"
+        );
 
         let r2 = build_test_request(Provider::Custom, &c, Some("k")).unwrap();
-        assert!(r2.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+        assert!(r2
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer k"));
     }
 
     #[test]

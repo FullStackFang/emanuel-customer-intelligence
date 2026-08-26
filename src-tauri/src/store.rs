@@ -312,6 +312,33 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Read every row of a mirror table as (column -> value) maps. Empty if the table
+    /// is absent. Column order follows `mirror_columns`.
+    pub fn mirror_rows(
+        &self,
+        object: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, Option<String>>>> {
+        let cols = self.mirror_columns(object)?;
+        if cols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tbl = ident(object)?;
+        let select = cols
+            .iter()
+            .map(|c| ident(c))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        let mut st = self.conn.prepare(&format!("SELECT {select} FROM {tbl}"))?;
+        let rows = st.query_map([], |r| {
+            let mut m = std::collections::HashMap::with_capacity(cols.len());
+            for (i, c) in cols.iter().enumerate() {
+                m.insert(c.clone(), r.get::<_, Option<String>>(i)?);
+            }
+            Ok(m)
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Column names of a mirror table (empty if the table does not exist).
     pub fn mirror_columns(&self, object: &str) -> Result<Vec<String>> {
         if !self.table_exists(object)? {
@@ -348,6 +375,7 @@ impl Store {
         }
         tx.execute_batch(
             "DROP TABLE IF EXISTS _m_household;
+             DROP TABLE IF EXISTS _m_household_fy;
              DELETE FROM _profile;
              DELETE FROM _meta WHERE key IN ('insights_built_at', 'insights_unavailable');
              UPDATE _objects SET last_synced_at = NULL, last_sync_rows = NULL;",

@@ -6,6 +6,7 @@
 # tauri / rust
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/.tmp/
 
 # local, machine-specific cargo build config (target-dir + perl path)
 .cargo/

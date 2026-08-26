@@ -1,8 +1,30 @@
-/* Applied by WebView2 PrintToPdf (print media) and by the browser print path. */
+/* The PDF report is the live page rendered under print media (WebView2 PrintToPdf,
+   or the browser print path). Everything report-specific lives here so exporting
+   never changes what is on screen. */
+.insights-report-only { display: none; }
+.insights-overview-hidden { display: none; }
+.insights-section-hidden { display: none; }
+
 @media print {
   header, nav { display: none !important; }
   html, body, #root, main { height: auto !important; overflow: visible !important; }
   main { padding: 0 !important; }
+  .insights-screen-only { display: none !important; }
+  .insights-report-only { display: block; }
+  .insights-overview { display: block !important; }
+  /* Every aggregate tab section composes into the report, regardless of the on-screen
+     tab. Named-household content stays screen-only above and never prints. */
+  .insights-section { display: block !important; }
   .insights-report-card { break-inside: avoid; page-break-inside: avoid; }
-  details > summary { display: none; }
+  /* Summary and highlights only: the expandable data tables stay out of the report. */
+  details { display: none !important; }
+  /* Charts were measured at screen width; scale their SVGs (they carry a viewBox)
+     to the print column instead of re-laying out the page. Recharts nests
+     responsive-container > div[width:0] > wrapper[px] > svg, so every level
+     needs to become fluid. */
+  .recharts-responsive-container, .recharts-responsive-container > div, .recharts-wrapper {
+    width: 100% !important; max-width: none !important; height: auto !important;
+  }
+  .recharts-wrapper > svg { width: 100% !important; height: auto !important; }
+  .recharts-legend-wrapper { width: 100% !important; }
 }

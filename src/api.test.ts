@@ -36,16 +36,32 @@ describe("api wrappers map 1:1 to Rust commands", () => {
     await api.getAtRisk();
     await api.exportInsightsCsv("trend");
     await api.revealExport("C:\\x\\exports\\a.csv");
-    await api.exportInsightsPdf(true);
+    await api.exportInsightsPdf();
     expect(invoke.mock.calls).toEqual([
       ["get_insights", { forceRebuild: false }],
       ["get_insights", { forceRebuild: true }],
       ["get_at_risk"],
       ["export_insights_csv", { view: "trend" }],
       ["reveal_export", { path: "C:\\x\\exports\\a.csv" }],
-      ["export_insights_pdf", { includeAtRisk: true }],
+      ["export_insights_pdf"],
     ]);
-    expect([...api.INSIGHT_VIEWS]).toEqual(["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"]);
+    expect([...api.INSIGHT_VIEWS]).toEqual([
+      "trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk",
+      "multi_job", "outcome_by_tenure", "school_progression", "school_gap",
+      "dues", "anchor_type", "anchor_count",
+    ]);
+  });
+
+  it("risk wrappers use the exact command names", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.getRiskSummary();
+    await api.getWatchList();
+    await api.exportWatchListCsv();
+    expect(invoke.mock.calls).toEqual([
+      ["get_risk_summary"],
+      ["get_watch_list"],
+      ["export_watch_list_csv"],
+    ]);
   });
 
   it("llm settings wrappers use the exact command names", async () => {
