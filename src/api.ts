@@ -75,3 +75,28 @@ export const onScanProgress = (cb: (p: { done: number; total: number }) => void)
   listen<{ done: number; total: number }>("scan:progress", (e) => cb(e.payload));
 export const onSyncProgress = (cb: (p: { object: string; rows: number }) => void): Promise<UnlistenFn> =>
   listen<{ object: string; rows: number }>("sync:progress", (e) => cb(e.payload));
+
+export type LlmProvider = "anthropic" | "openai" | "google" | "ollama" | "custom";
+export const PROVIDERS: LlmProvider[] = ["anthropic", "openai", "google", "ollama", "custom"];
+
+export interface ProviderConfig {
+  model: string; base_url: string; timeout_secs: number; headers: Record<string, string>;
+}
+export interface ProviderView { provider: LlmProvider; config: ProviderConfig; has_key: boolean }
+export interface LlmSettingsView {
+  active_provider: LlmProvider | null; cloud_egress_ack: boolean; providers: ProviderView[];
+}
+export interface LlmSettings {
+  active_provider: LlmProvider | null; cloud_egress_ack: boolean;
+  anthropic: ProviderConfig; openai: ProviderConfig; google: ProviderConfig;
+  ollama: ProviderConfig; custom: ProviderConfig;
+}
+export interface TestResult { ok: boolean; detail: string }
+
+export const getLlmSettings = () => invoke<LlmSettingsView>("get_llm_settings");
+export const setLlmSettings = (settings: LlmSettings) => invoke<void>("set_llm_settings", { settings });
+export const setLlmKey = (provider: LlmProvider, key: string) =>
+  invoke<void>("set_llm_key", { provider, key });
+export const clearLlmKey = (provider: LlmProvider) => invoke<void>("clear_llm_key", { provider });
+export const testLlmConnection = (provider: LlmProvider) =>
+  invoke<TestResult>("test_llm_connection", { provider });

@@ -47,4 +47,26 @@ describe("api wrappers map 1:1 to Rust commands", () => {
     ]);
     expect([...api.INSIGHT_VIEWS]).toEqual(["trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk"]);
   });
+
+  it("llm settings wrappers use the exact command names", async () => {
+    invoke.mockResolvedValue(undefined);
+    const cfg = { model: "m", base_url: "u", timeout_secs: 60, headers: {} };
+    const settings = {
+      active_provider: "anthropic" as const, cloud_egress_ack: true,
+      anthropic: cfg, openai: cfg, google: cfg, ollama: cfg, custom: cfg,
+    };
+    await api.getLlmSettings();
+    await api.setLlmSettings(settings);
+    await api.setLlmKey("openai", "sk-x");
+    await api.clearLlmKey("openai");
+    await api.testLlmConnection("ollama");
+    expect(invoke.mock.calls).toEqual([
+      ["get_llm_settings"],
+      ["set_llm_settings", { settings }],
+      ["set_llm_key", { provider: "openai", key: "sk-x" }],
+      ["clear_llm_key", { provider: "openai" }],
+      ["test_llm_connection", { provider: "ollama" }],
+    ]);
+    expect([...api.PROVIDERS]).toEqual(["anthropic", "openai", "google", "ollama", "custom"]);
+  });
 });
