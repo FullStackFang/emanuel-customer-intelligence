@@ -4,6 +4,7 @@
 
 use crate::auth::{self, Identity};
 use crate::config::Config;
+use crate::insights::{self, AtRiskRow, Insights};
 use crate::profile;
 use crate::salesforce::SfClient;
 use crate::secrets::{Secrets, TOKENS};
@@ -350,6 +351,15 @@ pub async fn profile_selected(state: State<'_, AppState>) -> CmdResult<usize> {
             None,
             Some(serde_json::json!({"objects": n})),
         )?;
+        if s.table_exists("Account")? {
+            let info = insights::rebuild(s)?;
+            s.audit(
+                &w,
+                "insights.rebuild",
+                None,
+                Some(serde_json::json!({"households": info.households, "unavailable": info.unavailable})),
+            )?;
+        }
         Ok(n)
     })
 }
@@ -393,4 +403,103 @@ pub async fn purge_local_data(state: State<'_, AppState>) -> CmdResult<()> {
         s.purge_mirror()?;
         s.audit(&w, "data.purge", None, None)
     })
+}
+
+// ── insights ────────────────────────────────────────────────────────────────
+
+fn exports_dir(state: &AppState) -> PathBuf {
+    state
+        .db_path
+        .parent()
+        .map(|p| p.join("exports"))
+        .unwrap_or_else(|| PathBuf::from("exports"))
+}
+
+/// Rebuild the mart if it is missing or older than the newest sync.
+fn ensure_fresh(s: &mut Store, w: &Who, force: bool) -> anyhow::Result<()> {
+    let built = s.get_meta("insights_built_at")?;
+    let newest = s.newest_sync_at()?;
+    let stale = match (&built, &newest) {
+        (None, _) => true,
+        (Some(b), Some(n)) => n > b, // ISO-8601 strings compare chronologically
+        (Some(_), None) => false,
+    };
+    if force || stale || !s.table_exists(insights::MART)? {
+        let info = insights::rebuild(s)?;
+        s.audit(
+            w,
+            "insights.rebuild",
+            None,
+            Some(
+                serde_json::json!({"households": info.households, "unavailable": info.unavailable}),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_insights(force_rebuild: bool, state: State<'_, AppState>) -> CmdResult<Insights> {
+    let w = who(state.inner());
+    with_store(state.inner(), |s| {
+        ensure_fresh(s, &w, force_rebuild)?;
+        insights::views(s, insights::current_fy())
+    })
+}
+
+#[tauri::command]
+pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>> {
+    let w = who(state.inner());
+    with_store(state.inner(), |s| {
+        ensure_fresh(s, &w, false)?;
+        let rows = insights::at_risk(s, insights::current_fy())?;
+        s.audit(
+            &w,
+            "insights.at_risk",
+            None,
+            Some(serde_json::json!({"count": rows.len()})),
+        )?;
+        Ok(rows)
+    })
+}
+
+#[tauri::command]
+pub async fn export_insights_csv(view: String, state: State<'_, AppState>) -> CmdResult<String> {
+    if !insights::VIEWS.contains(&view.as_str()) {
+        return Err(format!("unknown insights view: {view}"));
+    }
+    let w = who(state.inner());
+    let dir = exports_dir(state.inner());
+    with_store(state.inner(), |s| {
+        ensure_fresh(s, &w, false)?;
+        let cur = insights::current_fy();
+        let ins = insights::views(s, cur)?;
+        let ar = if view == "at_risk" {
+            insights::at_risk(s, cur)?
+        } else {
+            Vec::new()
+        };
+        let (text, rows) = insights::to_csv(&view, &ins, &ar)?;
+        std::fs::create_dir_all(&dir)?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
+        let path = dir.join(format!("insights-{view}-{stamp}.csv"));
+        std::fs::write(&path, text)?;
+        s.audit(
+            &w,
+            "insights.export",
+            None,
+            Some(serde_json::json!({"view": view, "rows": rows})),
+        )?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+pub async fn reveal_export(path: String, state: State<'_, AppState>) -> CmdResult<()> {
+    let dir = exports_dir(state.inner());
+    let p = PathBuf::from(&path);
+    if !insights::path_is_inside(&p, &dir) {
+        return Err("can only reveal files inside the app's exports folder".into());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&p).map_err(err)
 }

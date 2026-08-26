@@ -861,6 +861,14 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
     })
 }
 
+/// True only if `path` exists and canonicalizes to a location inside `dir`.
+pub fn path_is_inside(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(p), Ok(d)) => p.starts_with(&d) && p != d,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1438,6 +1446,25 @@ mod tests {
         assert!(
             n >= 1 && t.contains("Green"),
             "NS-only recent joiner is at risk"
+        );
+    }
+
+    #[test]
+    fn export_path_guard_only_accepts_files_inside_the_exports_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let exports = dir.path().join("exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        let ok = exports.join("insights-trend-20260825-1200.csv");
+        std::fs::write(&ok, "x").unwrap();
+        assert!(path_is_inside(&ok, &exports));
+        let outside = dir.path().join("mirror.db");
+        std::fs::write(&outside, "x").unwrap();
+        assert!(!path_is_inside(&outside, &exports));
+        let sneaky = exports.join("..").join("mirror.db");
+        assert!(!path_is_inside(&sneaky, &exports));
+        assert!(
+            !path_is_inside(&exports.join("missing.csv"), &exports),
+            "must exist"
         );
     }
 }
