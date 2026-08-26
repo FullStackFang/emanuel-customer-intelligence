@@ -2,6 +2,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod insights;
+pub mod llm;
 pub mod pdf;
 pub mod profile;
 pub mod salesforce;
