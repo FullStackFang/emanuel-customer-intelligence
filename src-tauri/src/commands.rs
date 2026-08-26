@@ -5,6 +5,7 @@
 use crate::auth::{self, Identity};
 use crate::config::Config;
 use crate::insights::{self, AtRiskRow, Insights};
+use crate::llm;
 use crate::profile;
 use crate::salesforce::SfClient;
 use crate::secrets::{Secrets, TOKENS};
@@ -551,4 +552,84 @@ pub async fn export_insights_pdf(
         .map_err(|_| "timed out rendering the PDF".to_string())?
         .map_err(err)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+// ── LLM provider settings ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_llm_settings(state: State<'_, AppState>) -> CmdResult<llm::LlmSettingsView> {
+    let settings = with_store(state.inner(), |s| llm::LlmSettings::load(s))?;
+    settings.to_view(&state.secrets).map_err(err)
+}
+
+#[tauri::command]
+pub async fn set_llm_settings(
+    state: State<'_, AppState>,
+    settings: llm::LlmSettings,
+) -> CmdResult<()> {
+    settings.validate().map_err(err)?;
+    with_store(state.inner(), |s| {
+        settings.save(s)?;
+        s.audit(&who(state.inner()), "settings.llm.update", None, None)?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub async fn set_llm_key(
+    state: State<'_, AppState>,
+    provider: llm::Provider,
+    key: String,
+) -> CmdResult<()> {
+    let name = provider
+        .key_name()
+        .ok_or_else(|| "This provider does not use an API key.".to_string())?;
+    if key.trim().is_empty() {
+        return Err(err("API key is empty."));
+    }
+    state.secrets.set(name, &key).map_err(err)?;
+    with_store(state.inner(), |s| {
+        s.audit(
+            &who(state.inner()),
+            "settings.llm.key_set",
+            Some(provider.as_str()),
+            None,
+        )
+    })
+}
+
+#[tauri::command]
+pub async fn clear_llm_key(
+    state: State<'_, AppState>,
+    provider: llm::Provider,
+) -> CmdResult<()> {
+    if let Some(name) = provider.key_name() {
+        state.secrets.delete(name).map_err(err)?;
+    }
+    with_store(state.inner(), |s| {
+        s.audit(
+            &who(state.inner()),
+            "settings.llm.key_cleared",
+            Some(provider.as_str()),
+            None,
+        )
+    })
+}
+
+#[tauri::command]
+pub async fn test_llm_connection(
+    state: State<'_, AppState>,
+    provider: llm::Provider,
+) -> CmdResult<llm::TestResult> {
+    // Read config + key without holding the store lock across the network await.
+    let settings = with_store(state.inner(), |s| llm::LlmSettings::load(s))?;
+    if provider.is_cloud() && !settings.cloud_egress_ack {
+        return Err("Acknowledge external data egress before testing this provider.".to_string());
+    }
+    let config = settings.config(provider).clone();
+    let key = match provider.key_name() {
+        Some(name) => state.secrets.get(name).map_err(err)?,
+        None => None,
+    };
+    Ok(llm::run_test(provider, &config, key.as_deref()).await)
 }

@@ -56,6 +56,11 @@ pub fn run() {
             commands::export_insights_csv,
             commands::reveal_export,
             commands::export_insights_pdf,
+            commands::get_llm_settings,
+            commands::set_llm_settings,
+            commands::set_llm_key,
+            commands::clear_llm_key,
+            commands::test_llm_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
