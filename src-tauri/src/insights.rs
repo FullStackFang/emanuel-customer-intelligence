@@ -198,14 +198,13 @@ pub fn dues_class(product_family: Option<&str>, product_name: Option<&str>) -> D
     }
 }
 
-/// Minimal normalized billing statement, ready for a future mirror-field adapter.
+/// Minimal normalized billing statement: the household link and issue date that place
+/// its lines in a household-year. Settlement lives on the lines, not here.
 #[derive(Debug, Copy, Clone)]
 pub struct BillingStatement<'a> {
     pub id: &'a str,
     pub household_id: Option<&'a str>,
     pub issued_at: Option<&'a str>,
-    pub eventual_received: Option<f64>,
-    pub eventual_balance: Option<f64>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -214,16 +213,27 @@ pub struct BillingStatementLine<'a> {
     pub product_family: Option<&'a str>,
     pub product_name: Option<&'a str>,
     pub amount: Option<f64>,
+    /// Per-line eventual received amount and balance, so dues settlement is measured on
+    /// the dues line alone rather than on a statement total that mixes in other products.
+    pub received: Option<f64>,
+    pub balance: Option<f64>,
 }
 
 impl<'a> BillingStatementLine<'a> {
     #[cfg(test)]
-    fn dues(statement_id: &'a str, amount: f64) -> Self {
+    fn dues(
+        statement_id: &'a str,
+        amount: f64,
+        received: Option<f64>,
+        balance: Option<f64>,
+    ) -> Self {
         Self {
             statement_id: Some(statement_id),
             product_family: Some("Membership"),
             product_name: Some("Dues"),
             amount: Some(amount),
+            received,
+            balance,
         }
     }
 }
@@ -260,8 +270,9 @@ impl DuesEvidence {
     }
 }
 
-fn statement_settlement(statement: &BillingStatement<'_>) -> SettlementState {
-    match (statement.eventual_received, statement.eventual_balance) {
+/// Eventual settlement of one dues line from its own received amount and balance.
+fn line_settlement(line: &BillingStatementLine<'_>) -> SettlementState {
+    match (line.received, line.balance) {
         (_, Some(balance)) if balance <= 0.0 => SettlementState::Settled,
         (Some(received), Some(_)) if received > 0.0 => SettlementState::PartiallySettled,
         (_, Some(_)) => SettlementState::Unsettled,
@@ -290,7 +301,9 @@ fn combined_settlement(states: impl Iterator<Item = SettlementState>) -> Settlem
 }
 
 /// Derive household-year dues evidence only through a statement that identifies the
-/// household. Final mirror balances and received amounts are expressly eventual states.
+/// household. Settlement is read from the qualifying dues lines alone — never from the
+/// statement total, which also covers security fees, tuition, and gifts. Final mirror
+/// balances and received amounts are expressly eventual states.
 pub fn dues_evidence(
     household_id: &str,
     fiscal_year: i32,
@@ -323,11 +336,7 @@ pub fn dues_evidence(
     DuesEvidence {
         coverage: BillingCoverage::Present,
         dues_billed: qualifying.iter().filter_map(|line| line.amount).sum(),
-        settlement: combined_settlement(
-            matching
-                .iter()
-                .map(|statement| statement_settlement(statement)),
-        ),
+        settlement: combined_settlement(qualifying.iter().map(|line| line_settlement(line))),
     }
 }
 
@@ -433,7 +442,7 @@ pub const MART_FY: &str = "_m_household_fy";
 
 /// Bumped whenever the mart column layout changes so that existing databases with an
 /// older `_m_household_fy`/`_m_household` schema are rebuilt rather than read as-is.
-pub const MART_SCHEMA_VERSION: i64 = 2;
+pub const MART_SCHEMA_VERSION: i64 = 3;
 
 /// Account columns the mart derives from. A missing one nulls what depends on it and is
 /// reported in `RebuildInfo::unavailable`; `Type` and `IsATempleMember__c` are mandatory.
@@ -633,6 +642,8 @@ fn mart_fy_ddl() -> String {
        anchor_dues INTEGER NOT NULL DEFAULT 0, anchor_nursery INTEGER NOT NULL DEFAULT 0,
        anchor_religious INTEGER NOT NULL DEFAULT 0, anchor_committee INTEGER NOT NULL DEFAULT 0,
        dues_coverage_missing INTEGER NOT NULL DEFAULT 0, dues_settlement TEXT,
+       renewal_observed INTEGER NOT NULL DEFAULT 0, school_observed INTEGER NOT NULL DEFAULT 0,
+       committee_observed INTEGER NOT NULL DEFAULT 0,
        PRIMARY KEY(account_id, fy))")
 }
 
@@ -658,6 +669,14 @@ pub struct HhFy {
     pub dues_coverage_missing: bool,
     /// Eventual-settlement label for this fiscal year's dues, when billed.
     pub dues_settlement: Option<String>,
+    /// Whether each optional source carried any rows for this fiscal year. Set by the
+    /// anchor adapters; false for a year the source has no data for (e.g. billing
+    /// statements before FY2023), which the churn model treats as uncovered rather than
+    /// as a zero anchor. Independent of `dues_coverage_missing`, which is a real signal
+    /// on a renewal-observed year.
+    pub renewal_observed: bool,
+    pub school_observed: bool,
+    pub committee_observed: bool,
 }
 
 impl HhFy {
@@ -721,17 +740,11 @@ struct StatementFields {
     id: Cands,
     household: Cands,
     date: Cands,
-    received: Cands,
-    balance: Cands,
 }
 const STATEMENT_FIELDS: StatementFields = StatementFields {
     id: &["Id"],
     household: &["Account__c"],
     date: &["Date__c"],
-    // Statement-level eventual totals; there is no per-statement "received", so credits
-    // (payments applied) stand in for it and drive PartiallySettled vs Unsettled.
-    received: &["TotalCredits__c"],
-    balance: &["TotalBalance__c"],
 };
 
 /// Candidate columns for a billing statement line. `parent` links to the statement Id.
@@ -740,6 +753,8 @@ struct LineFields {
     product_family: Cands,
     product_name: Cands,
     amount: Cands,
+    received: Cands,
+    balance: Cands,
 }
 const LINE_FIELDS: LineFields = LineFields {
     parent: &["BillingStatement__c"],
@@ -750,6 +765,10 @@ const LINE_FIELDS: LineFields = LineFields {
     product_family: &["Billing_PrimaryProductFamily__c"],
     product_name: &["Billing_PrimaryProductName__c"],
     amount: &["Charges__c"],
+    // Per-line eventual settlement. Dues settlement is read from the dues lines alone;
+    // the statement-level totals also cover security fees, tuition, and gifts.
+    received: &["Billing_ReceivedAmount__c"],
+    balance: &["Billing_Balance__c"],
 };
 
 /// Candidate columns for a class enrolment. The school type comes from the source's
@@ -838,18 +857,33 @@ fn row_index(rows: &[HhFy]) -> std::collections::HashMap<(String, i32), usize> {
         .collect()
 }
 
+/// Mark every household-year in a fiscal year the source carried rows for as observed
+/// for that family. A year with no source rows stays unobserved, so the churn model's
+/// coverage gate can tell "no data that year" from "data present, anchor absent".
+fn mark_observed(
+    rows: &mut [HhFy],
+    observed_fys: &std::collections::HashSet<i32>,
+    flag: impl Fn(&mut HhFy) -> &mut bool,
+) {
+    for row in rows.iter_mut() {
+        if observed_fys.contains(&row.fy) {
+            *flag(row) = true;
+        }
+    }
+}
+
 fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
     let statement_cols = store.mirror_columns("BillingStatement__c")?;
     let line_cols = store.mirror_columns("BillingStatementLine__c")?;
     let s_id = resolve_col(&statement_cols, STATEMENT_FIELDS.id);
     let s_hh = resolve_col(&statement_cols, STATEMENT_FIELDS.household);
     let s_date = resolve_col(&statement_cols, STATEMENT_FIELDS.date);
-    let s_recv = resolve_col(&statement_cols, STATEMENT_FIELDS.received);
-    let s_bal = resolve_col(&statement_cols, STATEMENT_FIELDS.balance);
     let l_parent = resolve_col(&line_cols, LINE_FIELDS.parent);
     let l_fam = resolve_col(&line_cols, LINE_FIELDS.product_family);
     let l_name = resolve_col(&line_cols, LINE_FIELDS.product_name);
     let l_amt = resolve_col(&line_cols, LINE_FIELDS.amount);
+    let l_recv = resolve_col(&line_cols, LINE_FIELDS.received);
+    let l_bal = resolve_col(&line_cols, LINE_FIELDS.balance);
     // Without the household and parent join keys there is no defensible link to a
     // household-year; leave dues anchors empty rather than guess.
     if s_id.is_none() || s_hh.is_none() || l_parent.is_none() {
@@ -863,8 +897,6 @@ fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
             id: field(r, &s_id).unwrap_or_default(),
             household_id: field(r, &s_hh),
             issued_at: field(r, &s_date),
-            eventual_received: field(r, &s_recv).and_then(|v| v.parse().ok()),
-            eventual_balance: field(r, &s_bal).and_then(|v| v.parse().ok()),
         })
         .collect();
     let lines: Vec<BillingStatementLine<'_>> = line_rows
@@ -874,8 +906,17 @@ fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
             product_family: field(r, &l_fam),
             product_name: field(r, &l_name),
             amount: field(r, &l_amt).and_then(|v| v.parse().ok()),
+            received: field(r, &l_recv).and_then(|v| v.parse().ok()),
+            balance: field(r, &l_bal).and_then(|v| v.parse().ok()),
         })
         .collect();
+    // A fiscal year is renewal-observed when any statement was issued in it. This is
+    // independent of `dues_coverage_missing` below, which stays a per-household signal.
+    let observed_fys: std::collections::HashSet<i32> = statements
+        .iter()
+        .filter_map(|s| s.issued_at.and_then(fy_of))
+        .collect();
+    mark_observed(rows, &observed_fys, |r| &mut r.renewal_observed);
     for row in rows.iter_mut() {
         let evidence = dues_evidence(&row.account_id, row.fy, &statements, &lines);
         match evidence.coverage {
@@ -905,6 +946,7 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
         return Ok(());
     }
     let index = row_index(rows);
+    let mut observed_fys = std::collections::HashSet::new();
     for r in store.mirror_rows("Class_Enrolment__c")? {
         let Some(account_id) = field(&r, &hh) else {
             continue;
@@ -913,6 +955,7 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
         let Some(fy) = parse_rs_year(field(&r, &year)) else {
             continue;
         };
+        observed_fys.insert(fy);
         // The source's own flags label the school type; hand the normalizer a canonical
         // label instead of parsing a free-text class name.
         let school_label = if is_flag_set(field(&r, &is_nursery)) {
@@ -932,6 +975,7 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
             None => {}
         }
     }
+    mark_observed(rows, &observed_fys, |r| &mut r.school_observed);
     Ok(())
 }
 
@@ -945,7 +989,9 @@ fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()>
         return Ok(());
     }
     let index = row_index(rows);
+    let mut observed_fys = std::collections::HashSet::new();
     let mut mark = |account_id: &str, fy: i32| {
+        observed_fys.insert(fy);
         if let Some(idx) = index.get(&(account_id.to_string(), fy)) {
             rows[*idx].anchor_committee = true;
         }
@@ -965,6 +1011,7 @@ fn apply_committee(store: &Store, rows: &mut [HhFy], through: i32) -> Result<()>
             mark(account_id, through);
         }
     }
+    mark_observed(rows, &observed_fys, |r| &mut r.committee_observed);
     Ok(())
 }
 
@@ -1076,8 +1123,9 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
             "INSERT INTO _m_household_fy(account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
              tenure_years, exit_outcome, entry_job_count, {flag_cols},
              anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
-             dues_coverage_missing, dues_settlement)
-             VALUES(?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?,?)"
+             dues_coverage_missing, dues_settlement,
+             renewal_observed, school_observed, committee_observed)
+             VALUES(?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?,?,?,?,?)"
         ))?;
         for row in &household_fy {
             let mut values: Vec<rusqlite::types::Value> = vec![
@@ -1098,6 +1146,9 @@ pub fn rebuild(store: &mut Store) -> Result<RebuildInfo> {
                 (row.anchor_committee as i64).into(),
                 (row.dues_coverage_missing as i64).into(),
                 row.dues_settlement.clone().into(),
+                (row.renewal_observed as i64).into(),
+                (row.school_observed as i64).into(),
+                (row.committee_observed as i64).into(),
             ]);
             st.execute(rusqlite::params_from_iter(values.iter()))?;
         }
@@ -2413,8 +2464,6 @@ mod tests {
             id: "stmt-1",
             household_id: Some("hh-1"),
             issued_at: Some("2024-07-01"),
-            eventual_received: Some(500.0),
-            eventual_balance: Some(0.0),
         }];
         let lines = [
             BillingStatementLine {
@@ -2422,18 +2471,24 @@ mod tests {
                 product_family: Some("Membership"),
                 product_name: Some("Annual Membership Dues"),
                 amount: Some(500.0),
+                received: Some(500.0),
+                balance: Some(0.0),
             },
             BillingStatementLine {
                 statement_id: Some("stmt-1"),
                 product_family: Some("Fees"),
                 product_name: Some("Security Fee"),
                 amount: Some(75.0),
+                received: Some(75.0),
+                balance: Some(0.0),
             },
             BillingStatementLine {
                 statement_id: Some("missing-parent"),
                 product_family: Some("Membership"),
                 product_name: Some("Annual Membership Dues"),
                 amount: Some(999.0),
+                received: Some(0.0),
+                balance: Some(999.0),
             },
         ];
 
@@ -2454,20 +2509,16 @@ mod tests {
                 id: "partial",
                 household_id: Some("hh-1"),
                 issued_at: Some("2024-06-01"),
-                eventual_received: Some(100.0),
-                eventual_balance: Some(400.0),
             },
             BillingStatement {
-                id: "unknown",
+                id: "unsettled",
                 household_id: Some("hh-2"),
                 issued_at: Some("2024-06-01"),
-                eventual_received: None,
-                eventual_balance: None,
             },
         ];
         let lines = [
-            BillingStatementLine::dues("partial", 500.0),
-            BillingStatementLine::dues("unknown", 500.0),
+            BillingStatementLine::dues("partial", 500.0, Some(100.0), Some(400.0)),
+            BillingStatementLine::dues("unsettled", 500.0, Some(0.0), Some(500.0)),
         ];
 
         let partial = dues_evidence("hh-1", 2025, &statements, &lines);
@@ -2477,12 +2528,75 @@ mod tests {
             "Eventual settlement: partially settled"
         );
 
-        let unknown = dues_evidence("hh-2", 2025, &statements, &lines);
-        assert_eq!(unknown.settlement, SettlementState::Unknown);
+        let unsettled = dues_evidence("hh-2", 2025, &statements, &lines);
+        assert_eq!(unsettled.settlement, SettlementState::Unsettled);
+        assert_eq!(
+            unsettled.settlement_label(),
+            "Eventual settlement: unsettled"
+        );
 
         let missing = dues_evidence("hh-3", 2025, &statements, &lines);
         assert_eq!(missing.coverage, BillingCoverage::Missing);
         assert_eq!(missing.settlement, SettlementState::Unknown);
+    }
+
+    #[test]
+    fn settlement_reads_the_dues_line_not_the_statement_total() {
+        // One statement: dues fully paid, a security fee still owed. The statement total
+        // says partially settled; the dues line says settled — and the label describes
+        // dues, so it must follow the line.
+        let statements = [BillingStatement {
+            id: "stmt",
+            household_id: Some("hh-1"),
+            issued_at: Some("2024-07-01"),
+        }];
+        let lines = [
+            BillingStatementLine::dues("stmt", 500.0, Some(500.0), Some(0.0)),
+            BillingStatementLine {
+                statement_id: Some("stmt"),
+                product_family: Some("Dues"),
+                product_name: Some("Membership Security Fee"),
+                amount: Some(75.0),
+                received: Some(0.0),
+                balance: Some(75.0),
+            },
+        ];
+        let evidence = dues_evidence("hh-1", 2025, &statements, &lines);
+        assert_eq!(evidence.dues_billed, 500.0);
+        assert_eq!(evidence.settlement, SettlementState::Settled);
+
+        // The mirror image: dues unpaid, the security fee paid. The statement total says
+        // partially settled; the dues line is unsettled.
+        let lines = [
+            BillingStatementLine::dues("stmt", 500.0, Some(0.0), Some(500.0)),
+            BillingStatementLine {
+                statement_id: Some("stmt"),
+                product_family: Some("Dues"),
+                product_name: Some("Membership Security Fee"),
+                amount: Some(75.0),
+                received: Some(75.0),
+                balance: Some(0.0),
+            },
+        ];
+        let evidence = dues_evidence("hh-1", 2025, &statements, &lines);
+        assert_eq!(evidence.settlement, SettlementState::Unsettled);
+    }
+
+    #[test]
+    fn dues_line_without_settlement_fields_is_unknown() {
+        // The statement total is fully paid, but the dues line itself carries no
+        // balance/received values: settlement falls back to Unknown rather than
+        // borrowing the statement-level figure.
+        let statements = [BillingStatement {
+            id: "stmt",
+            household_id: Some("hh-1"),
+            issued_at: Some("2024-07-01"),
+        }];
+        let lines = [BillingStatementLine::dues("stmt", 500.0, None, None)];
+        let evidence = dues_evidence("hh-1", 2025, &statements, &lines);
+        assert_eq!(evidence.coverage, BillingCoverage::Present);
+        assert_eq!(evidence.settlement, SettlementState::Unknown);
+        assert_eq!(evidence.settlement_label(), "Eventual settlement: unknown");
     }
 
     #[test]
@@ -3013,23 +3127,17 @@ mod tests {
     fn anchors_populate_from_optional_mirror_sources() {
         let (_d, mut s) = mem();
         seed_account(&mut s, &anchor_accounts(), &ACCT_COLS);
-        // Renewal: A billed membership dues in FY2025 (statement dated Sep 2024), settled.
+        // Renewal: A billed membership dues in FY2025 (statement dated Sep 2024). The dues
+        // line is fully paid; a security fee on the same statement is still owed, so the
+        // statement total would read "partially settled" while the dues line is settled.
         seed_object(
             &mut s,
             "BillingStatement__c",
-            &[
-                "Id",
-                "Account__c",
-                "Date__c",
-                "TotalCredits__c",
-                "TotalBalance__c",
-            ],
+            &["Id", "Account__c", "Date__c"],
             &[row(&[
                 ("Id", "st1"),
                 ("Account__c", "accA"),
                 ("Date__c", "2024-09-01"),
-                ("TotalCredits__c", "1000"),
-                ("TotalBalance__c", "0"),
             ])],
         );
         seed_object(
@@ -3041,17 +3149,32 @@ mod tests {
                 "Billing_PrimaryProductFamily__c",
                 "Billing_PrimaryProductName__c",
                 "Charges__c",
+                "Billing_ReceivedAmount__c",
+                "Billing_Balance__c",
             ],
-            &[row(&[
-                ("Id", "ln1"),
-                ("BillingStatement__c", "st1"),
-                ("Billing_PrimaryProductFamily__c", "Dues"),
-                (
-                    "Billing_PrimaryProductName__c",
-                    "Membership Dues (Unreserved)",
-                ),
-                ("Charges__c", "1000"),
-            ])],
+            &[
+                row(&[
+                    ("Id", "ln1"),
+                    ("BillingStatement__c", "st1"),
+                    ("Billing_PrimaryProductFamily__c", "Dues"),
+                    (
+                        "Billing_PrimaryProductName__c",
+                        "Membership Dues (Unreserved)",
+                    ),
+                    ("Charges__c", "1000"),
+                    ("Billing_ReceivedAmount__c", "1000"),
+                    ("Billing_Balance__c", "0"),
+                ]),
+                row(&[
+                    ("Id", "ln2"),
+                    ("BillingStatement__c", "st1"),
+                    ("Billing_PrimaryProductFamily__c", "Dues"),
+                    ("Billing_PrimaryProductName__c", "Membership Security Fee"),
+                    ("Charges__c", "75"),
+                    ("Billing_ReceivedAmount__c", "0"),
+                    ("Billing_Balance__c", "75"),
+                ]),
+            ],
         );
         // School: A confirmed Religious School enrolment for the 2024-2025 year (FY2025).
         seed_object(
@@ -3106,13 +3229,25 @@ mod tests {
         assert!(a25.anchor_dues && a25.anchor_religious && !a25.anchor_committee);
         assert_eq!(
             a25.dues_settlement.as_deref(),
-            Some("Eventual settlement: settled")
+            Some("Eventual settlement: settled"),
+            "settlement follows the dues line, not the statement total"
         );
         assert_eq!(a25.anchor_count(), 2);
         let b25 = at("accB", 2025);
         assert!(b25.anchor_committee && !b25.anchor_dues);
         // Open-ended committee membership stays active in later fiscal years.
         assert!(at("accB", 2026).anchor_committee);
+        // Every source carried rows for FY2025, so both households are observed for every
+        // family that year; B's missing dues line is coverage missing on an observed year.
+        assert!(a25.renewal_observed && a25.school_observed && a25.committee_observed);
+        assert!(b25.renewal_observed && b25.dues_coverage_missing);
+        // FY2024 has no statement, enrolment, or committee rows: unobserved, not zero.
+        let a24 = at("accA", 2024);
+        assert!(!a24.renewal_observed && !a24.school_observed && !a24.committee_observed);
+        assert!(
+            a24.dues_coverage_missing,
+            "coverage missing is derived independently of observation"
+        );
 
         let cur = current_fy();
         let caps = source_capabilities(&s).unwrap();
@@ -3624,7 +3759,9 @@ pub fn load_household_years(store: &Store) -> Result<Vec<HhFy>> {
         "SELECT account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
          tenure_years, exit_outcome, entry_job_count, {flag_cols},
          anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
-         dues_coverage_missing, dues_settlement FROM _m_household_fy ORDER BY account_id, fy"
+         dues_coverage_missing, dues_settlement,
+         renewal_observed, school_observed, committee_observed
+         FROM _m_household_fy ORDER BY account_id, fy"
     ))?;
     let rows = st.query_map([], |row| {
         let mut entry_jobs = [false; 12];
@@ -3648,6 +3785,9 @@ pub fn load_household_years(store: &Store) -> Result<Vec<HhFy>> {
             anchor_committee: row.get::<_, i64>(anchor + 3)? != 0,
             dues_coverage_missing: row.get::<_, i64>(anchor + 4)? != 0,
             dues_settlement: row.get(anchor + 5)?,
+            renewal_observed: row.get::<_, i64>(anchor + 6)? != 0,
+            school_observed: row.get::<_, i64>(anchor + 7)? != 0,
+            committee_observed: row.get::<_, i64>(anchor + 8)? != 0,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)

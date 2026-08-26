@@ -14,8 +14,9 @@ use serde::Serialize;
 pub const ADDRESSABLE: &str = "Addressable Churn";
 
 /// Fixed feature order. Base features are always present; the optional families
-/// (renewal, school, committee) are neutralized to 0 when their source is unavailable
-/// and reported through `FeatureRow`'s per-family coverage flags.
+/// (renewal, school, committee) are neutralized to 0 when their source is unavailable or
+/// carried no data for the row's fiscal year, and reported through `FeatureRow`'s
+/// per-family observed flags.
 pub const FEATURE_NAMES: [&str; 9] = [
     "tenure_years",                 // base
     "entry_job_count",              // base
@@ -41,10 +42,17 @@ pub struct FeatureRow {
     /// 1 = Addressable Churn in N+1, 0 = retained through N+1.
     pub label: u8,
     pub features: [f64; 9],
-    /// Whether each optional family contributed observed data for this row.
+    /// Whether each optional family's source was available for the run (reporting only;
+    /// coverage is gated on the per-year `*_observed` flags below).
     pub has_renewal: bool,
     pub has_school: bool,
     pub has_committee: bool,
+    /// Whether each optional family's source actually carried data for this row's fiscal
+    /// year. A year with no source rows is uncovered for that family, even when the
+    /// source is available, so the coverage gate can see it.
+    pub renewal_observed: bool,
+    pub school_observed: bool,
+    pub committee_observed: bool,
 }
 
 fn cap_available(caps: &[SourceCapability], key: &str) -> bool {
@@ -131,14 +139,23 @@ fn build_feature_row(
     let rs_ended = last_rs.is_some_and(|y| n - y >= 1) as i32 as f64;
     let years_since_rs = last_rs.map(|y| (n - y).max(0) as f64).unwrap_or(0.0);
 
+    // A family is observed for this row only when its source is available AND carried
+    // data for fiscal year N. An unobserved year neutralizes the family to 0 — it is
+    // uncovered, not a zero anchor and not "coverage missing".
+    let renewal_observed = has_renewal && at_n.is_some_and(|r| r.renewal_observed);
+    let school_observed = has_school && at_n.is_some_and(|r| r.school_observed);
+    let committee_observed = has_committee && at_n.is_some_and(|r| r.committee_observed);
+
     // Optional-family anchors observed during fiscal year N (available by its end).
     // dues_settlement is deliberately NOT a feature: it is an eventual state.
-    let dues_billed = (has_renewal && at_n.is_some_and(|r| r.anchor_dues)) as i32 as f64;
-    let dues_missing = (has_renewal && at_n.is_some_and(|r| r.dues_coverage_missing)) as i32 as f64;
-    let school_anchor =
-        (has_school && at_n.is_some_and(|r| r.anchor_nursery || r.anchor_religious)) as i32 as f64;
+    let dues_billed = (renewal_observed && at_n.is_some_and(|r| r.anchor_dues)) as i32 as f64;
+    let dues_missing =
+        (renewal_observed && at_n.is_some_and(|r| r.dues_coverage_missing)) as i32 as f64;
+    let school_anchor = (school_observed
+        && at_n.is_some_and(|r| r.anchor_nursery || r.anchor_religious))
+        as i32 as f64;
     let committee_anchor =
-        (has_committee && at_n.is_some_and(|r| r.anchor_committee)) as i32 as f64;
+        (committee_observed && at_n.is_some_and(|r| r.anchor_committee)) as i32 as f64;
 
     Some(FeatureRow {
         account_id: household.account_id.clone(),
@@ -158,6 +175,9 @@ fn build_feature_row(
         has_renewal,
         has_school,
         has_committee,
+        renewal_observed,
+        school_observed,
+        committee_observed,
     })
 }
 
@@ -423,13 +443,15 @@ fn optional_families() -> [(&'static str, &'static [usize]); 3] {
 }
 
 /// Whether a row carries observed data for an optional family. Every model feature is a
-/// leakage-safe anchor indicator, so a family is "covered" exactly when its source is
-/// available for that row; there is no partial as-of measurement to be missing.
+/// leakage-safe anchor indicator, so a family is "covered" exactly when its source
+/// carried data for that row's fiscal year; there is no partial as-of measurement to be
+/// missing. Availability alone (`has_*`) is not coverage: a year the source has no rows
+/// for is uncovered, which lets the gate drop a family whose data starts late.
 fn family_observed(row: &FeatureRow, family: &str) -> bool {
     match family {
-        "renewal" => row.has_renewal,
-        "school" => row.has_school,
-        "committee" => row.has_committee,
+        "renewal" => row.renewal_observed,
+        "school" => row.school_observed,
+        "committee" => row.committee_observed,
         _ => true,
     }
 }
@@ -920,11 +942,15 @@ mod tests {
         }
     }
 
+    /// An active household-year in a fiscal year every optional source has data for.
     fn year(id: &str, fy: i32) -> HhFy {
         HhFy {
             account_id: id.into(),
             fy,
             active_end_of_fy: true,
+            renewal_observed: true,
+            school_observed: true,
+            committee_observed: true,
             ..Default::default()
         }
     }
@@ -1089,9 +1115,13 @@ mod tests {
             has_renewal: false,
             has_school: false,
             has_committee: false,
+            renewal_observed: false,
+            school_observed: false,
+            committee_observed: false,
         }
     }
 
+    /// A row whose families are available and, when available, carry data this year.
     fn frow_fam(
         id: &str,
         fy: i32,
@@ -1104,7 +1134,108 @@ mod tests {
         r.has_renewal = renewal;
         r.has_school = school;
         r.has_committee = committee;
+        r.renewal_observed = renewal;
+        r.school_observed = school;
+        r.committee_observed = committee;
         r
+    }
+
+    #[test]
+    fn evaluate_removes_family_with_data_only_in_recent_years() {
+        // Every source is available for the whole run, but billing statements exist only
+        // from FY2022 onward: FY2018..=2021 carry no renewal data. Across the FY2018..=2022
+        // training window renewal coverage is 1/5, far below MIN_COVERAGE, so the gate
+        // must drop the family — availability alone must not count as coverage.
+        let mut rows = dataset(true);
+        for r in &mut rows {
+            r.has_renewal = true;
+            r.has_school = true;
+            r.has_committee = true;
+            r.renewal_observed = r.fy_n >= 2022;
+            r.school_observed = true;
+            r.committee_observed = true;
+        }
+        let model = evaluate(&rows, DEFAULT_ALPHA);
+        assert_eq!(model.removed_families, vec!["renewal".to_string()]);
+        assert!(
+            !model.validation.columns.contains(&5) && !model.validation.columns.contains(&6),
+            "renewal columns dropped: {:?}",
+            model.validation.columns
+        );
+        assert!(model.validation.columns.contains(&7) && model.validation.columns.contains(&8));
+        for family in ["school", "committee"] {
+            let c = model.coverage.iter().find(|c| c.family == family).unwrap();
+            assert!(
+                c.kept && c.train == 1.0 && c.score == 1.0,
+                "{family}: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unobserved_year_is_distinct_from_missing_dues_coverage() {
+        // The renewal source is available. FY2024 has statement data and this active
+        // household simply has no dues line: coverage missing is a real feature AND the
+        // year is renewal-observed. FY2018 has no statement data at all: the mart still
+        // marks the active row coverage-missing (the flags are independent), but the
+        // family is unobserved, so the feature is neutralized rather than read as
+        // "missing" and the gate sees the year as uncovered.
+        let household = hh("h", true, 2010, None, "(not coded)");
+        let mut fy24 = year("h", 2024);
+        fy24.dues_coverage_missing = true;
+        let mut fy18 = year("h", 2018);
+        fy18.renewal_observed = false;
+        fy18.dues_coverage_missing = true;
+        let years = [fy24, fy18];
+        let caps = caps(&["renewal"]);
+
+        let r24 = feature_rows(std::slice::from_ref(&household), &years, 2024, &caps).remove(0);
+        assert!(r24.has_renewal && r24.renewal_observed);
+        assert!(family_observed(&r24, "renewal"));
+        assert_eq!(r24.features[6], 1.0, "coverage missing is a real feature");
+
+        let r18 = feature_rows(std::slice::from_ref(&household), &years, 2018, &caps).remove(0);
+        assert!(r18.has_renewal, "source availability is still reported");
+        assert!(!r18.renewal_observed);
+        assert!(
+            !family_observed(&r18, "renewal"),
+            "an unobserved year is uncovered"
+        );
+        assert_eq!(
+            (r18.features[5], r18.features[6]),
+            (0.0, 0.0),
+            "unobserved year is neutralized, not counted as coverage missing"
+        );
+    }
+
+    #[test]
+    fn full_observation_keeps_every_family_and_matches_the_ungated_model() {
+        // Equivalence guard: when every year carries data for every family, coverage is
+        // 1.0, nothing is removed, and the validated model is exactly the rolling
+        // backtest over all nine columns — the gate contributes nothing.
+        let mut rows = dataset(true);
+        for r in &mut rows {
+            r.has_renewal = true;
+            r.has_school = true;
+            r.has_committee = true;
+            r.renewal_observed = true;
+            r.school_observed = true;
+            r.committee_observed = true;
+        }
+        let model = evaluate(&rows, DEFAULT_ALPHA);
+        assert!(model.removed_families.is_empty());
+        assert_eq!(model.coverage.len(), 3);
+        assert!(model
+            .coverage
+            .iter()
+            .all(|c| c.kept && c.train == 1.0 && c.score == 1.0));
+        assert_eq!(model.validation.columns, (0..9).collect::<Vec<_>>());
+        let ungated = rolling_validation(&rows, &model.validation.columns, DEFAULT_ALPHA);
+        assert_eq!(model.validation.passed, ungated.passed);
+        assert_eq!(model.validation.roc_auc, ungated.roc_auc);
+        assert_eq!(model.validation.top_decile_lift, ungated.top_decile_lift);
+        assert_eq!(model.validation.brier, ungated.brier);
+        assert_eq!(model.validation.failures, ungated.failures);
     }
 
     #[test]
@@ -1194,6 +1325,9 @@ mod tests {
                     has_renewal: false,
                     has_school: false,
                     has_committee: false,
+                    renewal_observed: false,
+                    school_observed: false,
+                    committee_observed: false,
                 });
             }
         }
