@@ -13,7 +13,7 @@ use crate::store::{self, AuditRow, FieldRow, ObjectRow, Store, Who};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct AppState {
     pub cfg: Config,
@@ -513,4 +513,42 @@ pub async fn reveal_export(path: String, state: State<'_, AppState>) -> CmdResul
         return Err("can only reveal files inside the app's exports folder".into());
     }
     tauri_plugin_opener::reveal_item_in_dir(&p).map_err(err)
+}
+
+#[tauri::command]
+pub async fn export_insights_pdf(
+    include_at_risk: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<String> {
+    let w = who(state.inner());
+    let dir = exports_dir(state.inner());
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
+    let path = dir.join(format!("insights-report-{stamp}.pdf"));
+    // Audit first (fail-closed), then render. No store lock is held across the await.
+    with_store(state.inner(), |s| {
+        s.audit(
+            &w,
+            "insights.export_pdf",
+            None,
+            Some(serde_json::json!({"includes_names": include_at_risk})),
+        )
+    })?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+    let target = path.clone();
+    window
+        .with_webview(move |wv| {
+            let _ = tx.send(crate::pdf::print_webview_to_pdf(&wv, &target));
+        })
+        .map_err(err)?;
+    tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(90)))
+        .await
+        .map_err(err)?
+        .map_err(|_| "timed out rendering the PDF".to_string())?
+        .map_err(err)?;
+    Ok(path.to_string_lossy().into_owned())
 }

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod insights;
+pub mod pdf;
 pub mod profile;
 pub mod salesforce;
 pub mod secrets;
@@ -53,6 +54,7 @@ pub fn run() {
             commands::get_at_risk,
             commands::export_insights_csv,
             commands::reveal_export,
+            commands::export_insights_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
