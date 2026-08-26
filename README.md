@@ -4,7 +4,13 @@ Desktop app (Tauri v2, Rust + React) that mirrors a governed, user-selected subs
 Temple Emanu-El's Salesforce data into an encrypted local database, profiles it, and
 lets staff build simple segments. Read-only against Salesforce. No server, no cloud copy.
 
-Design: `docs/superpowers/specs/2026-08-25-customer-intelligence-v1-design.md`
+Original v1 design: `docs/superpowers/specs/2026-08-25-customer-intelligence-v1-design.md`
+
+## Specifications
+
+OpenSpec is the authoritative workflow for new features, behavior changes, and architectural work.
+Active changes live under `openspec/changes/`; accepted capability specifications live under
+`openspec/specs/`. Run the repository-local CLI with `npm exec -- openspec <command>`.
 
 ## Setup
 1. Salesforce admin: External Client App with callback `http://localhost:1717/callback`,

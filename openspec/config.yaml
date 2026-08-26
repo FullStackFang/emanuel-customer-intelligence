@@ -1,20 +1,26 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Desktop customer-intelligence app for Temple Emanu-El.
+  Stack: Tauri v2, Rust, React 19, TypeScript, Vite, SQLCipher SQLite.
+  Salesforce access is read-only; analytics use only the encrypted local mirror.
+  The webview is untrusted and accesses data only through fixed Rust commands.
+  Household names and exports require existing audit and privacy boundaries.
+  Canonical membership terminology is defined in CONTEXT.md.
+  Follow the repository's existing design system and test patterns.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - State user impact and identify every new or modified capability.
+    - Identify privacy, audit, source-data, and dependency impact when applicable.
+  design:
+    - Record alternatives and explain why the selected architecture fits the existing codebase.
+    - Define failure behavior, migration, rollback, and data freshness semantics.
+    - Do not leave product or data-definition decisions unresolved before implementation.
+  specs:
+    - Use canonical terms from CONTEXT.md.
+    - Make privacy, audit, unavailable-source, and failure behavior testable when applicable.
+    - Include scenarios for the motivating regression or failure case.
+  tasks:
+    - Order tasks by dependency and include explicit tests before implementation tasks.
+    - End with full automated, real-data aggregate, and UI verification where applicable.
