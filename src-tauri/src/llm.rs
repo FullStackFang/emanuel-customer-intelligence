@@ -201,6 +201,109 @@ impl LlmSettings {
     }
 }
 
+pub struct TestRequest {
+    pub method: reqwest::Method,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct TestResult {
+    pub ok: bool,
+    pub detail: String,
+}
+
+fn base(c: &ProviderConfig) -> &str {
+    c.base_url.trim().trim_end_matches('/')
+}
+
+pub fn build_test_request(
+    p: Provider,
+    c: &ProviderConfig,
+    key: Option<&str>,
+) -> Result<TestRequest, String> {
+    if p.requires_key() && key.map(|k| k.trim().is_empty()).unwrap_or(true) {
+        return Err("No API key is set for this provider.".to_string());
+    }
+    let b = base(c);
+    if b.is_empty() {
+        return Err("Base URL is empty.".to_string());
+    }
+    Ok(match p {
+        Provider::Anthropic => TestRequest {
+            method: reqwest::Method::POST,
+            url: format!("{b}/v1/messages"),
+            headers: vec![
+                ("x-api-key".into(), key.unwrap_or_default().to_string()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: Some(serde_json::json!({
+                "model": c.model,
+                "max_tokens": 1,
+                "messages": [{ "role": "user", "content": "ping" }],
+            })),
+        },
+        Provider::OpenAi | Provider::Custom => {
+            let mut headers = Vec::new();
+            if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
+                headers.push(("Authorization".into(), format!("Bearer {k}")));
+            }
+            TestRequest {
+                method: reqwest::Method::GET,
+                url: format!("{b}/models"),
+                headers,
+                body: None,
+            }
+        }
+        Provider::Google => TestRequest {
+            method: reqwest::Method::GET,
+            url: format!("{b}/v1beta/models?key={}", key.unwrap_or_default()),
+            headers: vec![],
+            body: None,
+        },
+        Provider::Ollama => TestRequest {
+            method: reqwest::Method::GET,
+            url: format!("{b}/api/tags"),
+            headers: vec![],
+            body: None,
+        },
+    })
+}
+
+pub async fn run_test(p: Provider, c: &ProviderConfig, key: Option<&str>) -> TestResult {
+    let req = match build_test_request(p, c, key) {
+        Ok(r) => r,
+        Err(e) => return TestResult { ok: false, detail: e },
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(c.timeout_secs.max(1)))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return TestResult { ok: false, detail: e.to_string() },
+    };
+    let mut rb = client.request(req.method, &req.url);
+    for (k, v) in req.headers {
+        rb = rb.header(k, v);
+    }
+    if let Some(body) = req.body {
+        rb = rb.json(&body);
+    }
+    match rb.send().await {
+        Ok(resp) if resp.status().is_success() => TestResult {
+            ok: true,
+            detail: format!("OK ({})", resp.status().as_u16()),
+        },
+        Ok(resp) => TestResult {
+            ok: false,
+            detail: format!("HTTP {}", resp.status().as_u16()),
+        },
+        Err(e) => TestResult { ok: false, detail: e.to_string() },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +416,55 @@ mod tests {
         let s: LlmSettings = serde_json::from_str(json).unwrap();
         assert_eq!(s.anthropic.model, "m");
         assert_eq!(s.ollama.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn build_test_request_per_provider() {
+        // Anthropic: POST messages, keyed, 1-token body.
+        let c = ProviderConfig::default_for(Provider::Anthropic);
+        let r = build_test_request(Provider::Anthropic, &c, Some("k")).unwrap();
+        assert_eq!(r.method, reqwest::Method::POST);
+        assert_eq!(r.url, "https://api.anthropic.com/v1/messages");
+        assert!(r.headers.iter().any(|(k, v)| k == "x-api-key" && v == "k"));
+        assert!(r.headers.iter().any(|(k, _)| k == "anthropic-version"));
+        assert_eq!(r.body.as_ref().unwrap()["max_tokens"], serde_json::json!(1));
+
+        // OpenAI: GET models with bearer.
+        let c = ProviderConfig::default_for(Provider::OpenAi);
+        let r = build_test_request(Provider::OpenAi, &c, Some("k")).unwrap();
+        assert_eq!(r.method, reqwest::Method::GET);
+        assert_eq!(r.url, "https://api.openai.com/v1/models");
+        assert!(r.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+
+        // Google: key in query string.
+        let c = ProviderConfig::default_for(Provider::Google);
+        let r = build_test_request(Provider::Google, &c, Some("k")).unwrap();
+        assert_eq!(r.url, "https://generativelanguage.googleapis.com/v1beta/models?key=k");
+
+        // Ollama: GET tags, no key, no auth header.
+        let c = ProviderConfig::default_for(Provider::Ollama);
+        let r = build_test_request(Provider::Ollama, &c, None).unwrap();
+        assert_eq!(r.url, "http://localhost:11434/api/tags");
+        assert!(r.headers.iter().all(|(k, _)| k != "Authorization"));
+    }
+
+    #[test]
+    fn build_test_request_custom_key_optional_and_base_trimmed() {
+        let mut c = ProviderConfig::default_for(Provider::Custom);
+        c.base_url = "http://localhost:1234/v1/".into(); // trailing slash
+        let r = build_test_request(Provider::Custom, &c, None).unwrap();
+        assert_eq!(r.url, "http://localhost:1234/v1/models");
+        assert!(r.headers.iter().all(|(k, _)| k != "Authorization"), "no key -> no auth");
+
+        let r2 = build_test_request(Provider::Custom, &c, Some("k")).unwrap();
+        assert!(r2.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+    }
+
+    #[test]
+    fn build_test_request_requires_key_for_keyed_cloud() {
+        let c = ProviderConfig::default_for(Provider::OpenAi);
+        assert!(build_test_request(Provider::OpenAi, &c, None).is_err());
+        let c = ProviderConfig::default_for(Provider::Anthropic);
+        assert!(build_test_request(Provider::Anthropic, &c, None).is_err());
     }
 }
