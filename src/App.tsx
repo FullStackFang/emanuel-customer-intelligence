@@ -7,15 +7,17 @@ import * as api from "./api";
 import OverviewPage from "./pages/OverviewPage";
 import DataPage from "./pages/DataPage";
 import SegmentsPage from "./pages/SegmentsPage";
+import InsightsPage from "./pages/InsightsPage";
 import AuditPage from "./pages/AuditPage";
 
-export type PageKey = "overview" | "data" | "segments" | "audit";
+export type PageKey = "overview" | "data" | "segments" | "insights" | "audit";
 export interface PageProps { status: api.StatusView; refresh: () => Promise<void> }
 
 const NAV = [
   { key: "overview", icon: "layout-dashboard", label: "Overview" },
   { key: "data", icon: "database", label: "Data" },
   { key: "segments", icon: "chart-pie", label: "Segments" },
+  { key: "insights", icon: "chart-line", label: "Insights" },
   { key: "audit", icon: "scroll-text", label: "Audit" },
 ];
 
@@ -74,6 +76,7 @@ export default function App() {
       {page === "overview" && <OverviewPage {...props} />}
       {page === "data" && <DataPage {...props} />}
       {page === "segments" && <SegmentsPage {...props} />}
+      {page === "insights" && <InsightsPage {...props} />}
       {page === "audit" && <AuditPage {...props} />}
     </AppFrame>
   );
