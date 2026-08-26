@@ -5,12 +5,25 @@
 .insights-overview-hidden { display: none; }
 .insights-section-hidden { display: none; }
 
+/* Mounted only while the PDF action waits for chart layout. It is measurable at
+   Letter-printable width without disturbing the selected screen tab. */
+.insights-pdf-surface {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+  width: 816px;
+  background: var(--bg-primary);
+}
+.insights-pdf-surface .insights-overview,
+.insights-pdf-surface .insights-section { display: block !important; }
+
 @media print {
   header, nav { display: none !important; }
   html, body, #root, main { height: auto !important; overflow: visible !important; }
   main { padding: 0 !important; }
   .insights-screen-only { display: none !important; }
   .insights-report-only { display: block; }
+  .insights-pdf-surface { position: static; width: auto; }
   .insights-overview { display: block !important; }
   /* Every aggregate tab section composes into the report, regardless of the on-screen
      tab. Named-household content stays screen-only above and never prints. */

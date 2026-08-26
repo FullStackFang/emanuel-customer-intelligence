@@ -212,20 +212,25 @@ export function DuesChart({ rows }: { rows: DuesRow[] }) {
   );
 }
 
-/** Fixed series order (matches PALETTE.series); everything else folds into "Other". */
-export const REASON_ORDER = ["Non-payment", "Moved", "No longer engaged", "Deceased", "Young-adult tier aged out", "Joined another synagogue"];
-
-export function ReasonsChart({ cells }: { cells: ReasonCell[] }) {
-  const fys = [...new Set(cells.map((c) => c.fy))].sort();
-  const data = fys.map((fy) => {
+/** The lifecycle data contract defines the available series. Canonical outcomes lead;
+    later valid categories retain a stable alphabetical order. */
+export function reasonChartSeries(cells: ReasonCell[]) {
+  const categories = [...new Set(cells.map((cell) => cell.reason))].sort((a, b) => {
+    const aIndex = OUTCOME_ORDER.indexOf(a);
+    const bIndex = OUTCOME_ORDER.indexOf(b);
+    if (aIndex >= 0 || bIndex >= 0) return (aIndex < 0 ? Infinity : aIndex) - (bIndex < 0 ? Infinity : bIndex);
+    return a.localeCompare(b);
+  });
+  const data = [...new Set(cells.map((cell) => cell.fy))].sort().map((fy) => {
     const row: Record<string, number | string> = { fy: fyLabel(fy) };
-    let other = 0;
-    for (const c of cells.filter((x) => x.fy === fy)) {
-      if (REASON_ORDER.includes(c.reason)) row[c.reason] = c.n; else other += c.n;
-    }
-    row["Other"] = other;
+    for (const cell of cells.filter((item) => item.fy === fy)) row[cell.reason] = cell.n;
     return row;
   });
+  return { categories, data };
+}
+
+export function ReasonsChart({ cells }: { cells: ReasonCell[] }) {
+  const { categories, data } = reasonChartSeries(cells);
   return (
     <ResponsiveContainer width="100%" height={280}>
       <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="45%">
@@ -234,10 +239,9 @@ export function ReasonsChart({ cells }: { cells: ReasonCell[] }) {
         <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
         <Tooltip contentStyle={tooltipStyle} />
         <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
-        {REASON_ORDER.map((r, i) => (
-          <Bar key={r} dataKey={r} stackId="a" fill={PALETTE.series[i]} maxBarSize={24} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
+        {categories.map((r, i) => (
+          <Bar key={r} dataKey={r} stackId="a" fill={PALETTE.series[i % PALETTE.series.length]} maxBarSize={24} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
         ))}
-        <Bar dataKey="Other" stackId="a" fill={PALETTE.other} maxBarSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
       </BarChart>
     </ResponsiveContainer>
   );

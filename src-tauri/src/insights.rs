@@ -475,7 +475,7 @@ pub const MART_FY: &str = "_m_household_fy";
 
 /// Bumped whenever the mart column layout changes so that existing databases with an
 /// older `_m_household_fy`/`_m_household` schema are rebuilt rather than read as-is.
-pub const MART_SCHEMA_VERSION: i64 = 3;
+pub const MART_SCHEMA_VERSION: i64 = 4;
 
 /// Account columns the mart derives from. A missing one nulls what depends on it and is
 /// reported in `RebuildInfo::unavailable`; `Type` and `IsATempleMember__c` are mandatory.
@@ -539,7 +539,7 @@ const SOURCE_CAPABILITIES: [(&str, &[&str]); 4] = [
 /// capability has been synced. A selected-but-unsynced object is not evidence.
 pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
     let objects = store.list_objects()?;
-    SOURCE_CAPABILITIES
+    let mut capabilities: Vec<SourceCapability> = SOURCE_CAPABILITIES
         .iter()
         .map(|(key, required)| {
             let source_rows: Vec<_> = required
@@ -576,7 +576,19 @@ pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
                     .then(|| format!("Select and sync {}", required.join(" and "))),
             })
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    let account = objects.iter().find(|object| object.name == "Account");
+    let geo_available = account.is_some_and(|object| object.last_synced_at.is_some())
+        && store.mirror_columns("Account")?.iter().any(|column| column == "BillingPostalCode")
+        && store.allowed_fields("Account")?.contains("BillingPostalCode");
+    capabilities.push(SourceCapability {
+        key: "zip_attrition".into(), available: geo_available,
+        required_objects: vec!["Account".into()],
+        mirrored_columns: if geo_available { vec!["BillingPostalCode".into()] } else { Vec::new() },
+        last_synced_at: geo_available.then(|| account.and_then(|object| object.last_synced_at.clone())).flatten(),
+        unavailable_reason: (!geo_available).then(|| "Select and sync Account BillingPostalCode to enable ZIP attrition.".into()),
+    });
+    Ok(capabilities)
 }
 
 /// One household from the mart. Everything the views need, nothing else.
@@ -595,6 +607,8 @@ pub struct Hh {
     pub tier: Option<String>,
     pub category: Option<String>,
     pub join_reason: Option<String>,
+    /// Normalized five-digit ZIP derived locally from BillingPostalCode. Never raw postal data.
+    pub zip: Option<String>,
     pub ch: [bool; 12],
     pub rs_family: bool,
     pub ns_family: bool,
@@ -615,7 +629,7 @@ fn mart_ddl() -> String {
            is_current INTEGER NOT NULL, is_resigned INTEGER NOT NULL,
            join_fy INTEGER, cohort_fy INTEGER, resign_fy INTEGER,
            resigned_unknown_date INTEGER NOT NULL, bad_join_date INTEGER NOT NULL, rejoined INTEGER NOT NULL,
-           tier TEXT, category TEXT, join_reason TEXT, {flags},
+           tier TEXT, category TEXT, join_reason TEXT, zip TEXT, {flags},
            rs_family INTEGER NOT NULL, ns_family INTEGER NOT NULL, active_rs_students INTEGER NOT NULL,
            last_rs_year INTEGER, resign_reason_group TEXT NOT NULL)"
     )
@@ -630,8 +644,17 @@ fn as_num(v: &Option<String>) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn normalize_zip(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    let zip = value.get(0..5)?;
+    let suffix = value.get(5..).unwrap_or_default();
+    (zip.bytes().all(|byte| byte.is_ascii_digit())
+        && (suffix.is_empty() || (suffix.len() == 5 && suffix.starts_with('-') && suffix[1..].bytes().all(|byte| byte.is_ascii_digit()))))
+        .then(|| zip.to_string())
+}
+
 /// Derive one mart row from the raw Account values (positional per REQUIRED_COLUMNS).
-fn derive(raw: &[Option<String>; 16]) -> Hh {
+fn derive(raw: &[Option<String>; 16], zip: Option<String>) -> Hh {
     let [id, name, _ty, is_member, is_resigned, join, orig, resign, tier, category, reason, resign_reason, former_rs, active_rs, ever_ns, last_rs] =
         raw;
     let is_current = as_bool(is_member);
@@ -660,6 +683,7 @@ fn derive(raw: &[Option<String>; 16]) -> Hh {
         tier: tier.clone(),
         category: category.clone(),
         join_reason: reason.clone().filter(|s| !s.trim().is_empty()),
+        zip,
         ch: channel_flags(reason.as_deref()),
         rs_family: as_num(former_rs) > 0.0 || as_num(active_rs) > 0.0,
         ns_family: as_bool(ever_ns),
@@ -1123,7 +1147,8 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
         })
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    let sql = format!("SELECT {select_list} FROM \"Account\" WHERE \"Type\" = 'Member Family'");
+    let postal_select = if have("BillingPostalCode") { ident("BillingPostalCode")? } else { "NULL AS BillingPostalCode".into() };
+    let sql = format!("SELECT {select_list}, {postal_select} FROM \"Account\" WHERE \"Type\" = 'Member Family'");
 
     progress.phase("Reading membership records");
     let total_rows: u64 = store.conn().query_row(
@@ -1139,7 +1164,7 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
             for (i, slot) in raw.iter_mut().enumerate() {
                 *slot = r.get::<_, Option<String>>(i)?;
             }
-            Ok(derive(&raw))
+            Ok(derive(&raw, normalize_zip(r.get::<_, Option<String>>(16)?.as_deref())))
         })?;
         let mut out = Vec::with_capacity(total_rows as usize);
         progress.tick(0, Some(total_rows));
@@ -1176,9 +1201,9 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
         let flag_marks = vec!["?"; 12].join(", ");
         let mut st = tx.prepare(&format!(
             "INSERT INTO {MART}(account_id, name, is_current, is_resigned, join_fy, cohort_fy, resign_fy,
-               resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, {flag_cols},
+               resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, zip, {flag_cols},
                rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?)"
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?)"
         ))?;
         for h in &rows {
             let mut vals: Vec<rusqlite::types::Value> = vec![
@@ -1195,6 +1220,7 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
                 h.tier.clone().into(),
                 h.category.clone().into(),
                 h.join_reason.clone().into(),
+                h.zip.clone().into(),
             ];
             vals.extend(h.ch.iter().map(|b| rusqlite::types::Value::from(*b as i64)));
             vals.extend([
@@ -1283,14 +1309,14 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
         .join(", ");
     let mut st = store.conn().prepare(&format!(
         "SELECT account_id, name, is_current, is_resigned, join_fy, cohort_fy, resign_fy,
-                resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, {flag_cols},
+                resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, zip, {flag_cols},
                 rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group
          FROM {MART}"
     ))?;
     let rows = st.query_map([], |r| {
         let mut ch = [false; 12];
         for (i, f) in ch.iter_mut().enumerate() {
-            *f = r.get::<_, i64>(13 + i)? != 0;
+            *f = r.get::<_, i64>(14 + i)? != 0;
         }
         Ok(Hh {
             account_id: r.get(0)?,
@@ -1306,12 +1332,13 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
             tier: r.get(10)?,
             category: r.get(11)?,
             join_reason: r.get(12)?,
+            zip: r.get(13)?,
             ch,
-            rs_family: r.get::<_, i64>(25)? != 0,
-            ns_family: r.get::<_, i64>(26)? != 0,
-            active_rs_students: r.get(27)?,
-            last_rs_year: r.get(28)?,
-            resign_reason_group: r.get(29)?,
+            rs_family: r.get::<_, i64>(26)? != 0,
+            ns_family: r.get::<_, i64>(27)? != 0,
+            active_rs_students: r.get(28)?,
+            last_rs_year: r.get(29)?,
+            resign_reason_group: r.get(30)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1366,6 +1393,14 @@ pub struct ReasonCell {
     pub fy: i32,
     pub reason: String,
     pub n: i64,
+}
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ZipAttritionCell {
+    pub fy: i32,
+    pub zip: String,
+    pub start_households: i64,
+    pub exits: i64,
+    pub attrition_rate: f64,
 }
 /// Retention for households grouped by how many Entry Jobs they stated.
 #[derive(Serialize, Debug, Clone)]
@@ -1463,6 +1498,7 @@ pub struct Insights {
     pub dues: Vec<DuesRow>,
     pub anchor_type: Vec<AnchorTypeRow>,
     pub anchor_count: Vec<AnchorCountRow>,
+    pub zip_attrition: Vec<ZipAttritionCell>,
 }
 
 /// Spell rule: a member in `fy` if joined by then and not resigned before/in it.
@@ -1487,6 +1523,21 @@ fn pct(num: i64, den: i64) -> f64 {
     } else {
         (1000.0 * num as f64 / den as f64).round() / 10.0
     }
+}
+
+pub fn zip_attrition(households: &[Hh], cur: i32) -> Vec<ZipAttritionCell> {
+    let mut counts: std::collections::BTreeMap<(i32, String), (i64, i64)> = Default::default();
+    for fy in cur - 5..cur {
+        for household in households {
+            let Some(zip) = household.zip.as_ref() else { continue };
+            let cell = counts.entry((fy, zip.clone())).or_default();
+            if member_in(household, fy - 1) { cell.0 += 1; }
+            if household.resign_fy == Some(fy) { cell.1 += 1; }
+        }
+    }
+    counts.into_iter().filter_map(|((fy, zip), (start_households, exits))| {
+        (start_households >= 5).then(|| ZipAttritionCell { fy, zip, start_households, exits, attrition_rate: pct(exits, start_households) })
+    }).collect()
 }
 
 pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
@@ -2500,6 +2551,7 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
         dues: dues_view,
         anchor_type: anchor_type(&household_years, cur, &capabilities),
         anchor_count: anchor_count_view,
+        zip_attrition: if cap_available(&capabilities, "zip_attrition") { zip_attrition(&hh, cur) } else { Vec::new() },
         capabilities,
     })
 }
@@ -2515,6 +2567,35 @@ pub fn path_is_inside(path: &std::path::Path, dir: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_only_five_digit_us_zip_codes() {
+        assert_eq!(normalize_zip(Some("10024")), Some("10024".to_string()));
+        assert_eq!(normalize_zip(Some("10024-1234")), Some("10024".to_string()));
+        assert_eq!(normalize_zip(Some(" 10024-1234 ")), Some("10024".to_string()));
+        assert_eq!(normalize_zip(Some("1002")), None);
+        assert_eq!(normalize_zip(Some("ABCDE")), None);
+        assert_eq!(normalize_zip(None), None);
+    }
+
+    #[test]
+    fn zip_attrition_uses_starting_households_and_suppresses_small_cells() {
+        let households = (0..5).map(|i| Hh {
+            account_id: format!("ny-{i}"), zip: Some("10024".to_string()), join_fy: Some(2024),
+            resign_fy: (i == 0).then_some(2026), ..Default::default()
+        }).chain(std::iter::once(Hh {
+            account_id: "outside".into(), zip: Some("02108".to_string()), join_fy: Some(2024),
+            ..Default::default()
+        })).chain((0..4).map(|i| Hh {
+            account_id: format!("suppressed-{i}"), zip: Some("10025".to_string()), join_fy: Some(2024),
+            ..Default::default()
+        })).collect::<Vec<_>>();
+
+        assert_eq!(zip_attrition(&households, 2027), vec![
+            ZipAttritionCell { fy: 2025, zip: "10024".into(), start_households: 5, exits: 0, attrition_rate: 0.0 },
+            ZipAttritionCell { fy: 2026, zip: "10024".into(), start_households: 5, exits: 1, attrition_rate: 20.0 },
+        ]);
+    }
 
     #[test]
     fn fiscal_year_starts_june_first_and_is_labeled_by_end_year() {

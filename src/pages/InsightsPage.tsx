@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PageProps } from "../App";
 import * as api from "../api";
 import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
 import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsChart, TableView, TrendChart, Year1Chart } from "./insights/charts";
+import { NY_ZCTAS, ZipAttritionMap } from "./insights/ZipAttritionMap";
 import { EVIDENCE_LABELS, fmt, fyLabel, soWhat } from "./insights/format";
 
 function SoWhat({ text }: { text: string }) {
@@ -111,6 +112,26 @@ let snapshot: { ins: api.Insights; risk: api.RiskSummary | null; riskFailed: boo
 /** Test hook: clear the session snapshot so each case starts from a cold page. */
 export function _resetInsightsSnapshot() { snapshot = null; }
 
+const PDF_LAYOUT_TIMEOUT_MS = 3_000;
+
+/** Wait until every chart-bearing card has a printable layout before native capture. */
+export async function waitForPdfReportLayout(surface: HTMLElement): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  const deadline = Date.now() + PDF_LAYOUT_TIMEOUT_MS;
+  while (true) {
+    const charts = [...surface.querySelectorAll<HTMLElement>(".recharts-responsive-container")];
+    const ready = charts.length > 0 && charts.every((chart) => {
+      const card = chart.closest<HTMLElement>(".insights-report-card");
+      const { width, height } = chart.getBoundingClientRect();
+      const cardRect = card?.getBoundingClientRect();
+      return width > 0 && height > 0 && (cardRect?.width ?? 0) > 0 && (cardRect?.height ?? 0) > 0;
+    });
+    if (ready) return;
+    if (Date.now() >= deadline) throw new Error("PDF could not be rendered because the report layout did not become ready.");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 export default function InsightsPage({ status }: PageProps) {
   const [ins, setIns] = useState<api.Insights | null>(snapshot?.ins ?? null);
   const [risk, setRisk] = useState<api.RiskSummary | null>(snapshot?.risk ?? null);
@@ -124,6 +145,9 @@ export default function InsightsPage({ status }: PageProps) {
   const [riskBusy, setRiskBusy] = useState(false);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  const [zipFy, setZipFy] = useState<number | null>(null);
+  const [renderingPdf, setRenderingPdf] = useState(false);
+  const pdfReportRef = useRef<HTMLDivElement>(null);
 
   // Live job progress: the backend emits phase events only while a rebuild or risk fit runs,
   // so this stays null on the cached paths. On mount, ask whether a job is already running so
@@ -195,7 +219,13 @@ export default function InsightsPage({ status }: PageProps) {
   const doPdf = async () => {
     if (!ins) return;
     setBusy("pdf"); setErr(null); setExported(null);
-    try { setExported(await api.exportInsightsPdf()); } catch (e) { setErr(String(e)); } finally { setBusy(null); }
+    setRenderingPdf(true);
+    try {
+      const surface = pdfReportRef.current;
+      if (!surface) throw new Error("PDF could not be rendered because the report surface is unavailable.");
+      await waitForPdfReportLayout(surface);
+      setExported(await api.exportInsightsPdf());
+    } catch (e) { setErr(String(e)); } finally { setRenderingPdf(false); setBusy(null); }
   };
 
   if (status.synced_rows === 0) {
@@ -215,7 +245,7 @@ export default function InsightsPage({ status }: PageProps) {
   const latestTwo = ins ? ins.year1.slice(-2).map((r) => r.cohort) : [];
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
   const anyAnchor = capOn("renewal") || capOn("school") || capOn("committee");
-  const sectionClass = (key: typeof tab) => `insights-section${tab === key ? "" : " insights-section-hidden"}`;
+  const sectionClass = (key: typeof tab) => `insights-section${renderingPdf || tab === key ? "" : " insights-section-hidden"}`;
   const rebuilding = progress?.job === "rebuild" || busy === "rebuild";
   const rebuildProgress = progress?.job === "rebuild" ? progress : null;
   const riskProgress = progress?.job === "risk" ? progress : null;
@@ -276,6 +306,7 @@ export default function InsightsPage({ status }: PageProps) {
         </Card>
       ) : (
         <>
+          <div ref={pdfReportRef} data-testid={renderingPdf ? "insights-pdf-surface" : undefined} className={renderingPdf ? "insights-pdf-surface" : undefined}>
           <div className="insights-report-only" style={{ marginBottom: "var(--space-5)" }}>
             <div style={{ fontSize: "var(--text-2xs)", letterSpacing: "var(--tracking-wider)", textTransform: "uppercase", color: "var(--text-tertiary)", fontWeight: "var(--font-semibold)" }}>Temple Emanu-El · Customer Intelligence</div>
             <div style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-2xl)", fontWeight: "var(--font-semibold)", color: "var(--text-primary)" }}>Membership Insights</div>
@@ -323,7 +354,7 @@ export default function InsightsPage({ status }: PageProps) {
           </div>
 
           {/* ── Overview ─────────────────────────────────────────────────────── */}
-          <div className={tab === "overview" ? "insights-overview" : "insights-overview insights-overview-hidden"}>
+          <div className={renderingPdf || tab === "overview" ? "insights-overview" : "insights-overview insights-overview-hidden"}>
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Membership over time</CardTitle></CardHeader>
             <Lede>Active member households at the end of each fiscal year, and the joins and resignations behind them. The current fiscal year is in progress.</Lede>
@@ -532,6 +563,38 @@ export default function InsightsPage({ status }: PageProps) {
               </>
             )}
           </Card>
+
+          <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+            <CardHeader><CardTitle>ZIP attrition</CardTitle></CardHeader>
+            {(() => {
+              const zipCapability = ins.capabilities.find((capability) => capability.key === "zip_attrition");
+              const years = [...new Set(ins.zip_attrition.map((cell) => cell.fy))].sort((a, b) => b - a);
+              const selectedFy = zipFy ?? years[0];
+              const rows = ins.zip_attrition.filter((cell) => cell.fy === selectedFy);
+              const mappedRows = rows.filter((row) => NY_ZCTAS.has(row.zip));
+              const unmappedCount = rows.length - mappedRows.length;
+              if (!zipCapability?.available || years.length === 0) {
+                return <Lede>ZIP attrition is unavailable because a usable BillingPostalCode source is not mirrored. Other Insights views remain available.</Lede>;
+              }
+              return <>
+                <Lede>Snapshot-based Account ZIP geography only. ZIPs with fewer than five starting households are suppressed; eligible ZIPs outside New York or without a packaged boundary are excluded from the map.</Lede>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", marginBottom: "var(--space-3)", fontSize: "var(--text-sm)" }}>
+                  Fiscal year
+                  <select aria-label="Fiscal year" value={selectedFy} onChange={(event) => setZipFy(Number(event.target.value))}>
+                    {years.map((year) => <option key={year} value={year}>{fyLabel(year)}</option>)}
+                  </select>
+                </label>
+                <div style={{ marginBottom: "var(--space-3)" }}><ZipAttritionMap rows={mappedRows} fiscalYear={fyLabel(selectedFy)} /></div>
+                {unmappedCount > 0 && <p style={{ margin: "0 0 var(--space-3)", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>{unmappedCount} eligible ZIP {unmappedCount === 1 ? "is" : "are"} outside New York or unavailable in the bundled Census ZCTA boundary data.</p>}
+                <TableView rows={mappedRows} getRowKey={(row) => row.zip} columns={[
+                  { key: "zip", header: "ZIP", render: (row) => row.zip },
+                  { key: "rate", header: "Attrition rate", align: "right", render: (row) => `${row.attrition_rate}%` },
+                  { key: "exits", header: "Exits", align: "right", render: (row) => fmt(row.exits) },
+                  { key: "start", header: "Starting households", align: "right", render: (row) => fmt(row.start_households) },
+                ]} />
+              </>;
+            })()}
+          </Card>
           </div>
 
           {/* ── Risk ─────────────────────────────────────────────────────────── */}
@@ -578,6 +641,8 @@ export default function InsightsPage({ status }: PageProps) {
             )}
           </Card>
 
+          </div>
+          </div>
           {/* Named households are screen-only and never enter the PDF report. */}
           <Card className="insights-screen-only" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Named Watch List</CardTitle></CardHeader>
@@ -612,7 +677,6 @@ export default function InsightsPage({ status }: PageProps) {
               </>
             )}
           </Card>
-          </div>
         </>
       )}
     </div>

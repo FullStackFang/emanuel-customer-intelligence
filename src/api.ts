@@ -43,6 +43,7 @@ export interface SchoolGapRow { bucket: string; n: number; still_members: number
 export interface DuesRow { fy: number; active: number; billed: number; coverage_missing: number; settled: number; partially_settled: number; unsettled: number }
 export interface AnchorTypeRow { key: string; label: string; n: number; still_members: number; pct: number }
 export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
+export interface ZipAttritionCell { fy: number; zip: string; start_households: number; exits: number; attrition_rate: number }
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
 export interface SourceCapability {
   key: string; available: boolean; required_objects: string[];
@@ -57,6 +58,7 @@ export interface Insights {
   multi_job: MultiJobRow[]; outcome_by_tenure: OutcomeByTenureRow[];
   school_progression: SchoolRow[]; school_gap: SchoolGapRow[];
   dues: DuesRow[]; anchor_type: AnchorTypeRow[]; anchor_count: AnchorCountRow[];
+  zip_attrition: ZipAttritionCell[];
 }
 export const INSIGHT_VIEWS = [
   "trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk",

@@ -1,7 +1,7 @@
 ## 1. Lifecycle chart regression coverage
 
-- [ ] 1.1 Add a frontend regression test proving that each returned primary Exit Outcome becomes a distinct reason-chart series, rather than being folded into `Other`.
-- [ ] 1.2 Replace the fixed raw-reason series definition with deterministic dynamic category ordering and rendering, then make the regression test pass.
+- [x] 1.1 Add a frontend regression test proving that each returned primary Exit Outcome becomes a distinct reason-chart series, rather than being folded into `Other`.
+- [x] 1.2 Replace the fixed raw-reason series definition with deterministic dynamic category ordering and rendering, then make the regression test pass.
 
 ## 2. ZIP attrition analytical contract
 
@@ -12,10 +12,10 @@
 
 ## 3. Offline New York map
 
-- [ ] 3.1 Select and add a versioned, simplified New York ZIP boundary asset with license/provenance documentation; verify it contains no member data and can load offline.
+- [x] 3.1 Select and add a versioned, simplified New York ZIP boundary asset with license/provenance documentation; verify it contains no member data and can load offline.
 - [ ] 3.2 Add frontend tests for the unavailable state, fiscal-year selection, privacy-suppressed cells, map tooltip/focus values, and equivalent aggregate table.
-- [ ] 3.3 Build the accessible local SVG choropleth and fiscal-year selector in Insights, with rate color encoding and count/rate tooltip content.
-- [ ] 3.4 Add clear snapshot-geography, suppression, and unmapped-ZIP explanatory copy to the map section.
+- [x] 3.3 Build the accessible local SVG choropleth and fiscal-year selector in Insights, with rate color encoding and count/rate tooltip content.
+- [x] 3.4 Add clear snapshot-geography, suppression, and unmapped-ZIP explanatory copy to the map section.
 
 ## 4. Verification
 

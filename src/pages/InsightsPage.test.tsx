@@ -24,7 +24,7 @@ function emit(name: string, payload: unknown) {
 // Stub the charts module so jsdom never renders recharts; keep a TableView that
 // renders each cell so column content (e.g. household names) is assertable.
 vi.mock("./insights/charts", () => {
-  const N = () => null;
+  const N = () => <div className="recharts-responsive-container" data-insights-chart />;
   type Col = { key: string; render: (r: unknown) => React.ReactNode };
   return {
     TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N,
@@ -62,6 +62,7 @@ const fakeInsights: api.Insights = {
   school_progression: [{ group: "Nursery → Religious school", n: 8, still_members: 6, pct: 75 }],
   school_gap: [{ bucket: "0-1y", n: 4, still_members: 3, pct: 75 }],
   dues: [], anchor_type: [], anchor_count: [],
+  zip_attrition: [],
 };
 const fakeRisk: api.RiskSummary = {
   available: true, unavailable_reason: null, roc_auc: 0.72, top_decile_lift: 2.4, brier: 0.12, baseline_brier: 0.2,
@@ -96,7 +97,7 @@ function mockInvoke(over: Partial<Record<string, unknown>> = {}) {
 
 describe("InsightsPage", () => {
   beforeEach(() => { invoke.mockReset(); mockInvoke(); listeners.clear(); _resetInsightsSnapshot(); });
-  afterEach(() => { cleanup(); vi.useRealTimers(); });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
   it("loads aggregates and switches the visible tab section", async () => {
     render(<InsightsPage {...props} />);
@@ -222,5 +223,60 @@ describe("InsightsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     await screen.findByText("Membership over time");
     expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(2);
+  });
+
+  it("shows aggregate ZIP attrition with a fiscal-year selector and an unavailable source state", async () => {
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", true)], zip_attrition: [{ fy: 2026, zip: "10024", start_households: 8, exits: 2, attrition_rate: 25 }] } });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("ZIP attrition");
+    expect(screen.getByRole("combobox", { name: "Fiscal year" })).toBeTruthy();
+    expect(screen.getByRole("img", { name: "New York ZIP attrition map for FY2026" })).toBeTruthy();
+    expect(screen.getByText("10024")).toBeTruthy();
+    expect(screen.getByText("25%")).toBeTruthy();
+
+    cleanup();
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", false)] } });
+    render(<InsightsPage {...props} />);
+    expect(await screen.findByText(/ZIP attrition is unavailable/)).toBeTruthy();
+  });
+
+  it.each(["Overview", "Jobs", "Renewal & Engagement", "Risk"])("lays out the aggregate report before exporting from %s", async (tab) => {
+    const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 800, height: 280 } as DOMRect);
+    mockInvoke({ export_insights_pdf: pending });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    fireEvent.click(screen.getByRole("button", { name: tab }));
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Download PDF report" }));
+
+    const surface = await screen.findByTestId("insights-pdf-surface");
+    expect(surface.contains(screen.getByText("Named Watch List").closest(".insights-screen-only"))).toBe(false);
+    expect(invoke.mock.calls.some(([command]) => command === "export_insights_pdf")).toBe(false);
+    await waitFor(() => expect(invoke.mock.calls.some(([command]) => command === "export_insights_pdf")).toBe(true));
+    rect.mockRestore();
+  });
+
+  it("reports an unready report surface without invoking the native PDF command", async () => {
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    vi.useFakeTimers();
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 0, height: 0 } as DOMRect);
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Download PDF report" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_100); });
+    expect(screen.getByText(/PDF could not be rendered/)).toBeTruthy();
+    expect(invoke.mock.calls.some(([command]) => command === "export_insights_pdf")).toBe(false);
+  });
+
+  it("surfaces a native PDF rendering failure without reporting an export path", async () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 800, height: 280 } as DOMRect);
+    mockInvoke({ export_insights_pdf: () => Promise.reject(new Error("webview print failed")) });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Download PDF report" }));
+
+    await screen.findByText(/webview print failed/);
+    expect(screen.queryByText(/Exported to/)).toBeNull();
   });
 });
