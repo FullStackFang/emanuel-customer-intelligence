@@ -671,9 +671,173 @@ pub fn kpis(hh: &[Hh], cur: i32, at_risk_count: i64) -> Kpis {
     }
 }
 
-/// Completed in Task 4; the stub keeps `views` compiling.
-pub fn at_risk_rows(_hh: &[Hh], _cur: i32) -> Vec<AtRiskRow> {
-    Vec::new()
+// ── at-risk rules (fixed in code; tuning is a code change on purpose) ───────
+
+const INTRO_TIERS: [&str; 3] = ["Young Adult Member", "Young Professionals", "Downtown"];
+
+pub fn at_risk_rows(hh: &[Hh], cur: i32) -> Vec<AtRiskRow> {
+    let idx = |k: &str| {
+        CHANNELS
+            .iter()
+            .position(|(key, _)| *key == k)
+            .expect("channel")
+    };
+    let (ns, rs) = (idx("nursery_school"), idx("religious_school"));
+    let mut out: Vec<AtRiskRow> = hh
+        .iter()
+        .filter(|h| h.is_current)
+        .filter_map(|h| {
+            let mut rules = Vec::new();
+            if h.join_fy == Some(cur - 1) {
+                rules.push("first_year");
+            }
+            if matches!(h.join_fy, Some(j) if j >= cur - 2) && h.ch[ns] && !h.ch[rs] && !h.rs_family
+            {
+                rules.push("new_ns_only");
+            }
+            if h.tier
+                .as_deref()
+                .map_or(false, |t| INTRO_TIERS.contains(&t))
+                && matches!(h.join_fy, Some(j) if cur - j >= 2)
+            {
+                rules.push("intro_tier_aging");
+            }
+            if h.rs_family
+                && h.active_rs_students == 0
+                && matches!(h.last_rs_year, Some(y) if y >= cur - 2 && y <= cur - 1)
+            {
+                rules.push("rs_ended");
+            }
+            if rules.is_empty() {
+                return None;
+            }
+            Some(AtRiskRow {
+                account_id: h.account_id.clone(),
+                name: h.name.clone().unwrap_or_default(),
+                tier: h.tier.clone(),
+                join_fy: h.join_fy,
+                rules: rules.into_iter().map(String::from).collect(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.rules.len().cmp(&a.rules.len()).then(a.name.cmp(&b.name)));
+    out
+}
+
+pub fn at_risk(store: &Store, cur: i32) -> Result<Vec<AtRiskRow>> {
+    Ok(at_risk_rows(&load(store)?, cur))
+}
+
+// ── CSV ─────────────────────────────────────────────────────────────────────
+
+pub const VIEWS: [&str; 7] = [
+    "trend",
+    "year1",
+    "cohort_matrix",
+    "channels",
+    "school",
+    "reasons",
+    "at_risk",
+];
+
+fn csv_cell(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn csv(header: &[&str], rows: Vec<Vec<String>>) -> (String, usize) {
+    let mut out = header.join(",");
+    out.push('\n');
+    let n = rows.len();
+    for r in rows {
+        out.push_str(&r.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
+    (out, n)
+}
+
+/// Render one view as CSV text. Returns (text, number of data rows).
+pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(String, usize)> {
+    let s = |v: &dyn std::fmt::Display| v.to_string();
+    Ok(match view {
+        "trend" => csv(
+            &["fy", "joins", "resigns", "active_end_of_fy"],
+            ins.trend
+                .iter()
+                .map(|r| vec![s(&r.fy), s(&r.joins), s(&r.resigns), s(&r.active_end_of_fy)])
+                .collect(),
+        ),
+        "year1" => csv(
+            &["cohort", "n", "pct_retained_1y"],
+            ins.year1
+                .iter()
+                .map(|r| vec![s(&r.cohort), s(&r.n), s(&r.pct_retained)])
+                .collect(),
+        ),
+        "cohort_matrix" => csv(
+            &["cohort", "n", "years_after", "pct_retained"],
+            ins.cohort_matrix
+                .iter()
+                .map(|r| vec![s(&r.cohort), s(&r.n), s(&r.k), s(&r.pct_retained)])
+                .collect(),
+        ),
+        "channels" => csv(
+            &[
+                "channel",
+                "households",
+                "still_members",
+                "pct",
+                "avg_tenure_years",
+                "left_within_2y",
+            ],
+            ins.channels
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.label.clone(),
+                        s(&r.n),
+                        s(&r.still_members),
+                        s(&r.pct),
+                        s(&r.avg_tenure),
+                        s(&r.left_within_2y),
+                    ]
+                })
+                .collect(),
+        ),
+        "school" => csv(
+            &["group", "households", "still_members", "pct"],
+            ins.school
+                .iter()
+                .map(|r| vec![r.group.clone(), s(&r.n), s(&r.still_members), s(&r.pct)])
+                .collect(),
+        ),
+        "reasons" => csv(
+            &["fy", "reason", "n"],
+            ins.reasons
+                .iter()
+                .map(|r| vec![s(&r.fy), r.reason.clone(), s(&r.n)])
+                .collect(),
+        ),
+        "at_risk" => csv(
+            &["account_id", "name", "tier", "join_fy", "rules"],
+            at_risk
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.account_id.clone(),
+                        r.name.clone(),
+                        r.tier.clone().unwrap_or_default(),
+                        r.join_fy.map(|v| v.to_string()).unwrap_or_default(),
+                        r.rules.join(";"),
+                    ]
+                })
+                .collect(),
+        ),
+        other => anyhow::bail!("unknown insights view: {other}"),
+    })
 }
 
 pub fn views(store: &Store, cur: i32) -> Result<Insights> {
@@ -1217,5 +1381,63 @@ mod tests {
         assert_eq!(v.kpis.members_now, 4);
         assert!(!v.trend.is_empty());
         assert!(v.year1.iter().any(|r| r.cohort == 2015 && r.n == 2));
+    }
+
+    #[test]
+    fn at_risk_rules_fire_with_reasons() {
+        let cur = 2026;
+        let mut ns_only = h("ns", true, Some(2025), None);
+        ns_only.name = Some("NS Only".into());
+        ns_only.ch = channel_flags(Some("Nursery School"));
+        let mut intro = h("yp", true, Some(2023), None);
+        intro.name = Some("Young Pro".into());
+        intro.tier = Some("Young Professionals".into());
+        let mut rs_done = h("rs", true, Some(2012), None);
+        rs_done.name = Some("RS Done".into());
+        rs_done.rs_family = true;
+        rs_done.active_rs_students = 0;
+        rs_done.last_rs_year = Some(2025);
+        let mut safe = h("ok", true, Some(2012), None);
+        safe.name = Some("Safe".into());
+        let mut gone = h("gone", false, Some(2025), Some(2026));
+        gone.name = Some("Gone".into());
+        let rows = at_risk_rows(&[ns_only, intro, rs_done, safe, gone], cur);
+        let get = |id: &str| {
+            rows.iter()
+                .find(|r| r.account_id == id)
+                .map(|r| r.rules.clone())
+        };
+        assert_eq!(
+            get("ns"),
+            Some(vec!["first_year".to_string(), "new_ns_only".to_string()])
+        );
+        assert_eq!(get("yp"), Some(vec!["intro_tier_aging".to_string()]));
+        assert_eq!(get("rs"), Some(vec!["rs_ended".to_string()]));
+        assert_eq!(get("ok"), None);
+        assert_eq!(get("gone"), None, "only current members can be at risk");
+        assert_eq!(rows[0].account_id, "ns", "most rules first");
+    }
+
+    #[test]
+    fn csv_renders_every_view_with_a_header() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let ins = views(&s, 2026).unwrap();
+        let ar = at_risk(&s, 2026).unwrap();
+        for v in VIEWS {
+            let (text, n) = to_csv(v, &ins, &ar).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(lines.len() >= 1, "{v} has a header");
+            assert_eq!(lines.len() - 1, n, "{v} row count matches");
+        }
+        let (t, _) = to_csv("trend", &ins, &ar).unwrap();
+        assert!(t.starts_with("fy,joins,resigns,active_end_of_fy\n"));
+        assert!(to_csv("nope", &ins, &ar).is_err());
+        let (t, n) = to_csv("at_risk", &ins, &ar).unwrap();
+        assert!(
+            n >= 1 && t.contains("Green"),
+            "NS-only recent joiner is at risk"
+        );
     }
 }
