@@ -704,15 +704,15 @@ fn household_year_rows(hh: &[Hh], through_fy: i32) -> Vec<HhFy> {
         .collect()
 }
 
-// ── Relationship Anchor ingestion (RECONCILE AT TASK 8.2) ───────────────────
+// ── Relationship Anchor ingestion ───────────────────────────────────────────
 //
 // The optional Salesforce objects (BillingStatement__c, BillingStatementLine__c,
-// Class_Enrolment__c, Committee_Membership__c) are not yet synced, so their real
-// column names, household join keys, and fiscal-year fields are unconfirmed. Every
-// schema assumption lives in the `*_FIELDS` candidate lists below. Each source is
-// capability-gated, so until an object is actually synced its anchors stay empty and
-// dependent views report unavailable. When the objects sync (task 8.2), verify each
-// candidate against `store.mirror_columns(object)` and adjust the lists as needed.
+// Class_Enrolment__c, Committee_Membership__c) were synced and their real schema
+// confirmed against the mirror on 2026-08-26 (task 8.2). The `*_FIELDS` lists below
+// are pinned to the confirmed columns; each `Cands` slice holds the real column name.
+// Each source stays capability-gated, so an unsynced object leaves its anchors empty
+// and dependent views report unavailable. If Salesforce renames one of these columns,
+// re-verify against `store.mirror_columns(object)` and update the matching list.
 
 type Cands = &'static [&'static str];
 
@@ -726,15 +726,12 @@ struct StatementFields {
 }
 const STATEMENT_FIELDS: StatementFields = StatementFields {
     id: &["Id"],
-    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
-    date: &[
-        "Statement_Date__c",
-        "Issued_Date__c",
-        "Date__c",
-        "CreatedDate",
-    ],
-    received: &["Amount_Received__c", "Received__c", "Paid__c"],
-    balance: &["Balance__c", "Amount_Outstanding__c", "Outstanding__c"],
+    household: &["Account__c"],
+    date: &["Date__c"],
+    // Statement-level eventual totals; there is no per-statement "received", so credits
+    // (payments applied) stand in for it and drive PartiallySettled vs Unsettled.
+    received: &["TotalCredits__c"],
+    balance: &["TotalBalance__c"],
 };
 
 /// Candidate columns for a billing statement line. `parent` links to the statement Id.
@@ -745,28 +742,32 @@ struct LineFields {
     amount: Cands,
 }
 const LINE_FIELDS: LineFields = LineFields {
-    parent: &[
-        "BillingStatement__c",
-        "Statement__c",
-        "Billing_Statement__c",
-    ],
-    product_family: &["Product_Family__c", "Family__c", "ProductFamily"],
-    product_name: &["Product_Name__c", "Product__c", "Name"],
-    amount: &["Amount__c", "Line_Amount__c", "Total__c"],
+    parent: &["BillingStatement__c"],
+    // Both family and name feed `dues_class`: the family groups the line ("Dues",
+    // "Gift", "Nursery"…) and the name separates security fees and tuition that also
+    // sit under the "Dues" family, so both must be the real product columns — not the
+    // record `Name`, which carries no product text.
+    product_family: &["Billing_PrimaryProductFamily__c"],
+    product_name: &["Billing_PrimaryProductName__c"],
+    amount: &["Charges__c"],
 };
 
-/// Candidate columns for a class enrolment.
+/// Candidate columns for a class enrolment. The school type comes from the source's
+/// authoritative `IsNursery__c` / `IsReligious__c` flags rather than a free-text name.
 struct EnrolmentFields {
     household: Cands,
-    school_name: Cands,
+    is_nursery: Cands,
+    is_religious: Cands,
     status: Cands,
     year: Cands,
 }
 const ENROLMENT_FIELDS: EnrolmentFields = EnrolmentFields {
-    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
-    school_name: &["Class_Name__c", "Program__c", "School__c", "Name"],
-    status: &["Status__c", "Enrolment_Status__c", "Enrollment_Status__c"],
-    year: &["School_Year__c", "Year__c", "Academic_Year__c"],
+    household: &["Account__c"],
+    is_nursery: &["IsNursery__c"],
+    is_religious: &["IsReligious__c"],
+    status: &["Status__c"],
+    // "2024-2025" school-year strings; `parse_rs_year` takes the end year.
+    year: &["Academic_Year__c"],
 };
 
 /// Candidate columns for a committee membership.
@@ -777,10 +778,10 @@ struct CommitteeFields {
     is_active: Cands,
 }
 const COMMITTEE_FIELDS: CommitteeFields = CommitteeFields {
-    household: &["Account__c", "Household__c", "Member__c", "AccountId"],
-    start: &["Start_Date__c", "Valid_From__c", "Effective_Date__c"],
-    end: &["End_Date__c", "Valid_To__c", "Expiration_Date__c"],
-    is_active: &["IsActive__c", "Active__c"],
+    household: &["Account__c"],
+    start: &["Member_From__c"],
+    end: &["Member_To__c"],
+    is_active: &["IsActive__c"],
 };
 
 /// First mirror column (case-insensitive) matching any candidate name.
@@ -793,6 +794,11 @@ fn resolve_col(columns: &[String], candidates: &[&str]) -> Option<String> {
 
 fn cap_available(caps: &[SourceCapability], key: &str) -> bool {
     caps.iter().any(|c| c.key == key && c.available)
+}
+
+/// A mirror boolean is stored as text; treat "true"/"1" as set.
+fn is_flag_set(value: Option<&str>) -> bool {
+    matches!(value, Some("true") | Some("1"))
 }
 
 /// Read a resolved field from a mirror row map.
@@ -891,7 +897,8 @@ fn apply_dues(store: &Store, rows: &mut [HhFy]) -> Result<()> {
 fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
     let cols = store.mirror_columns("Class_Enrolment__c")?;
     let hh = resolve_col(&cols, ENROLMENT_FIELDS.household);
-    let name = resolve_col(&cols, ENROLMENT_FIELDS.school_name);
+    let is_nursery = resolve_col(&cols, ENROLMENT_FIELDS.is_nursery);
+    let is_religious = resolve_col(&cols, ENROLMENT_FIELDS.is_religious);
     let status = resolve_col(&cols, ENROLMENT_FIELDS.status);
     let year = resolve_col(&cols, ENROLMENT_FIELDS.year);
     if hh.is_none() || year.is_none() {
@@ -906,7 +913,16 @@ fn apply_school(store: &Store, rows: &mut [HhFy]) -> Result<()> {
         let Some(fy) = parse_rs_year(field(&r, &year)) else {
             continue;
         };
-        let enrolment = normalize_enrollment(field(&r, &name), field(&r, &status));
+        // The source's own flags label the school type; hand the normalizer a canonical
+        // label instead of parsing a free-text class name.
+        let school_label = if is_flag_set(field(&r, &is_nursery)) {
+            Some("nursery")
+        } else if is_flag_set(field(&r, &is_religious)) {
+            Some("religious")
+        } else {
+            None
+        };
+        let enrolment = normalize_enrollment(school_label, field(&r, &status));
         let Some(idx) = index.get(&(account_id.to_string(), fy)) else {
             continue;
         };
@@ -3004,16 +3020,16 @@ mod tests {
             &[
                 "Id",
                 "Account__c",
-                "Statement_Date__c",
-                "Amount_Received__c",
-                "Balance__c",
+                "Date__c",
+                "TotalCredits__c",
+                "TotalBalance__c",
             ],
             &[row(&[
                 ("Id", "st1"),
                 ("Account__c", "accA"),
-                ("Statement_Date__c", "2024-09-01"),
-                ("Amount_Received__c", "1000"),
-                ("Balance__c", "0"),
+                ("Date__c", "2024-09-01"),
+                ("TotalCredits__c", "1000"),
+                ("TotalBalance__c", "0"),
             ])],
         );
         seed_object(
@@ -3022,16 +3038,19 @@ mod tests {
             &[
                 "Id",
                 "BillingStatement__c",
-                "Product_Family__c",
-                "Product_Name__c",
-                "Amount__c",
+                "Billing_PrimaryProductFamily__c",
+                "Billing_PrimaryProductName__c",
+                "Charges__c",
             ],
             &[row(&[
                 ("Id", "ln1"),
                 ("BillingStatement__c", "st1"),
-                ("Product_Family__c", "Membership"),
-                ("Product_Name__c", "Dues"),
-                ("Amount__c", "1000"),
+                ("Billing_PrimaryProductFamily__c", "Dues"),
+                (
+                    "Billing_PrimaryProductName__c",
+                    "Membership Dues (Unreserved)",
+                ),
+                ("Charges__c", "1000"),
             ])],
         );
         // School: A confirmed Religious School enrolment for the 2024-2025 year (FY2025).
@@ -3041,16 +3060,18 @@ mod tests {
             &[
                 "Id",
                 "Account__c",
-                "Class_Name__c",
+                "IsNursery__c",
+                "IsReligious__c",
                 "Status__c",
-                "School_Year__c",
+                "Academic_Year__c",
             ],
             &[row(&[
                 ("Id", "en1"),
                 ("Account__c", "accA"),
-                ("Class_Name__c", "Religious School Grade 3"),
+                ("IsNursery__c", "false"),
+                ("IsReligious__c", "true"),
                 ("Status__c", "Confirmed"),
-                ("School_Year__c", "2024-2025"),
+                ("Academic_Year__c", "2024-2025"),
             ])],
         );
         // Committee: B active from FY2025 with a far-future placeholder end date.
@@ -3060,15 +3081,15 @@ mod tests {
             &[
                 "Id",
                 "Account__c",
-                "Start_Date__c",
-                "End_Date__c",
+                "Member_From__c",
+                "Member_To__c",
                 "IsActive__c",
             ],
             &[row(&[
                 ("Id", "cm1"),
                 ("Account__c", "accB"),
-                ("Start_Date__c", "2024-06-01"),
-                ("End_Date__c", "2199-12-31"),
+                ("Member_From__c", "2024-06-01"),
+                ("Member_To__c", "2199-12-31"),
                 ("IsActive__c", "true"),
             ])],
         );
