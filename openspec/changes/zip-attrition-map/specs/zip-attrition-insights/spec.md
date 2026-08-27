@@ -1,11 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: ZIP-level fiscal-year attrition aggregates
-The system SHALL derive ZIP-level attrition aggregates from normalized five-digit `BillingPostalCode` values in the local Account mirror. For each supported completed fiscal year and eligible ZIP, it SHALL report the starting Membership Household count, completed membership-spell exits, and the attrition rate as exits divided by starting households.
+The system SHALL derive ZIP-level attrition aggregates from the normalized five-digit `AddressPostalCode__c` on the latest dated locally mirrored `BillingStatement__c` linked through `Account__c`, falling back to normalized five-digit `BillingPostalCode` values in the local Account mirror. For each supported completed fiscal year and eligible ZIP, it SHALL report the starting Membership Household count, completed membership-spell exits, and the attrition rate as exits divided by starting households.
 
 #### Scenario: ZIP+4 is normalized
-- **WHEN** a Membership Household has a locally mirrored `BillingPostalCode` of `10024-1234`
+- **WHEN** a Membership Household has a latest linked locally mirrored `AddressPostalCode__c` of `10024-1234`
 - **THEN** its aggregate geography is ZIP `10024` and no raw postal code is returned to the webview
+
+#### Scenario: Latest linked billing statement takes precedence
+- **WHEN** a Membership Household has a normalizable Account ZIP and multiple linked dated billing statements with normalizable postal codes
+- **THEN** its aggregate geography uses the postal code from the latest statement rather than the Account ZIP or an older statement
+
+#### Scenario: Account ZIP is the fallback
+- **WHEN** a Membership Household has no linked dated billing statement with a normalizable postal code and has a normalizable `BillingPostalCode`
+- **THEN** its aggregate geography uses the normalized Account ZIP
 
 #### Scenario: Exit rate uses the fiscal-year starting population
 - **WHEN** a ZIP has 40 Membership Households active at the beginning of FY2026 and 4 completed membership spells end during FY2026
@@ -13,14 +21,18 @@ The system SHALL derive ZIP-level attrition aggregates from normalized five-digi
 
 #### Scenario: Current postal geography is not presented as historical fact
 - **WHEN** staff view a ZIP aggregate for a completed fiscal year
-- **THEN** the view identifies the geography as based on the locally mirrored Account snapshot rather than an asserted address at exit
+- **THEN** the view identifies the geography as based on the locally mirrored billing-statement or Account snapshot rather than an asserted address at exit
 
 ### Requirement: Geographic source capability and privacy suppression
-The system SHALL make ZIP attrition unavailable when a usable local `BillingPostalCode` source is absent or withheld, and SHALL exclude any ZIP with fewer than five starting Membership Households before returning aggregate data to the webview.
+The system SHALL make ZIP attrition unavailable when neither the usable local `BillingStatement__c.AddressPostalCode__c` source nor the usable local `Account.BillingPostalCode` fallback is available, and SHALL exclude any ZIP with fewer than five starting Membership Households before returning aggregate data to the webview.
 
 #### Scenario: Postal source is unavailable
-- **WHEN** `BillingPostalCode` is missing, withheld, or contains no normalizable ZIP for the relevant population
+- **WHEN** both local postal sources are missing, withheld, or contain no normalizable ZIP for the relevant population
 - **THEN** Insights displays a geographic-source unavailable state and does not render a zero-valued map
+
+#### Scenario: Bill-to-other account link is not followed
+- **WHEN** a linked billing statement has `BilledToOtherAccountId__c` populated
+- **THEN** the statement postal code is attributed only through `Account__c`, and the bill-to-other identifier is neither followed nor returned to the webview
 
 #### Scenario: Sparse ZIP is suppressed
 - **WHEN** a ZIP has fewer than five Membership Households at the fiscal-year start
@@ -28,7 +40,7 @@ The system SHALL make ZIP attrition unavailable when a usable local `BillingPost
 
 #### Scenario: Aggregate map access does not reveal household identity
 - **WHEN** staff load ZIP attrition Insights
-- **THEN** the response and map contain only ZIP-level counts and rates, without household names, street addresses, coordinates, pins, or named-access audit events
+- **THEN** the response and map contain only ZIP-level counts and rates, without household names, raw postal codes, street addresses, bill-to-other identifiers, coordinates, pins, or named-access audit events
 
 ### Requirement: Offline New York ZIP map
 The system SHALL render eligible New York ZIP attrition aggregates against a packaged local boundary asset without a third-party map, tile, geocoding, or runtime network service. It SHALL provide an accessible table containing the same mapped aggregates.

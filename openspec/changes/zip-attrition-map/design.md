@@ -1,6 +1,6 @@
 ## Context
 
-Insights derives aggregate lifecycle views from the encrypted local Salesforce mirror and exposes them through fixed Rust commands. `reason_group` now correctly returns primary Exit Outcomes, but `ReasonsChart` still uses an obsolete fixed list of raw labels, folding every valid outcome into "Other." The mirror contains no historical address snapshots, and Salesforce access is read-only; a geography view must therefore use a locally mirrored Account postal-code field without geocoding or sending data outside the device.
+Insights derives aggregate lifecycle views from the encrypted local Salesforce mirror and exposes them through fixed Rust commands. `reason_group` now correctly returns primary Exit Outcomes, but `ReasonsChart` still uses an obsolete fixed list of raw labels, folding every valid outcome into "Other." The mirror has no historical address snapshots and Salesforce access is read-only. Its linked billing statements, however, provide a much more complete postal source (`BillingStatement__c.AddressPostalCode__c`) than `Account.BillingPostalCode`, so geography must use those locally mirrored fields without geocoding or sending data outside the device.
 
 The requested map is a New York ZIP-code choropleth. It must remain usable offline, show only aggregates, and make its snapshot-based geographic attribution clear.
 
@@ -16,7 +16,7 @@ The requested map is a New York ZIP-code choropleth. It must remain usable offli
 **Non-Goals:**
 
 - No household markers, addresses, drill-down lists, named exports, or new named-access audit events.
-- No geocoding, third-party maps/tiles, runtime network calls, or collection of additional Salesforce data beyond an opted-in mirrored Account postal-code field.
+- No geocoding, third-party maps/tiles, runtime network calls, or collection of additional Salesforce data beyond opted-in mirrored billing-statement and Account postal-code fields.
 - No claim that a ZIP or attrition association is causal, nor a reconstruction of historical addresses from a current mirror snapshot.
 - No nationwide map or non-New York ZIP shapes in this change.
 
@@ -30,17 +30,17 @@ The requested map is a New York ZIP-code choropleth. It must remain usable offli
 - **Alternative considered:** restore the old raw-label `reason_group` strings. Rejected because it would undo the authoritative multi-label/primary-outcome design.
 - **Alternative considered:** retain a fixed list and explicitly add outcome labels. Rejected because the next legitimate category change would reproduce the same failure.
 
-### Decision 2: Normalize an Account postal code locally and report a clear source capability
+### Decision 2: Normalize the latest linked billing-statement postal code locally, with an Account fallback
 
-The mart rebuild will inspect `BillingPostalCode` as an optional Account source field, retain only a normalized five-digit U.S. ZIP code, and mark the geography capability unavailable when the field is absent, withheld, empty, or cannot yield a five-digit ZIP. The raw postal code and street address are not returned to the webview.
+The mart rebuild will use the normalized five-digit U.S. ZIP from the latest dated `BillingStatement__c` linked through `Account__c` as the household geography. When no linked statement has a normalizable `AddressPostalCode__c`, it will fall back to `Account.BillingPostalCode`. A statement with no usable issue date cannot establish "latest" and therefore does not override the Account fallback. `BilledToOtherAccountId__c` is deliberately ignored: the statement ZIP remains attributed only to its `Account__c` link, rather than silently moving geography to another account. The geography capability is available when either locally mirrored source yields at least one normalizable ZIP. The raw postal code, any street address, and the bill-to-other identifier are never returned to the webview.
 
-- **Why:** `BillingPostalCode` is the standard Account-level source appropriate for a household aggregate. The normalization accepts ZIP+4 input but only retains the first five digits needed for the map.
+- **Why:** Salesforce inspection found normalizable billing-statement postal codes for 2,829 of 2,850 linked accounts (99.3%), materially improving coverage over the sparsely populated Account field. The normalization accepts ZIP+4 input but only retains the first five digits needed for the map.
 - **Alternative considered:** use compound address/location fields. Rejected because the existing Salesforce selector excludes address/location types and they expose more location detail than needed.
 - **Alternative considered:** geocode street addresses or use a remote map provider. Rejected for privacy, network, reliability, and data-governance reasons.
 
 ### Decision 3: Measure fiscal-year attrition by ZIP against the start-of-year household population
 
-For each available recent completed fiscal year and normalized ZIP, the backend will report: households active at the start of the fiscal year, completed membership spells ending during the fiscal year, and `exits / start_households * 100`, rounded consistently with other Insights percentages. A household belongs to the ZIP from its locally mirrored Account snapshot; the UI labels this as snapshot-based geography. The map defaults to the latest completed fiscal year and lets staff choose another available recent completed fiscal year.
+For each available recent completed fiscal year and normalized ZIP, the backend will report: households active at the start of the fiscal year, completed membership spells ending during the fiscal year, and `exits / start_households * 100`, rounded consistently with other Insights percentages. A household belongs to the ZIP from the latest linked locally mirrored billing-statement snapshot, with an Account snapshot fallback; the UI labels this as snapshot-based geography. The map defaults to the latest completed fiscal year and lets staff choose another available recent completed fiscal year.
 
 - **Why:** a rate prevents ZIPs with more households from appearing worse solely due to size; the starting population gives a meaningful fiscal-year denominator.
 - **Alternative considered:** map only exit counts. Rejected because counts conflate membership concentration with attrition.
@@ -65,11 +65,11 @@ The desktop bundle will include a simplified New York ZIP boundary asset rendere
 
 ## Migration Plan
 
-1. Add postal-code capability detection and normalized ZIP storage during mart rebuild; existing mirrors rebuild on the next Insights refresh, with no source write.
+1. Add billing-statement-first postal capability detection and normalized ZIP storage during mart rebuild; existing mirrors rebuild on the next Insights refresh, with no source write.
 2. Add aggregate ZIP attrition results to the aggregate Insights response, excluding suppressed and invalid ZIPs before serialization.
 3. Add the packaged boundary asset, fiscal-year selector, map, and equivalent aggregate table.
 4. Replace the obsolete fixed reason series with the returned dynamic groups.
-5. Test missing/withheld source, malformed and ZIP+4 values, suppression, fiscal-year math, chart series, and offline boundary rendering; run the existing Insights regression suite.
+5. Test billing-statement precedence, Account fallback, ignored bill-to-other links, missing/withheld source, malformed and ZIP+4 values, suppression, fiscal-year math, chart series, and offline boundary rendering; run the existing Insights regression suite.
 
 Rollback is code-only: reverting the change removes the map and restores the prior chart behavior. The optional normalized ZIP mart column is derived data in the encrypted local database and is rebuilt or dropped with the existing mart lifecycle.
 

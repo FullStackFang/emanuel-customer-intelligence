@@ -6,7 +6,7 @@ The resignation-reason chart maintains a separate, fixed list of labels, so a le
 
 - Make the exit-reason chart render the categories supplied by lifecycle analytics, preserving the primary Exit Outcome order when those outcomes are present and avoiding silent folding of newly returned groups into "Other."
 - Add a ZIP-level New York attrition view that reports fiscal-period resignation count, eligible starting-household count, and attrition rate; map color represents rate and tooltips also show the counts.
-- Derive a normalized five-digit ZIP only from an available locally mirrored Account ZIP/postal-code field; do not geocode, transmit address data, or display household pins or addresses.
+- Derive a normalized five-digit ZIP from the latest locally mirrored linked billing-statement postal code, falling back to an available locally mirrored Account ZIP/postal-code field; do not geocode, transmit address data, or display household pins or addresses.
 - Suppress ZIP aggregates below a privacy threshold and provide an explicit unavailable state when no usable ZIP source field is mirrored.
 - Package the New York ZIP boundary data with the desktop app so the map does not rely on a third-party map or tile service at runtime.
 

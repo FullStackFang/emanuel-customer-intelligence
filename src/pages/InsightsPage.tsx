@@ -4,7 +4,7 @@ import * as api from "../api";
 import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
-import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsChart, TableView, TrendChart, Year1Chart } from "./insights/charts";
+import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsHeatmap, TableView, TrendChart, Year1Chart } from "./insights/charts";
 import { NY_ZCTAS, ZipAttritionMap } from "./insights/ZipAttritionMap";
 import { EVIDENCE_LABELS, fmt, fyLabel, soWhat } from "./insights/format";
 
@@ -399,8 +399,8 @@ export default function InsightsPage({ status }: PageProps) {
             <CardHeader><CardTitle>Why people leave</CardTitle></CardHeader>
             {missing("Resign_Reason__c") ? <Unavailable column="Resign_Reason__c" /> : (
               <>
-                <Lede>Coded resignation reasons by fiscal year. Reasons outside the six most common fold into "Other".</Lede>
-                <ReasonsChart cells={ins.reasons} />
+                <Lede>Coded resignation reasons by fiscal year — each row a specific reason (most common on top), each column a year, darker cells more households. Affordability stays separate from disengagement, moving from death; only deaths, uncoded, and administrative exits fold into "Other / not actionable". Sparse coding shows as pale cells.</Lede>
+                <ReasonsHeatmap cells={ins.reasons} />
                 <SoWhat text={s!.reasons} />
                 <TableView rows={ins.reasons} getRowKey={(r) => `${r.fy}-${r.reason}`} columns={[
                   { key: "f", header: "Fiscal year", render: (r) => fyLabel(r.fy) },
@@ -453,11 +453,11 @@ export default function InsightsPage({ status }: PageProps) {
             <CardHeader><CardTitle>Exit Outcomes by tenure</CardTitle></CardHeader>
             {missing("Resign_Reason__c") ? <Unavailable column="Resign_Reason__c" /> : (
               <>
-                <Lede>Primary Exit Outcome of resigned households, grouped by how long they were members. Every recognized resignation reason is preserved; precedence only chooses the primary outcome shown here.</Lede>
+                <Lede>Resigned households grouped by how long they were members. The chart colors each exit by its family — addressable churn, conversion loss, structural exit, or not-actionable — while the table lists the specific reason. When a household names more than one reason, precedence picks a single primary.</Lede>
                 <OutcomeByTenureChart rows={ins.outcome_by_tenure} />
                 <TableView rows={ins.outcome_by_tenure} getRowKey={(r) => `${r.tenure_bucket}-${r.outcome}`} columns={[
                   { key: "t", header: "Tenure at exit", render: (r) => r.tenure_bucket },
-                  { key: "o", header: "Primary outcome", render: (r) => r.outcome },
+                  { key: "o", header: "Exit reason", render: (r) => r.outcome },
                   { key: "n", header: "Households", align: "right", render: (r) => fmt(r.n) },
                 ]} />
               </>
@@ -574,10 +574,10 @@ export default function InsightsPage({ status }: PageProps) {
               const mappedRows = rows.filter((row) => NY_ZCTAS.has(row.zip));
               const unmappedCount = rows.length - mappedRows.length;
               if (!zipCapability?.available || years.length === 0) {
-                return <Lede>ZIP attrition is unavailable because a usable BillingPostalCode source is not mirrored. Other Insights views remain available.</Lede>;
+                return <Lede>{`ZIP attrition is unavailable. ${zipCapability?.unavailable_reason ?? "A usable billing-statement or Account postal source is not mirrored."} Other Insights views remain available.`}</Lede>;
               }
               return <>
-                <Lede>Snapshot-based Account ZIP geography only. ZIPs with fewer than five starting households are suppressed; eligible ZIPs outside New York or without a packaged boundary are excluded from the map.</Lede>
+                <Lede>Snapshot-based geography from the latest linked billing statement ZIP, with an Account ZIP fallback. ZIPs with fewer than five starting households are suppressed; eligible ZIPs outside New York or without a packaged boundary are excluded from the map.</Lede>
                 <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", marginBottom: "var(--space-3)", fontSize: "var(--text-sm)" }}>
                   Fiscal year
                   <select aria-label="Fiscal year" value={selectedFy} onChange={(event) => setZipFy(Number(event.target.value))}>

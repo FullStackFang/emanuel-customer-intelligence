@@ -28,7 +28,7 @@ vi.mock("./insights/charts", () => {
   type Col = { key: string; render: (r: unknown) => React.ReactNode };
   return {
     TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N,
-    HBarChart: N, ReasonsChart: N, OutcomeByTenureChart: N, DuesChart: N,
+    HBarChart: N, ReasonsHeatmap: N, OutcomeByTenureChart: N, DuesChart: N,
     TableView: ({ rows, columns, getRowKey }: { rows: unknown[]; columns: Col[]; getRowKey: (r: unknown) => string }) => (
       <div data-testid="table">
         {rows.map((r) => (
@@ -58,7 +58,7 @@ const fakeInsights: api.Insights = {
   school: [{ group: "No school history", n: 50, still_members: 20, pct: 40 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 10 }],
   multi_job: [{ bucket: "1 job", jobs: 1, n: 30, still_members: 20, pct: 66.7, avg_tenure: 6 }],
-  outcome_by_tenure: [{ tenure_bucket: "1-2y", outcome: "Addressable Churn", n: 5 }],
+  outcome_by_tenure: [{ tenure_bucket: "1-2y", outcome: "No longer engaged", n: 5 }],
   school_progression: [{ group: "Nursery → Religious school", n: 8, still_members: 6, pct: 75 }],
   school_gap: [{ bucket: "0-1y", n: 4, still_members: 3, pct: 75 }],
   dues: [], anchor_type: [], anchor_count: [],
@@ -226,13 +226,18 @@ describe("InsightsPage", () => {
   });
 
   it("shows aggregate ZIP attrition with a fiscal-year selector and an unavailable source state", async () => {
-    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", true)], zip_attrition: [{ fy: 2026, zip: "10024", start_households: 8, exits: 2, attrition_rate: 25 }] } });
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", true)], zip_attrition: [{ fy: 2026, zip: "10024", start_households: 8, exits: 2, attrition_rate: 25 }, { fy: 2026, zip: "02108", start_households: 8, exits: 1, attrition_rate: 12.5 }, { fy: 2025, zip: "10024", start_households: 8, exits: 1, attrition_rate: 12.5 }] } });
     render(<InsightsPage {...props} />);
     await screen.findByText("ZIP attrition");
+    expect(screen.getByText(/latest linked billing statement ZIP, with an Account ZIP fallback/)).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "Fiscal year" })).toBeTruthy();
     expect(screen.getByRole("img", { name: "New York ZIP attrition map for FY2026" })).toBeTruthy();
+    expect(screen.getByLabelText("10024: 25% attrition; 2 exits from 8 starting households")).toBeTruthy();
     expect(screen.getByText("10024")).toBeTruthy();
     expect(screen.getByText("25%")).toBeTruthy();
+    expect(screen.getByText(/1 eligible ZIP is outside New York/)).toBeTruthy();
+    fireEvent.change(screen.getByRole("combobox", { name: "Fiscal year" }), { target: { value: "2025" } });
+    expect(screen.getByRole("img", { name: "New York ZIP attrition map for FY2025" })).toBeTruthy();
 
     cleanup();
     mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", false)] } });

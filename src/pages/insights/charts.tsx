@@ -157,23 +157,41 @@ export function HBarChart({ rows, emphasize }: { rows: HBarRow[]; emphasize?: st
   );
 }
 
-/** Primary Exit Outcomes, most-addressable first. Colors follow PALETTE.series. */
-export const OUTCOME_ORDER = [
-  "Addressable Churn",
-  "Conversion Loss",
-  "Structural Exit",
-  "Administrative or Unknown Exit",
-];
+/** Each fine reason's coarse family. The tenure chart colors by family (four
+    accessible hues); the specific reason is carried by the table beneath it. */
+const EXIT_FAMILY: Record<string, string> = {
+  "Non-payment": "Addressable churn",
+  "Financial hardship": "Addressable churn",
+  "No longer engaged": "Addressable churn",
+  "Displeased": "Addressable churn",
+  "Joined another synagogue": "Addressable churn",
+  "Aged out": "Conversion loss",
+  "Introductory tier ended": "Conversion loss",
+  "Moved": "Structural exit",
+  "Elderly / ill": "Structural exit",
+  "Other / not actionable": "Other / not actionable",
+};
+const FAMILY_ORDER = ["Addressable churn", "Conversion loss", "Structural exit", "Other / not actionable"];
+// Validated 4-way categorical set (dataviz scripts/validate_palette.js): blue / amber /
+// green clear the CVD floor with the legend + stacked-segment gaps as secondary
+// encoding; the not-actionable tail uses the neutral de-emphasis hue.
+const FAMILY_COLOR: Record<string, string> = {
+  "Addressable churn": "#3b6eb8",
+  "Conversion loss": "#d97706",
+  "Structural exit": "#059669",
+  "Other / not actionable": PALETTE.other,
+};
 const TENURE_ORDER = ["1-2y", "3-5y", "6-10y", "11+y"];
 
-/** Exit-outcome composition by tenure at exit: a stacked count per tenure band. */
+/** Exit composition by tenure at exit: a stacked count per tenure band, colored by
+    the four reason families. The specific reason sits in the table beneath it. */
 export function OutcomeByTenureChart({ rows }: { rows: OutcomeByTenureRow[] }) {
   const data = TENURE_ORDER.map((bucket) => {
     const row: Record<string, number | string> = { bucket };
-    for (const outcome of OUTCOME_ORDER) {
-      row[outcome] = rows
-        .filter((r) => r.tenure_bucket === bucket && r.outcome === outcome)
-        .reduce((a, r) => a + r.n, 0);
+    for (const family of FAMILY_ORDER) row[family] = 0;
+    for (const r of rows.filter((r) => r.tenure_bucket === bucket)) {
+      const family = EXIT_FAMILY[r.outcome] ?? "Other / not actionable";
+      row[family] = (row[family] as number) + r.n;
     }
     return row;
   });
@@ -185,8 +203,8 @@ export function OutcomeByTenureChart({ rows }: { rows: OutcomeByTenureRow[] }) {
         <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
         <Tooltip contentStyle={tooltipStyle} />
         <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
-        {OUTCOME_ORDER.map((o, i) => (
-          <Bar key={o} dataKey={o} stackId="a" fill={PALETTE.series[i]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1} radius={i === OUTCOME_ORDER.length - 1 ? [4, 4, 0, 0] : undefined} />
+        {FAMILY_ORDER.map((family, i) => (
+          <Bar key={family} dataKey={family} stackId="a" fill={FAMILY_COLOR[family]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1} radius={i === FAMILY_ORDER.length - 1 ? [4, 4, 0, 0] : undefined} />
         ))}
       </BarChart>
     </ResponsiveContainer>
@@ -212,37 +230,57 @@ export function DuesChart({ rows }: { rows: DuesRow[] }) {
   );
 }
 
-/** The lifecycle data contract defines the available series. Canonical outcomes lead;
-    later valid categories retain a stable alphabetical order. */
-export function reasonChartSeries(cells: ReasonCell[]) {
-  const categories = [...new Set(cells.map((cell) => cell.reason))].sort((a, b) => {
-    const aIndex = OUTCOME_ORDER.indexOf(a);
-    const bIndex = OUTCOME_ORDER.indexOf(b);
-    if (aIndex >= 0 || bIndex >= 0) return (aIndex < 0 ? Infinity : aIndex) - (bIndex < 0 ? Infinity : bIndex);
-    return a.localeCompare(b);
-  });
-  const data = [...new Set(cells.map((cell) => cell.fy))].sort().map((fy) => {
-    const row: Record<string, number | string> = { fy: fyLabel(fy) };
-    for (const cell of cells.filter((item) => item.fy === fy)) row[cell.reason] = cell.n;
-    return row;
-  });
-  return { categories, data };
+/** Total resignations per fine reason across the shown years, ranked high to low.
+    Reason identity is carried by the axis label, so every reason reads cleanly
+    without relying on color; the per-year split lives in the table beside it. */
+export function rankedReasons(cells: ReasonCell[]) {
+  const totals = new Map<string, number>();
+  for (const cell of cells) totals.set(cell.reason, (totals.get(cell.reason) ?? 0) + cell.n);
+  return [...totals.entries()]
+    .map(([reason, n]) => ({ reason, n }))
+    .sort((a, b) => b.n - a.n || a.reason.localeCompare(b.reason));
 }
 
-export function ReasonsChart({ cells }: { cells: ReasonCell[] }) {
-  const { categories, data } = reasonChartSeries(cells);
+/** Reasons over time: rows are the specific reasons (most common on top), columns
+    are fiscal years, and cell shade is the household count on a single-hue ramp
+    (darker = more). The count sits in each cell so identity and magnitude never
+    rely on color alone. */
+export function ReasonsHeatmap({ cells }: { cells: ReasonCell[] }) {
+  const reasons = rankedReasons(cells);
+  const years = [...new Set(cells.map((c) => c.fy))].sort((a, b) => a - b);
+  if (reasons.length === 0 || years.length === 0) return null;
+  const max = Math.max(1, ...cells.map((c) => c.n));
+  const at = (reason: string, fy: number) => cells.find((c) => c.reason === reason && c.fy === fy)?.n ?? 0;
+  const cell = { height: 30, borderRadius: "var(--radius-sm)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "var(--text-xs)", fontVariantNumeric: "tabular-nums" } as const;
   return (
-    <ResponsiveContainer width="100%" height={280}>
-      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="45%">
-        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
-        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
-        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} />
-        <Tooltip contentStyle={tooltipStyle} />
-        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
-        {categories.map((r, i) => (
-          <Bar key={r} dataKey={r} stackId="a" fill={PALETTE.series[i % PALETTE.series.length]} maxBarSize={24} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: `180px repeat(${years.length}, 1fr)`, gap: 2 }}>
+        <div />
+        {years.map((fy) => <div key={fy} style={{ textAlign: "center", fontSize: "var(--text-xs)", color: "var(--text-tertiary)" }}>{fyLabel(fy)}</div>)}
+        {reasons.map(({ reason, n }) => (
+          <Fragment key={reason}>
+            <div style={{ alignSelf: "center", textAlign: "right", paddingRight: 8, fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              {reason} <span style={{ color: "var(--text-tertiary)" }}>({fmt(n)})</span>
+            </div>
+            {years.map((fy) => {
+              const v = at(reason, fy);
+              if (v === 0) return <div key={`${reason}-${fy}`} style={cell} />;
+              const step = Math.round((v / max) * 6);
+              return (
+                <div key={`${reason}-${fy}`} title={`${reason} · ${fyLabel(fy)} · ${fmt(v)} household${v === 1 ? "" : "s"}`}
+                  style={{ ...cell, background: PALETTE.ramp[step], color: step >= 4 ? "#ffffff" : "var(--text-primary)" }}>
+                  {fmt(v)}
+                </div>
+              );
+            })}
+          </Fragment>
         ))}
-      </BarChart>
-    </ResponsiveContainer>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, fontSize: "var(--text-xs)", color: "var(--text-tertiary)" }}>
+        <span>0</span>
+        <div style={{ width: 160, height: 8, borderRadius: 4, background: `linear-gradient(90deg, ${PALETTE.ramp[0]}, ${PALETTE.ramp[6]})` }} />
+        <span>{fmt(max)}</span>
+      </div>
+    </div>
   );
 }

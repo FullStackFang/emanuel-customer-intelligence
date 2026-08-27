@@ -153,6 +153,43 @@ pub fn reason_group(raw: Option<&str>) -> &'static str {
     exit_outcome_label(outcome)
 }
 
+/// Presentation label for a resignation that cannot be tied to a specific,
+/// actionable exit reason: deaths, uncoded, and administrative resignations.
+pub const OTHER_EXIT: &str = "Other / not actionable";
+
+/// Precedence for choosing the single primary fine-grained exit reason from a
+/// multi-label resignation. Structural reasons win first (matching the family
+/// precedence in `reason_group`), then Conversion, then Addressable — resolved
+/// down to the specific reason. `Deceased`, uncoded, and administrative
+/// resignations fold into `OTHER_EXIT`.
+const EXIT_REASON_PRECEDENCE: [&str; 10] = [
+    "Moved",
+    "Elderly / ill",
+    "Deceased",
+    "Aged out",
+    "Introductory tier ended",
+    "Non-payment",
+    "Financial hardship",
+    "No longer engaged",
+    "Displeased",
+    "Joined another synagogue",
+];
+
+/// The single fine-grained exit reason surfaced for a resignation. Unlike
+/// `reason_group` (the four coarse Exit Outcomes the churn model depends on),
+/// this keeps the specific reason so staff can tell affordability from
+/// disengagement. `Deceased`, uncoded, and administrative reasons become
+/// `OTHER_EXIT`.
+pub fn exit_reason_primary(raw: Option<&str>) -> &'static str {
+    let labels = exit_labels(raw);
+    for candidate in EXIT_REASON_PRECEDENCE {
+        if labels.contains(&candidate) {
+            return if candidate == "Deceased" { OTHER_EXIT } else { candidate };
+        }
+    }
+    OTHER_EXIT
+}
+
 /// `LastYearAttendedRS__c` is "2025-2026" or "2007"; take the last 4-digit year.
 pub fn parse_rs_year(s: Option<&str>) -> Option<i32> {
     let s = s?.trim();
@@ -475,7 +512,7 @@ pub const MART_FY: &str = "_m_household_fy";
 
 /// Bumped whenever the mart column layout changes so that existing databases with an
 /// older `_m_household_fy`/`_m_household` schema are rebuilt rather than read as-is.
-pub const MART_SCHEMA_VERSION: i64 = 4;
+pub const MART_SCHEMA_VERSION: i64 = 6;
 
 /// Account columns the mart derives from. A missing one nulls what depends on it and is
 /// reported in `RebuildInfo::unavailable`; `Type` and `IsATempleMember__c` are mandatory.
@@ -578,15 +615,42 @@ pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
         })
         .collect::<Result<_>>()?;
     let account = objects.iter().find(|object| object.name == "Account");
-    let geo_available = account.is_some_and(|object| object.last_synced_at.is_some())
+    let account_field_available = account.is_some_and(|object| object.last_synced_at.is_some())
         && store.mirror_columns("Account")?.iter().any(|column| column == "BillingPostalCode")
         && store.allowed_fields("Account")?.contains("BillingPostalCode");
+    let account_zip_available = account_field_available && {
+        let mut statement = store.conn().prepare("SELECT \"BillingPostalCode\" FROM \"Account\" WHERE \"Type\" = 'Member Family'")?;
+        let values = statement.query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values.iter().any(|value| normalize_zip(value.as_deref()).is_some())
+    };
+    let statement_zip_available = !billing_statement_zips(store)?.is_empty();
+    let geo_available = statement_zip_available || account_zip_available;
+    let statement_object = objects.iter().find(|object| object.name == "BillingStatement__c");
+    let mut mirrored_columns = Vec::new();
+    if statement_zip_available {
+        mirrored_columns.push("BillingStatement__c.AddressPostalCode__c".into());
+    }
+    if account_zip_available {
+        mirrored_columns.push("Account.BillingPostalCode".into());
+    }
     capabilities.push(SourceCapability {
         key: "zip_attrition".into(), available: geo_available,
-        required_objects: vec!["Account".into()],
-        mirrored_columns: if geo_available { vec!["BillingPostalCode".into()] } else { Vec::new() },
-        last_synced_at: geo_available.then(|| account.and_then(|object| object.last_synced_at.clone())).flatten(),
-        unavailable_reason: (!geo_available).then(|| "Select and sync Account BillingPostalCode to enable ZIP attrition.".into()),
+        required_objects: vec!["BillingStatement__c".into(), "Account".into()],
+        mirrored_columns,
+        last_synced_at: geo_available.then(|| {
+            [statement_object, account]
+                .into_iter()
+                .flatten()
+                .filter_map(|object| object.last_synced_at.clone())
+                .max()
+        }).flatten(),
+        unavailable_reason: (!geo_available).then(|| if account_field_available
+            || statement_object.is_some_and(|object| object.last_synced_at.is_some()) {
+            "Billing statement and Account postal sources have no normalizable five-digit ZIP values for member households.".into()
+        } else {
+            "Select and sync BillingStatement__c AddressPostalCode__c or Account BillingPostalCode to enable ZIP attrition.".into()
+        }),
     });
     Ok(capabilities)
 }
@@ -607,7 +671,7 @@ pub struct Hh {
     pub tier: Option<String>,
     pub category: Option<String>,
     pub join_reason: Option<String>,
-    /// Normalized five-digit ZIP derived locally from BillingPostalCode. Never raw postal data.
+    /// Normalized five-digit ZIP derived locally from a billing statement, with Account fallback. Never raw postal data.
     pub zip: Option<String>,
     pub ch: [bool; 12],
     pub rs_family: bool,
@@ -615,6 +679,10 @@ pub struct Hh {
     pub active_rs_students: i64,
     pub last_rs_year: Option<i32>,
     pub resign_reason_group: String,
+    /// Single primary fine-grained exit reason for presentation (see
+    /// `exit_reason_primary`). "(not coded)" for current members. Distinct from
+    /// `resign_reason_group`, which the churn model owns.
+    pub exit_reason: String,
 }
 
 fn mart_ddl() -> String {
@@ -631,7 +699,7 @@ fn mart_ddl() -> String {
            resigned_unknown_date INTEGER NOT NULL, bad_join_date INTEGER NOT NULL, rejoined INTEGER NOT NULL,
            tier TEXT, category TEXT, join_reason TEXT, zip TEXT, {flags},
            rs_family INTEGER NOT NULL, ns_family INTEGER NOT NULL, active_rs_students INTEGER NOT NULL,
-           last_rs_year INTEGER, resign_reason_group TEXT NOT NULL)"
+           last_rs_year INTEGER, resign_reason_group TEXT NOT NULL, exit_reason TEXT NOT NULL)"
     )
 }
 
@@ -694,6 +762,11 @@ fn derive(raw: &[Option<String>; 16], zip: Option<String>) -> Hh {
         } else {
             reason_group(resign_reason.as_deref()).to_string()
         },
+        exit_reason: if is_current {
+            "(not coded)".into()
+        } else {
+            exit_reason_primary(resign_reason.as_deref()).to_string()
+        },
     }
 }
 
@@ -706,7 +779,7 @@ fn mart_fy_ddl() -> String {
     format!("CREATE TABLE _m_household_fy(
        account_id TEXT NOT NULL, fy INTEGER NOT NULL,
        active_end_of_fy INTEGER NOT NULL, joined_this_fy INTEGER NOT NULL, resigned_this_fy INTEGER NOT NULL,
-       tenure_years INTEGER, exit_outcome TEXT, entry_job_count INTEGER NOT NULL, {entry_jobs},
+       tenure_years INTEGER, exit_reason TEXT, entry_job_count INTEGER NOT NULL, {entry_jobs},
        anchor_dues INTEGER NOT NULL DEFAULT 0, anchor_nursery INTEGER NOT NULL DEFAULT 0,
        anchor_religious INTEGER NOT NULL DEFAULT 0, anchor_committee INTEGER NOT NULL DEFAULT 0,
        dues_coverage_missing INTEGER NOT NULL DEFAULT 0, dues_settlement TEXT,
@@ -723,7 +796,7 @@ pub struct HhFy {
     pub joined_this_fy: bool,
     pub resigned_this_fy: bool,
     pub tenure_years: Option<i32>,
-    pub exit_outcome: Option<String>,
+    pub exit_reason: Option<String>,
     pub entry_job_count: i64,
     pub entry_jobs: [bool; 12],
     // Relationship Anchors observed in this fiscal year (populated by the optional
@@ -777,10 +850,10 @@ fn household_year_rows(hh: &[Hh], through_fy: i32) -> Vec<HhFy> {
                     joined_this_fy: household.join_fy == Some(fy),
                     resigned_this_fy: household.resign_fy == Some(fy),
                     tenure_years: Some(fy - join_fy + 1),
-                    exit_outcome: household
+                    exit_reason: household
                         .resign_fy
                         .filter(|resign_fy| *resign_fy == fy)
-                        .map(|_| household.resign_reason_group.clone()),
+                        .map(|_| household.exit_reason.clone()),
                     entry_job_count: household.ch.iter().filter(|flag| **flag).count() as i64,
                     entry_jobs: household.ch,
                     // Anchors come from the optional mirror sources, applied after this base.
@@ -808,11 +881,13 @@ struct StatementFields {
     id: Cands,
     household: Cands,
     date: Cands,
+    postal: Cands,
 }
 const STATEMENT_FIELDS: StatementFields = StatementFields {
     id: &["Id"],
     household: &["Account__c"],
     date: &["Date__c"],
+    postal: &["AddressPostalCode__c"],
 };
 
 /// Candidate columns for a billing statement line. `parent` links to the statement Id.
@@ -898,6 +973,62 @@ fn field<'a>(
         .and_then(|v| v.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// The date component of a statement issue timestamp. Unlike `fy_of`, this accepts
+/// any valid statement date because source ordering must not depend on the reporting
+/// fiscal-year window.
+fn statement_issue_date(value: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value.get(0..10)?, "%Y-%m-%d").ok()
+}
+
+/// Latest normalizable billing-statement ZIP by its direct Account link. The
+/// BilledToOtherAccountId__c field is intentionally never read: it is a bill-to
+/// routing attribute, not a household-geography relationship.
+fn billing_statement_zips(store: &Store) -> Result<std::collections::HashMap<String, String>> {
+    let columns = store.mirror_columns("BillingStatement__c")?;
+    let household = resolve_col(&columns, STATEMENT_FIELDS.household);
+    let date = resolve_col(&columns, STATEMENT_FIELDS.date);
+    let postal = resolve_col(&columns, STATEMENT_FIELDS.postal);
+    let id = resolve_col(&columns, STATEMENT_FIELDS.id);
+    let allowed = store.allowed_fields("BillingStatement__c")?;
+    let usable = [household.as_ref(), date.as_ref(), postal.as_ref(), id.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|column| allowed.contains(column));
+    if !usable || household.is_none() || date.is_none() || postal.is_none() || id.is_none() {
+        return Ok(Default::default());
+    }
+
+    let mut latest: std::collections::HashMap<String, (chrono::NaiveDate, String, String)> = Default::default();
+    for row in store.mirror_rows("BillingStatement__c")? {
+        let (Some(account_id), Some(issued_at), Some(zip), Some(id)) = (
+            field(&row, &household),
+            field(&row, &date).and_then(statement_issue_date),
+            normalize_zip(field(&row, &postal)),
+            field(&row, &id),
+        ) else {
+            continue;
+        };
+        let candidate = (issued_at, id.to_string(), zip);
+        let replace = latest
+            .get(account_id)
+            .is_none_or(|current| (candidate.0, candidate.1.as_str()) > (current.0, current.1.as_str()));
+        if replace {
+            latest.insert(account_id.to_string(), candidate);
+        }
+    }
+    Ok(latest.into_iter().map(|(account_id, (_, _, zip))| (account_id, zip)).collect())
+}
+
+fn apply_billing_statement_zips(store: &Store, households: &mut [Hh]) -> Result<()> {
+    let billing_zips = billing_statement_zips(store)?;
+    for household in households {
+        if let Some(zip) = billing_zips.get(&household.account_id) {
+            household.zip = Some(zip.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Populate Relationship Anchors on the household-year rows from the optional mirror
@@ -1175,6 +1306,8 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
         }
         out
     };
+    let mut rows = rows;
+    apply_billing_statement_zips(store, &mut rows)?;
 
     progress.phase("Building yearly membership history");
     let mut household_fy = household_year_rows(&rows, current_fy());
@@ -1202,8 +1335,8 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
         let mut st = tx.prepare(&format!(
             "INSERT INTO {MART}(account_id, name, is_current, is_resigned, join_fy, cohort_fy, resign_fy,
                resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, zip, {flag_cols},
-               rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?)"
+               rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group, exit_reason)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,{flag_marks},?,?,?,?,?,?)"
         ))?;
         for h in &rows {
             let mut vals: Vec<rusqlite::types::Value> = vec![
@@ -1229,6 +1362,7 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
                 h.active_rs_students.into(),
                 h.last_rs_year.into(),
                 h.resign_reason_group.clone().into(),
+                h.exit_reason.clone().into(),
             ]);
             st.execute(rusqlite::params_from_iter(vals.iter()))?;
             written += 1;
@@ -1244,7 +1378,7 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
         let flag_marks = vec!["?"; CHANNELS.len()].join(", ");
         let mut st = tx.prepare(&format!(
             "INSERT INTO _m_household_fy(account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
-             tenure_years, exit_outcome, entry_job_count, {flag_cols},
+             tenure_years, exit_reason, entry_job_count, {flag_cols},
              anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
              dues_coverage_missing, dues_settlement,
              renewal_observed, school_observed, committee_observed)
@@ -1258,7 +1392,7 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
                 (row.joined_this_fy as i64).into(),
                 (row.resigned_this_fy as i64).into(),
                 row.tenure_years.into(),
-                row.exit_outcome.clone().into(),
+                row.exit_reason.clone().into(),
                 row.entry_job_count.into(),
             ];
             values.extend(row.entry_jobs.iter().map(|flag| (*flag as i64).into()));
@@ -1310,7 +1444,7 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
     let mut st = store.conn().prepare(&format!(
         "SELECT account_id, name, is_current, is_resigned, join_fy, cohort_fy, resign_fy,
                 resigned_unknown_date, bad_join_date, rejoined, tier, category, join_reason, zip, {flag_cols},
-                rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group
+                rs_family, ns_family, active_rs_students, last_rs_year, resign_reason_group, exit_reason
          FROM {MART}"
     ))?;
     let rows = st.query_map([], |r| {
@@ -1339,6 +1473,7 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
             active_rs_students: r.get(28)?,
             last_rs_year: r.get(29)?,
             resign_reason_group: r.get(30)?,
+            exit_reason: r.get(31)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1901,7 +2036,7 @@ pub fn outcome_by_tenure(hh: &[Hh], cur: i32) -> Vec<OutcomeByTenureRow> {
     for h in hh.iter().filter(|h| !h.is_current && h.is_resigned) {
         let bucket = tenure_bucket_index(tenure_years(h, cur));
         *counts
-            .entry((bucket, h.resign_reason_group.clone()))
+            .entry((bucket, h.exit_reason.clone()))
             .or_default() += 1;
     }
     counts
@@ -2579,6 +2714,69 @@ mod tests {
     }
 
     #[test]
+    fn zip_capability_requires_an_allowed_field_with_at_least_one_normalizable_value() {
+        let (_d, mut s) = mem();
+        let mut rows = fixture();
+        for row in &mut rows {
+            row.insert("BillingPostalCode".into(), serde_json::Value::String("not a ZIP".into()));
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        assert!(!zip.available);
+        assert!(zip.unavailable_reason.unwrap().contains("normalizable"));
+
+        s.conn().execute("UPDATE \"Account\" SET \"BillingPostalCode\" = '10024-1234' WHERE \"Id\" = '001A'", []).unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        assert!(zip.available);
+
+        s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        assert!(!zip.available);
+    }
+
+    #[test]
+    fn billing_statement_zip_uses_the_latest_linked_statement_and_falls_back_to_account() {
+        let (_d, mut s) = mem();
+        let mut accounts = fixture();
+        accounts[0].insert("BillingPostalCode".into(), serde_json::Value::String("10001".into()));
+        accounts[1].insert("BillingPostalCode".into(), serde_json::Value::String("10002".into()));
+        let mut account_cols = ACCT_COLS.to_vec();
+        account_cols.push("BillingPostalCode");
+        seed_account(&mut s, &accounts, &account_cols);
+        seed_object(
+            &mut s,
+            "BillingStatement__c",
+            &["Id", "Account__c", "Date__c", "AddressPostalCode__c", "BilledToOtherAccountId__c"],
+            &[
+                row(&[("Id", "old"), ("Account__c", "001A"), ("Date__c", "2024-06-01"), ("AddressPostalCode__c", "11224")]),
+                row(&[("Id", "new"), ("Account__c", "001A"), ("Date__c", "2025-06-01"), ("AddressPostalCode__c", "11235"), ("BilledToOtherAccountId__c", "001B")]),
+                row(&[("Id", "undated"), ("Account__c", "001B"), ("AddressPostalCode__c", "10038")]),
+            ],
+        );
+
+        let zips = billing_statement_zips(&s).unwrap();
+        assert_eq!(zips.get("001A"), Some(&"11235".to_string()));
+        assert!(!zips.contains_key("001B"));
+
+        rebuild(&mut s).unwrap();
+        let a_zip: Option<String> = s.conn().query_row(
+            "SELECT zip FROM _m_household WHERE account_id = '001A'", [], |row| row.get(0),
+        ).unwrap();
+        let b_zip: Option<String> = s.conn().query_row(
+            "SELECT zip FROM _m_household WHERE account_id = '001B'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(a_zip.as_deref(), Some("11235"));
+        assert_eq!(b_zip.as_deref(), Some("10002"));
+
+        s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        assert!(zip.available);
+    }
+
+    #[test]
     fn zip_attrition_uses_starting_households_and_suppresses_small_cells() {
         let households = (0..5).map(|i| Hh {
             account_id: format!("ny-{i}"), zip: Some("10024".to_string()), join_fy: Some(2024),
@@ -2595,6 +2793,40 @@ mod tests {
             ZipAttritionCell { fy: 2025, zip: "10024".into(), start_households: 5, exits: 0, attrition_rate: 0.0 },
             ZipAttritionCell { fy: 2026, zip: "10024".into(), start_households: 5, exits: 1, attrition_rate: 20.0 },
         ]);
+    }
+
+    #[test]
+    fn zip_attrition_retains_eligible_non_new_york_zips_for_the_ui_to_label_unmapped() {
+        let households = (0..5).map(|index| Hh {
+            account_id: format!("ma-{index}"), zip: Some("02108".to_string()), join_fy: Some(2024),
+            ..Default::default()
+        }).collect::<Vec<_>>();
+        assert!(zip_attrition(&households, 2027).iter().any(|cell| cell.fy == 2026 && cell.zip == "02108" && cell.start_households == 5));
+    }
+
+    #[test]
+    fn zip_views_expose_only_aggregate_cells_and_become_unavailable_when_withheld() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..5 {
+            let mut row = fixture()[0].clone();
+            row.insert("Id".into(), serde_json::Value::String(format!("zip-{index}")));
+            row.insert("BillingPostalCode".into(), serde_json::Value::String("10024-1234".into()));
+            rows.push(row);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        rebuild(&mut s).unwrap();
+        let view = views(&s, 2027).unwrap();
+        assert!(view.zip_attrition.iter().any(|cell| cell.zip == "10024" && cell.start_households == 5));
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("10024-1234") && !json.contains("zip-0"));
+
+        s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
+        let view = views(&s, 2027).unwrap();
+        assert!(view.zip_attrition.is_empty());
+        assert!(!view.capabilities.iter().find(|capability| capability.key == "zip_attrition").unwrap().available);
     }
 
     #[test]
@@ -2659,6 +2891,24 @@ mod tests {
         assert_eq!(reason_group(Some("Moved; Non-payment")), "Structural Exit");
         assert_eq!(reason_group(Some("Aged out")), "Conversion Loss");
         assert_eq!(reason_group(Some("")), "Administrative or Unknown Exit");
+    }
+
+    #[test]
+    fn exit_reason_primary_keeps_the_fine_reason_with_structural_precedence() {
+        // Affordability and disengagement stay distinct — the whole point of the split.
+        assert_eq!(exit_reason_primary(Some("Financial Hardship")), "Financial hardship");
+        assert_eq!(exit_reason_primary(Some("No Longer Engaged")), "No longer engaged");
+        // Conversion reasons are told apart from each other.
+        assert_eq!(exit_reason_primary(Some("Aged out")), "Aged out");
+        assert_eq!(exit_reason_primary(Some("Introductory tier")), "Introductory tier ended");
+        // Structural wins on a mixed reason, resolved to the specific reason.
+        assert_eq!(exit_reason_primary(Some("Moved; Non-payment")), "Moved");
+        assert_eq!(exit_reason_primary(Some("Elderly / Ill")), "Elderly / ill");
+        // Deceased, uncoded, and administrative all fold into the not-actionable tail.
+        assert_eq!(exit_reason_primary(Some("Deceased")), OTHER_EXIT);
+        assert_eq!(exit_reason_primary(Some("Administrative")), OTHER_EXIT);
+        assert_eq!(exit_reason_primary(Some("")), OTHER_EXIT);
+        assert_eq!(exit_reason_primary(None), OTHER_EXIT);
     }
 
     #[test]
@@ -3259,7 +3509,7 @@ mod tests {
                 && row.fy == 2020
                 && row.resigned_this_fy
                 && !row.active_end_of_fy
-                && row.exit_outcome.as_deref() == Some("Addressable Churn")
+                && row.exit_reason.as_deref() == Some("Non-payment")
         }));
     }
 
@@ -4209,19 +4459,19 @@ mod tests {
     #[test]
     fn outcome_by_tenure_buckets_exits_by_tenure_at_exit() {
         let mut a = h("a", false, Some(2018), Some(2019)); // 1 year tenure
-        a.resign_reason_group = "Addressable Churn".into();
+        a.exit_reason = "No longer engaged".into();
         let mut b = h("b", false, Some(2010), Some(2018)); // 8 years
-        b.resign_reason_group = "Structural Exit".into();
+        b.exit_reason = "Moved".into();
         let mut c = h("c", false, Some(2000), Some(2020)); // 20 years
-        c.resign_reason_group = "Addressable Churn".into();
+        c.exit_reason = "Displeased".into();
         let rows = outcome_by_tenure(&[a, b, c], 2026);
         let has = |bucket: &str, outcome: &str| {
             rows.iter()
                 .any(|r| r.tenure_bucket == bucket && r.outcome == outcome && r.n == 1)
         };
-        assert!(has("1-2y", "Addressable Churn"));
-        assert!(has("6-10y", "Structural Exit"));
-        assert!(has("11+y", "Addressable Churn"));
+        assert!(has("1-2y", "No longer engaged"));
+        assert!(has("6-10y", "Moved"));
+        assert!(has("11+y", "Displeased"));
     }
 
     #[test]
@@ -4425,9 +4675,9 @@ pub fn reasons_from_household_years(rows: &[HhFy], cur: i32) -> Vec<ReasonCell> 
         *counts
             .entry((
                 row.fy,
-                row.exit_outcome
+                row.exit_reason
                     .clone()
-                    .unwrap_or_else(|| "Administrative or Unknown Exit".into()),
+                    .unwrap_or_else(|| OTHER_EXIT.into()),
             ))
             .or_default() += 1;
     }
@@ -4445,7 +4695,7 @@ pub fn load_household_years(store: &Store) -> Result<Vec<HhFy>> {
         .join(", ");
     let mut st = store.conn().prepare(&format!(
         "SELECT account_id, fy, active_end_of_fy, joined_this_fy, resigned_this_fy,
-         tenure_years, exit_outcome, entry_job_count, {flag_cols},
+         tenure_years, exit_reason, entry_job_count, {flag_cols},
          anchor_dues, anchor_nursery, anchor_religious, anchor_committee,
          dues_coverage_missing, dues_settlement,
          renewal_observed, school_observed, committee_observed
@@ -4464,7 +4714,7 @@ pub fn load_household_years(store: &Store) -> Result<Vec<HhFy>> {
             joined_this_fy: row.get::<_, i64>(3)? != 0,
             resigned_this_fy: row.get::<_, i64>(4)? != 0,
             tenure_years: row.get(5)?,
-            exit_outcome: row.get(6)?,
+            exit_reason: row.get(6)?,
             entry_job_count: row.get(7)?,
             entry_jobs,
             anchor_dues: row.get::<_, i64>(anchor)? != 0,
