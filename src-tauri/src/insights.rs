@@ -4,8 +4,9 @@
 use crate::progress::{noop, Reporter};
 use crate::store::{ident, Store};
 use anyhow::Result;
-use rusqlite::params;
-use serde::Serialize;
+use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// First month of the fiscal year (June). FY is labeled by the calendar year it ends in.
 pub const FY_START_MONTH: u32 = 6;
@@ -510,9 +511,46 @@ pub fn normalize_committee(
 pub const MART: &str = "_m_household";
 pub const MART_FY: &str = "_m_household_fy";
 
-/// Bumped whenever the mart column layout changes so that existing databases with an
-/// older `_m_household_fy`/`_m_household` schema are rebuilt rather than read as-is.
-pub const MART_SCHEMA_VERSION: i64 = 6;
+/// Bumped only when the mart's *derivation logic* changes without touching its column
+/// layout — e.g. how an existing column's value is computed. Layout changes are picked up
+/// automatically by `mart_schema_fingerprint` (they alter the DDL), so this is rarely
+/// touched; it exists because a hash of the DDL cannot see a change to Rust logic alone.
+const LOGIC_REVISION: i64 = 1;
+
+/// A fingerprint of the mart's *shape*: the two table DDLs plus the column and source lists
+/// they are built from. It is stored in `_meta` at each rebuild and compared on load, so any
+/// change to the mart layout forces exactly one rebuild and an unchanged layout never does.
+/// This replaces a hand-maintained version integer, which could be forgotten (silently
+/// serving stale-shape data) or churned across branches (needless rebuilds every launch).
+pub fn mart_schema_fingerprint() -> String {
+    let ddl = mart_ddl();
+    let fy = mart_fy_ddl();
+    let required = REQUIRED_COLUMNS.join(",");
+    let sources = MART_SOURCE_OBJECTS.join(",");
+    let channels = CHANNELS.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(",");
+    let logic = LOGIC_REVISION.to_string();
+    schema_fingerprint_of(&[
+        ddl.as_str(),
+        fy.as_str(),
+        required.as_str(),
+        sources.as_str(),
+        channels.as_str(),
+        logic.as_str(),
+    ])
+}
+
+/// Pure core of `mart_schema_fingerprint`: hash the parts, whitespace-insensitively, so
+/// reformatting a DDL string never triggers a rebuild. A `\0` separates the parts so that
+/// moving text across a boundary still changes the hash. Truncated to 8 bytes (16 hex
+/// chars): ample to make an accidental collision between two real layouts implausible.
+fn schema_fingerprint_of(parts: &[&str]) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.split_whitespace().collect::<Vec<_>>().join(" "));
+        h.update(b"\0");
+    }
+    hex::encode(&h.finalize()[..8])
+}
 
 /// Account columns the mart derives from. A missing one nulls what depends on it and is
 /// reported in `RebuildInfo::unavailable`; `Type` and `IsATempleMember__c` are mandatory.
@@ -535,13 +573,13 @@ pub const REQUIRED_COLUMNS: [&str; 16] = [
     "LastYearAttendedRS__c",
 ];
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RebuildInfo {
     pub households: usize,
     pub unavailable: Vec<String>,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SourceCapability {
     pub key: String,
     pub available: bool,
@@ -615,16 +653,16 @@ pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
         })
         .collect::<Result<_>>()?;
     let account = objects.iter().find(|object| object.name == "Account");
+    // Policy (cheap catalog reads): is each postal source synced, mirrored, and not withheld?
     let account_field_available = account.is_some_and(|object| object.last_synced_at.is_some())
         && store.mirror_columns("Account")?.iter().any(|column| column == "BillingPostalCode")
         && store.allowed_fields("Account")?.contains("BillingPostalCode");
-    let account_zip_available = account_field_available && {
-        let mut statement = store.conn().prepare("SELECT \"BillingPostalCode\" FROM \"Account\" WHERE \"Type\" = 'Member Family'")?;
-        let values = statement.query_map([], |row| row.get::<_, Option<String>>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        values.iter().any(|value| normalize_zip(value.as_deref()).is_some())
-    };
-    let statement_zip_available = !billing_statement_zips(store)?.is_empty();
+    let statement_field_available = statement_zip_columns(store)?.is_some();
+    // Data (expensive full scans): does either source hold a normalizable ZIP? Derived once per
+    // build and per policy state, never on the read path.
+    let facts = geo_source_facts(store, account_field_available, statement_field_available)?;
+    let account_zip_available = facts.account_zip;
+    let statement_zip_available = facts.statement_zip;
     let geo_available = statement_zip_available || account_zip_available;
     let statement_object = objects.iter().find(|object| object.name == "BillingStatement__c");
     let mut mirrored_columns = Vec::new();
@@ -635,7 +673,7 @@ pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
         mirrored_columns.push("Account.BillingPostalCode".into());
     }
     capabilities.push(SourceCapability {
-        key: "zip_attrition".into(), available: geo_available,
+        key: "geography".into(), available: geo_available,
         required_objects: vec!["BillingStatement__c".into(), "Account".into()],
         mirrored_columns,
         last_synced_at: geo_available.then(|| {
@@ -649,10 +687,72 @@ pub fn source_capabilities(store: &Store) -> Result<Vec<SourceCapability>> {
             || statement_object.is_some_and(|object| object.last_synced_at.is_some()) {
             "Billing statement and Account postal sources have no normalizable five-digit ZIP values for member households.".into()
         } else {
-            "Select and sync BillingStatement__c AddressPostalCode__c or Account BillingPostalCode to enable ZIP attrition.".into()
+            "Select and sync BillingStatement__c AddressPostalCode__c or Account BillingPostalCode to enable geographic membership insights.".into()
         }),
     });
     Ok(capabilities)
+}
+
+/// Whether each postal source actually holds a normalizable ZIP — the expensive half of the
+/// geography capability. Answering it means scanning every Account and every billing
+/// statement, so it is a fact about a BUILD (the data only changes on a sync, which triggers a
+/// rebuild) and about the withhold POLICY in force when it was derived. It is persisted under
+/// `_meta` with both, and a read serves it while they match; a rebuild or a policy change
+/// misses and re-derives it. Before the first build there is nothing to pin it to, so it is
+/// scanned every time (the cost the rebuild is about to pay anyway).
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+struct GeoSourceFacts {
+    built_at: String,
+    account_policy: bool,
+    statement_policy: bool,
+    account_zip: bool,
+    statement_zip: bool,
+}
+const GEO_SOURCES_KEY: &str = "geo_sources";
+
+fn geo_source_facts(
+    store: &Store,
+    account_policy: bool,
+    statement_policy: bool,
+) -> Result<GeoSourceFacts> {
+    let built_at = store.get_meta("insights_built_at")?;
+    if let Some(built_at) = &built_at {
+        let cached = store
+            .get_meta(GEO_SOURCES_KEY)?
+            .and_then(|blob| serde_json::from_str::<GeoSourceFacts>(&blob).ok());
+        if let Some(facts) = cached {
+            if &facts.built_at == built_at
+                && facts.account_policy == account_policy
+                && facts.statement_policy == statement_policy
+            {
+                return Ok(facts);
+            }
+        }
+    }
+    let account_zip = account_policy && {
+        let mut statement = store.conn().prepare(
+            "SELECT \"BillingPostalCode\" FROM \"Account\" WHERE \"Type\" = 'Member Family'",
+        )?;
+        let values = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        values.iter().any(|value| normalize_zip(value.as_deref()).is_some())
+    };
+    let statement_zip = statement_policy && !billing_statement_zips(store)?.is_empty();
+    let facts = GeoSourceFacts {
+        built_at: built_at.clone().unwrap_or_default(),
+        account_policy,
+        statement_policy,
+        account_zip,
+        statement_zip,
+    };
+    if built_at.is_some() {
+        // Best-effort: a failed persist only means the next read scans again.
+        if let Err(e) = store.set_meta(GEO_SOURCES_KEY, &serde_json::to_string(&facts)?) {
+            tracing::warn!("geography source facts persist failed: {e}");
+        }
+    }
+    Ok(facts)
 }
 
 /// One household from the mart. Everything the views need, nothing else.
@@ -673,6 +773,12 @@ pub struct Hh {
     pub join_reason: Option<String>,
     /// Normalized five-digit ZIP derived locally from a billing statement, with Account fallback. Never raw postal data.
     pub zip: Option<String>,
+    /// Per-fiscal-year ZIP history: one normalized ZIP per fiscal year that has a dated
+    /// billing statement (the latest statement in that fiscal year). Sorted ascending by
+    /// fiscal year. Empty when the household has no usable statements — then `zip` (the
+    /// Account fallback) is the only geography. Populated on demand by the geography
+    /// command, not persisted to the mart.
+    pub zip_series: Vec<(i32, String)>,
     pub ch: [bool; 12],
     pub rs_family: bool,
     pub ns_family: bool,
@@ -752,6 +858,7 @@ fn derive(raw: &[Option<String>; 16], zip: Option<String>) -> Hh {
         category: category.clone(),
         join_reason: reason.clone().filter(|s| !s.trim().is_empty()),
         zip,
+        zip_series: Vec::new(),
         ch: channel_flags(reason.as_deref()),
         rs_family: as_num(former_rs) > 0.0 || as_num(active_rs) > 0.0,
         ns_family: as_bool(ever_ns),
@@ -982,23 +1089,33 @@ fn statement_issue_date(value: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(value.get(0..10)?, "%Y-%m-%d").ok()
 }
 
+/// The resolved (household, date, postal, id) statement columns when every one is mirrored
+/// and none is withheld — the policy gate for reading statement ZIPs. Catalog reads only.
+fn statement_zip_columns(store: &Store) -> Result<Option<(String, String, String, String)>> {
+    let columns = store.mirror_columns("BillingStatement__c")?;
+    let (Some(household), Some(date), Some(postal), Some(id)) = (
+        resolve_col(&columns, STATEMENT_FIELDS.household),
+        resolve_col(&columns, STATEMENT_FIELDS.date),
+        resolve_col(&columns, STATEMENT_FIELDS.postal),
+        resolve_col(&columns, STATEMENT_FIELDS.id),
+    ) else {
+        return Ok(None);
+    };
+    let allowed = store.allowed_fields("BillingStatement__c")?;
+    let usable = [&household, &date, &postal, &id]
+        .into_iter()
+        .all(|column| allowed.contains(column));
+    Ok(usable.then_some((household, date, postal, id)))
+}
+
 /// Latest normalizable billing-statement ZIP by its direct Account link. The
 /// BilledToOtherAccountId__c field is intentionally never read: it is a bill-to
 /// routing attribute, not a household-geography relationship.
 fn billing_statement_zips(store: &Store) -> Result<std::collections::HashMap<String, String>> {
-    let columns = store.mirror_columns("BillingStatement__c")?;
-    let household = resolve_col(&columns, STATEMENT_FIELDS.household);
-    let date = resolve_col(&columns, STATEMENT_FIELDS.date);
-    let postal = resolve_col(&columns, STATEMENT_FIELDS.postal);
-    let id = resolve_col(&columns, STATEMENT_FIELDS.id);
-    let allowed = store.allowed_fields("BillingStatement__c")?;
-    let usable = [household.as_ref(), date.as_ref(), postal.as_ref(), id.as_ref()]
-        .into_iter()
-        .flatten()
-        .all(|column| allowed.contains(column));
-    if !usable || household.is_none() || date.is_none() || postal.is_none() || id.is_none() {
+    let Some((household, date, postal, id)) = statement_zip_columns(store)? else {
         return Ok(Default::default());
-    }
+    };
+    let (household, date, postal, id) = (Some(household), Some(date), Some(postal), Some(id));
 
     let mut latest: std::collections::HashMap<String, (chrono::NaiveDate, String, String)> = Default::default();
     for row in store.mirror_rows("BillingStatement__c")? {
@@ -1424,9 +1541,26 @@ pub fn rebuild_with(store: &mut Store, progress: &mut Reporter<'_>) -> Result<Re
     )?;
     tx.execute(
         "INSERT INTO _meta(key, value) VALUES('insights_schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![MART_SCHEMA_VERSION.to_string()],
+        params![mart_schema_fingerprint()],
     )?;
+    // The data behind the geography source facts and the cached Insights payload has changed;
+    // drop both so the next read re-derives them for this build (the stamp alone can't tell
+    // two builds in the same second apart).
+    tx.execute("DELETE FROM _meta WHERE key IN (?1, ?2)", params![GEO_SOURCES_KEY, INSIGHTS_CACHE_KEY])?;
     tx.commit()?;
+    // Precompute every geography view into the persisted cache so the map paints instantly on
+    // reopen and only ever recomputes after the next data refresh (which re-enters this path).
+    // Best-effort under the already-emitted "Finalizing" phase: the mart is committed, so a
+    // geography hiccup must not fail an otherwise-good rebuild — the read path recomputes on a
+    // miss regardless.
+    match warm_zip_geo_cache(store) {
+        // Stamp the cache as warmed for this build so `ensure_geo_cache_warm` skips re-warming.
+        Ok(()) => {
+            let _ = store.set_meta("geo_cache_built_at", &now);
+        }
+        // Leave the stamp unset so the next read path warms it; a hiccup must not fail the mart.
+        Err(e) => tracing::warn!("zip geography cache warm failed: {e}"),
+    }
     progress.finish();
     Ok(RebuildInfo {
         households: rows.len(),
@@ -1467,6 +1601,7 @@ pub fn load(store: &Store) -> Result<Vec<Hh>> {
             category: r.get(11)?,
             join_reason: r.get(12)?,
             zip: r.get(13)?,
+            zip_series: Vec::new(),
             ch,
             rs_family: r.get::<_, i64>(26)? != 0,
             ns_family: r.get::<_, i64>(27)? != 0,
@@ -1486,27 +1621,27 @@ const FIRST_COHORT_FY: i32 = 2010;
 const MAX_K: i32 = 8;
 const CHANNEL_MIN_N: usize = 20;
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TrendRow {
     pub fy: i32,
     pub joins: i64,
     pub resigns: i64,
     pub active_end_of_fy: i64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CohortYear1 {
     pub cohort: i32,
     pub n: i64,
     pub pct_retained: f64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CohortCell {
     pub cohort: i32,
     pub n: i64,
     pub k: i32,
     pub pct_retained: f64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChannelRow {
     pub key: String,
     pub label: String,
@@ -1516,29 +1651,21 @@ pub struct ChannelRow {
     pub avg_tenure: f64,
     pub left_within_2y: i64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SchoolRow {
     pub group: String,
     pub n: i64,
     pub still_members: i64,
     pub pct: f64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReasonCell {
     pub fy: i32,
     pub reason: String,
     pub n: i64,
 }
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct ZipAttritionCell {
-    pub fy: i32,
-    pub zip: String,
-    pub start_households: i64,
-    pub exits: i64,
-    pub attrition_rate: f64,
-}
 /// Retention for households grouped by how many Entry Jobs they stated.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MultiJobRow {
     pub bucket: String,
     pub jobs: i64,
@@ -1548,14 +1675,14 @@ pub struct MultiJobRow {
     pub avg_tenure: f64,
 }
 /// Primary Exit Outcome counts within a tenure-at-exit band.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OutcomeByTenureRow {
     pub tenure_bucket: String,
     pub outcome: String,
     pub n: i64,
 }
 /// Retention by completed fiscal years since Religious School ended.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SchoolGapRow {
     pub bucket: String,
     pub n: i64,
@@ -1564,7 +1691,7 @@ pub struct SchoolGapRow {
 }
 /// Dues state for one fiscal year. Settlement counts are eventual states, not as-of
 /// history. Coverage-missing means active-with-no-dues-line, never proven non-renewal.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DuesRow {
     pub fy: i32,
     pub active: i64,
@@ -1575,7 +1702,7 @@ pub struct DuesRow {
     pub unsettled: i64,
 }
 /// Retention of households that recently held one kind of Relationship Anchor.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnchorTypeRow {
     pub key: String,
     pub label: String,
@@ -1584,7 +1711,7 @@ pub struct AnchorTypeRow {
     pub pct: f64,
 }
 /// Retention by how many distinct Relationship Anchors a household recently held.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnchorCountRow {
     pub anchors: i64,
     pub label: String,
@@ -1592,7 +1719,7 @@ pub struct AnchorCountRow {
     pub still_members: i64,
     pub pct: f64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Kpis {
     pub members_now: i64,
     pub net_vs_prior_fy: i64,
@@ -1603,7 +1730,7 @@ pub struct Kpis {
     pub year1_baseline_pct: f64,
     pub at_risk_count: i64,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AtRiskRow {
     pub account_id: String,
     pub name: String,
@@ -1611,7 +1738,7 @@ pub struct AtRiskRow {
     pub join_fy: Option<i32>,
     pub rules: Vec<String>,
 }
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Insights {
     pub built_at: Option<String>,
     pub newest_source_sync_at: Option<String>,
@@ -1633,7 +1760,12 @@ pub struct Insights {
     pub dues: Vec<DuesRow>,
     pub anchor_type: Vec<AnchorTypeRow>,
     pub anchor_count: Vec<AnchorCountRow>,
-    pub zip_attrition: Vec<ZipAttritionCell>,
+    /// The Geography panel's default view (density · last completed fiscal year · all members),
+    /// resolved on the get_insights path so the panel paints with the rest of the page. This
+    /// matters because get_insights releases the store lock before the risk analysis grabs it,
+    /// whereas a standalone zip_geography call would queue behind that long-running lock holder
+    /// and sit at "Loading…". Served from the persisted cache like any other view.
+    pub geography: Option<ZipGeography>,
 }
 
 /// Spell rule: a member in `fy` if joined by then and not resigned before/in it.
@@ -1660,19 +1792,644 @@ fn pct(num: i64, den: i64) -> f64 {
     }
 }
 
-pub fn zip_attrition(households: &[Hh], cur: i32) -> Vec<ZipAttritionCell> {
-    let mut counts: std::collections::BTreeMap<(i32, String), (i64, i64)> = Default::default();
-    for fy in cur - 5..cur {
-        for household in households {
-            let Some(zip) = household.zip.as_ref() else { continue };
-            let cell = counts.entry((fy, zip.clone())).or_default();
-            if member_in(household, fy - 1) { cell.0 += 1; }
-            if household.resign_fy == Some(fy) { cell.1 += 1; }
+// ── mode-driven ZIP geography ────────────────────────────────────────────────
+// A single command answers four map modes over the same `Hh` mart, placing each
+// household by the ZIP it held *as of* the display fiscal year (`zip_as_of`), with
+// server-side suppression and an out-of-area count so no member is silently dropped.
+
+/// The mapped area: every Census ZCTA in the packaged New York boundary asset. The
+/// list is derived once from `src/assets/ny-zcta-boundaries.json`; regenerate it if the
+/// asset changes (see `ny-zcta-boundaries.md`). Held here so the backend — not the
+/// webview — is the authority on which ZIPs are on the map, letting it count out-of-area
+/// members before suppression rather than leaking that to the frontend.
+static NY_ZCTAS: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+    std::sync::OnceLock::new();
+fn ny_zctas() -> &'static std::collections::HashSet<&'static str> {
+    NY_ZCTAS.get_or_init(|| {
+        include_str!("ny_zctas.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    })
+}
+fn is_mapped_zip(zip: &str) -> bool {
+    ny_zctas().contains(zip)
+}
+
+/// The household's ZIP as of a fiscal year: the ZIP of its latest statement in or before
+/// `fy`; if the series begins after `fy`, its earliest known ZIP; if it has no statement
+/// series at all, the Account fallback (`zip`). `None` when the household has no geography.
+pub fn zip_as_of(h: &Hh, fy: i32) -> Option<&str> {
+    if h.zip_series.is_empty() {
+        return h.zip.as_deref();
+    }
+    // The series is sorted ascending by fiscal year, so the last entry at or before `fy`
+    // is the statement in force that year.
+    let mut chosen: Option<&str> = None;
+    for (year, zip) in &h.zip_series {
+        if *year <= fy {
+            chosen = Some(zip.as_str());
+        } else {
+            break;
         }
     }
-    counts.into_iter().filter_map(|((fy, zip), (start_households, exits))| {
-        (start_households >= 5).then(|| ZipAttritionCell { fy, zip, start_households, exits, attrition_rate: pct(exits, start_households) })
-    }).collect()
+    chosen.or_else(|| h.zip_series.first().map(|(_, zip)| zip.as_str()))
+}
+
+/// Which map a mode draws. Counts (Density, Provenance, NetChange) and the rates
+/// (Attrition, Retention) never share a scale — a spec requirement enforced by their
+/// encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeoMode {
+    Density,
+    Provenance,
+    NetChange,
+    Attrition,
+    /// Cohort retention by ZIP: of the households that joined in the selected cohort year
+    /// (placed at their join-year mirrored ZIP), the share still members today.
+    Retention,
+}
+impl GeoMode {
+    fn is_rate(self) -> bool {
+        matches!(self, GeoMode::Attrition | GeoMode::Retention)
+    }
+    /// Suppression floor: `<5` households in a count mode, `<10` in a rate mode — the
+    /// stricter rate floor guards a cohort × ZIP denominator that is easily a few families.
+    fn min_n(self) -> i64 {
+        if self.is_rate() {
+            10
+        } else {
+            5
+        }
+    }
+    /// The fiscal year whose resolved ZIP places a household. Attrition places by the
+    /// starting-population year (end of the prior FY); Retention by the cohort's join year;
+    /// the others by the display year.
+    fn as_of(self, fy: i32) -> i32 {
+        match self {
+            GeoMode::Attrition => fy - 1,
+            _ => fy,
+        }
+    }
+}
+
+/// A single segment the map can be filtered by before aggregation. One value at a time.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Segment {
+    /// Join era, per join fiscal year (`cohort_fy`).
+    JoinFy(i32),
+    /// Dues tier; the sentinel `"Other"` matches any tier outside the top set (and null).
+    Tier(String),
+    /// Member category; `"Other"` as above.
+    Category(String),
+    /// Entry Job channel, by `CHANNELS` key.
+    Channel(String),
+    /// School-family lifecycle group.
+    School(SchoolLifecycle),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchoolLifecycle {
+    /// Households with a religious-school student enrolled now.
+    ActiveReligiousSchool,
+    /// Ever a religious-school family, none currently enrolled (past the cliff).
+    PastReligiousSchoolCliff,
+    /// Ever a nursery-school family.
+    NurserySchool,
+}
+
+/// One per-ZIP aggregate. `measure` is the mode's primary value (household count for
+/// Density/Provenance, net for NetChange, rate percent for Attrition); `n` is always the
+/// household denominator behind it so a rate can never be read without it. `joins`/`exits`
+/// give the tooltip the parts behind net and attrition.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ZipGeoCell {
+    pub zip: String,
+    pub measure: f64,
+    pub n: i64,
+    pub joins: i64,
+    pub exits: i64,
+    /// Households in the cohort still members today (Retention mode only; 0 otherwise).
+    pub retained: i64,
+}
+
+/// A pickable segment value with a display label.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SegmentOption {
+    pub key: String,
+    pub label: String,
+}
+
+/// The segment values available for the dropdown, computed from the mart so Tier/Category
+/// collapse to their top 6 (+ "Other") rather than a sprawling picklist.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SegmentOptions {
+    pub join_fys: Vec<i32>,
+    pub tiers: Vec<String>,
+    pub categories: Vec<String>,
+    pub channels: Vec<SegmentOption>,
+    pub school: Vec<SegmentOption>,
+}
+
+/// The mode-driven geographic view for one fiscal year, mode, and optional segment.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ZipGeography {
+    pub fiscal_year: i32,
+    pub mode: GeoMode,
+    pub segment: Option<Segment>,
+    /// False when neither postal source yields a normalizable ZIP: the view shows an
+    /// unavailable state instead of a zero-valued map.
+    pub available: bool,
+    /// Mapped (New York ZCTA) ZIPs only, already suppressed.
+    pub cells: Vec<ZipGeoCell>,
+    /// Households in the mode's population with a normalizable ZIP outside the mapped area.
+    pub out_of_area: i64,
+    /// Mapped ZIPs dropped for falling under the mode's suppression floor.
+    pub suppressed_zips: i64,
+    pub options: SegmentOptions,
+}
+
+/// The top `k` values of a text field by household count (ties broken alphabetically),
+/// excluding null. Used to bound Tier/Category before "Other".
+fn top_values(households: &[Hh], pick: impl Fn(&Hh) -> Option<&str>, k: usize) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for h in households {
+        if let Some(value) = pick(h) {
+            *counts.entry(value).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(&str, i64)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.into_iter().take(k).map(|(v, _)| v.to_string()).collect()
+}
+
+fn channel_index(key: &str) -> Option<usize> {
+    CHANNELS.iter().position(|(k, _)| *k == key)
+}
+
+/// Humanize a snake_case channel key into a display label ("religious_school" → "Religious School").
+fn humanize(key: &str) -> String {
+    key.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bucket_match(field: Option<&str>, wanted: &str, top: &[String]) -> bool {
+    if wanted == "Other" {
+        field.is_none_or(|f| !top.iter().any(|t| t == f))
+    } else {
+        field == Some(wanted)
+    }
+}
+
+fn in_segment(h: &Hh, seg: &Segment, top_tiers: &[String], top_cats: &[String]) -> bool {
+    match seg {
+        Segment::JoinFy(fy) => h.cohort_fy == Some(*fy),
+        Segment::Tier(value) => bucket_match(h.tier.as_deref(), value, top_tiers),
+        Segment::Category(value) => bucket_match(h.category.as_deref(), value, top_cats),
+        Segment::Channel(key) => channel_index(key).is_some_and(|i| h.ch[i]),
+        Segment::School(SchoolLifecycle::ActiveReligiousSchool) => h.active_rs_students > 0,
+        Segment::School(SchoolLifecycle::PastReligiousSchoolCliff) => {
+            h.rs_family && h.active_rs_students == 0
+        }
+        Segment::School(SchoolLifecycle::NurserySchool) => h.ns_family,
+    }
+}
+
+fn build_segment_options(
+    households: &[Hh],
+    top_tiers: &[String],
+    top_cats: &[String],
+) -> SegmentOptions {
+    let mut join_fys: Vec<i32> = households.iter().filter_map(|h| h.cohort_fy).collect();
+    join_fys.sort_unstable();
+    join_fys.dedup();
+    join_fys.reverse();
+
+    let with_other = |top: &[String], has_more: bool| {
+        let mut list = top.to_vec();
+        if has_more {
+            list.push("Other".to_string());
+        }
+        list
+    };
+    let tier_more = households
+        .iter()
+        .filter_map(|h| h.tier.as_deref())
+        .any(|t| !top_tiers.iter().any(|x| x == t));
+    let cat_more = households
+        .iter()
+        .filter_map(|h| h.category.as_deref())
+        .any(|c| !top_cats.iter().any(|x| x == c));
+
+    SegmentOptions {
+        join_fys,
+        tiers: with_other(top_tiers, tier_more),
+        categories: with_other(top_cats, cat_more),
+        channels: CHANNELS
+            .iter()
+            .map(|(key, _)| SegmentOption {
+                key: (*key).to_string(),
+                label: humanize(key),
+            })
+            .collect(),
+        school: [
+            ("active_religious_school", "Active religious school"),
+            ("past_religious_school_cliff", "Past religious-school cliff"),
+            ("nursery_school", "Nursery school"),
+        ]
+        .iter()
+        .map(|(key, label)| SegmentOption {
+            key: (*key).to_string(),
+            label: (*label).to_string(),
+        })
+        .collect(),
+    }
+}
+
+#[derive(Default)]
+struct GeoAcc {
+    pop: i64,
+    joins: i64,
+    exits: i64,
+    retained: i64,
+}
+
+/// Aggregate the mart into per-ZIP cells for one mode, fiscal year, and optional segment.
+/// Pure over `Hh` (ZIP series must already be attached); the store-backed entry point is
+/// `zip_geography_view`. Assumes the geographic capability is available.
+pub fn zip_geography(
+    households: &[Hh],
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+) -> ZipGeography {
+    let top_tiers = top_values(households, |h| h.tier.as_deref(), 6);
+    let top_cats = top_values(households, |h| h.category.as_deref(), 6);
+    let options = build_segment_options(households, &top_tiers, &top_cats);
+    zip_geography_inner(households, fy, mode, segment, &top_tiers, &top_cats, options)
+}
+
+/// The per-ZIP aggregation core, with the household-level derived inputs (top tiers/categories
+/// and the segment options) supplied by the caller. Warming the geography cache computes those
+/// once and reuses them across every warmed view, so they aren't re-derived per view.
+#[allow(clippy::too_many_arguments)]
+fn zip_geography_inner(
+    households: &[Hh],
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+    top_tiers: &[String],
+    top_cats: &[String],
+    options: SegmentOptions,
+) -> ZipGeography {
+    let asof = mode.as_of(fy);
+    let mut by_zip: std::collections::BTreeMap<String, GeoAcc> = Default::default();
+    let mut out_of_area: i64 = 0;
+
+    for h in households {
+        if let Some(seg) = &segment {
+            if !in_segment(h, seg, top_tiers, top_cats) {
+                continue;
+            }
+        }
+        let active_end = member_in(h, fy);
+        let started = member_in(h, fy - 1);
+        let is_join = h.join_fy == Some(fy);
+        let is_exit = h.resign_fy == Some(fy);
+        let is_cohort = h.cohort_fy == Some(fy);
+        // Is the household part of this mode's population this year?
+        let in_pop = match mode {
+            GeoMode::Density => active_end,
+            GeoMode::Provenance => is_join,
+            GeoMode::NetChange => started || is_join || is_exit,
+            GeoMode::Attrition => started,
+            GeoMode::Retention => is_cohort,
+        };
+        if !in_pop {
+            continue;
+        }
+        let Some(zip) = zip_as_of(h, asof) else {
+            continue;
+        };
+        if !is_mapped_zip(zip) {
+            out_of_area += 1;
+            continue;
+        }
+        let acc = by_zip.entry(zip.to_string()).or_default();
+        acc.pop += 1;
+        if is_join {
+            acc.joins += 1;
+        }
+        if is_exit {
+            acc.exits += 1;
+        }
+        if h.is_current {
+            acc.retained += 1;
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut suppressed_zips = 0i64;
+    for (zip, acc) in by_zip {
+        if acc.pop < mode.min_n() {
+            suppressed_zips += 1;
+            continue;
+        }
+        let measure = match mode {
+            GeoMode::Density | GeoMode::Provenance => acc.pop as f64,
+            GeoMode::NetChange => (acc.joins - acc.exits) as f64,
+            GeoMode::Attrition => pct(acc.exits, acc.pop),
+            GeoMode::Retention => pct(acc.retained, acc.pop),
+        };
+        cells.push(ZipGeoCell {
+            zip,
+            measure,
+            n: acc.pop,
+            joins: acc.joins,
+            exits: acc.exits,
+            retained: acc.retained,
+        });
+    }
+
+    ZipGeography {
+        fiscal_year: fy,
+        mode,
+        segment,
+        available: true,
+        cells,
+        out_of_area,
+        suppressed_zips,
+        options,
+    }
+}
+
+/// Build each household's per-fiscal-year ZIP series from dated billing statements: one
+/// ZIP per fiscal year (the latest statement in that year), sorted ascending. Shares the
+/// privacy discipline of `billing_statement_zips` — the bill-to-other id is never read.
+fn billing_statement_zip_series(
+    store: &Store,
+) -> Result<std::collections::HashMap<String, Vec<(i32, String)>>> {
+    let columns = store.mirror_columns("BillingStatement__c")?;
+    let household = resolve_col(&columns, STATEMENT_FIELDS.household);
+    let date = resolve_col(&columns, STATEMENT_FIELDS.date);
+    let postal = resolve_col(&columns, STATEMENT_FIELDS.postal);
+    let id = resolve_col(&columns, STATEMENT_FIELDS.id);
+    let allowed = store.allowed_fields("BillingStatement__c")?;
+    let usable = [household.as_ref(), date.as_ref(), postal.as_ref(), id.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|column| allowed.contains(column));
+    if !usable || household.is_none() || date.is_none() || postal.is_none() || id.is_none() {
+        return Ok(Default::default());
+    }
+
+    // account -> fy -> (best_date, best_id, zip): the latest statement within each fiscal year.
+    let mut per: std::collections::HashMap<
+        String,
+        std::collections::HashMap<i32, (chrono::NaiveDate, String, String)>,
+    > = Default::default();
+    for row in store.mirror_rows("BillingStatement__c")? {
+        let raw_date = field(&row, &date);
+        let (Some(account_id), Some(raw_date), Some(zip), Some(sid)) = (
+            field(&row, &household),
+            raw_date,
+            normalize_zip(field(&row, &postal)),
+            field(&row, &id),
+        ) else {
+            continue;
+        };
+        let (Some(issued_at), Some(fy)) = (statement_issue_date(raw_date), fy_of(raw_date)) else {
+            continue;
+        };
+        let years = per.entry(account_id.to_string()).or_default();
+        let candidate = (issued_at, sid.to_string(), zip);
+        let replace = years
+            .get(&fy)
+            .is_none_or(|current| (candidate.0, candidate.1.as_str()) > (current.0, current.1.as_str()));
+        if replace {
+            years.insert(fy, candidate);
+        }
+    }
+    Ok(per
+        .into_iter()
+        .map(|(account_id, years)| {
+            let mut series: Vec<(i32, String)> =
+                years.into_iter().map(|(fy, (_, _, zip))| (fy, zip)).collect();
+            series.sort_by_key(|(fy, _)| *fy);
+            (account_id, series)
+        })
+        .collect())
+}
+
+/// Persisted per-build geography cache. Keyed by `(version, fy, mode, segment)` so a view is
+/// only ever recomputed when the data is refreshed — a rebuild (which is what a source sync
+/// triggers) drops and re-warms this table, and nothing else touches it. This is why the map
+/// paints instantly on reopen: the app process dies but this table lives in the mart DB.
+const GEO_CACHE_TABLE: &str = "_m_zip_geo";
+/// Bump to invalidate every cached view at once when the geography compute or the
+/// `ZipGeography` shape changes (old rows miss and recompute).
+const GEO_CACHE_VERSION: u32 = 1;
+
+fn geo_cache_ddl() -> String {
+    format!("CREATE TABLE IF NOT EXISTS {GEO_CACHE_TABLE}(view_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+}
+
+/// Canonical cache key for one view. Deterministic for a given selection, so the warm pass
+/// and the read path agree without sharing state.
+fn geo_view_key(fy: i32, mode: GeoMode, segment: &Option<Segment>) -> Result<String> {
+    Ok(serde_json::to_string(&(GEO_CACHE_VERSION, fy, mode, segment))?)
+}
+
+/// Load the mart households with each one's per-FY ZIP series attached — the input the
+/// geography aggregation is pure over. Shared by the read path and the warm pass.
+fn load_geo_households(store: &Store) -> Result<Vec<Hh>> {
+    let mut households = load(store)?;
+    let series = billing_statement_zip_series(store)?;
+    for h in &mut households {
+        if let Some(s) = series.get(&h.account_id) {
+            h.zip_series = s.clone();
+        }
+    }
+    Ok(households)
+}
+
+/// Every (mode, fiscal year, segment) tuple the UI can request — the exact surface the map's
+/// controls expose: four count/flux modes over the last six years, retention over the last
+/// eight cohort years, each crossed with "all members" plus every segment option.
+fn geo_view_combos() -> Vec<(i32, GeoMode)> {
+    let cur = current_fy();
+    let mut combos = Vec::new();
+    for mode in [
+        GeoMode::Density,
+        GeoMode::Provenance,
+        GeoMode::NetChange,
+        GeoMode::Attrition,
+    ] {
+        for fy in (cur - 5)..=cur {
+            combos.push((fy, mode));
+        }
+    }
+    for fy in (cur - 8)..=(cur - 1) {
+        combos.push((fy, GeoMode::Retention));
+    }
+    combos
+}
+
+/// Precompute the all-members geography views into the persisted cache. The one expensive
+/// step is `load_geo_households` (a full mart read plus a join across every billing statement
+/// to build each household's ZIP-by-year history); warming does it ONCE here so no view read
+/// ever pays it again. Only the all-members views are warmed — every mode × year plus the
+/// retention cohorts, ~32 views, the surface the panel opens on and switches between. The
+/// rarer segment drill-downs lazy-fill (and then persist) through `zip_geography_view`, so we
+/// don't pay for ~1.3k combinations most of which are never opened. Drops any prior-build rows
+/// first so the table reflects exactly the current build.
+fn warm_zip_geo_cache(store: &mut Store) -> Result<()> {
+    let caps = source_capabilities(store)?;
+    if !cap_available(&caps, "geography") {
+        // No geography source this build: reset to an empty current-build table.
+        store.conn().execute_batch(&format!(
+            "DROP TABLE IF EXISTS {GEO_CACHE_TABLE}; {}",
+            geo_cache_ddl()
+        ))?;
+        return Ok(());
+    }
+    // Load once; derive the per-household inputs once; reuse across every view. These are
+    // owned, so they hold no store borrow while the insert transaction is open below.
+    let households = load_geo_households(store)?;
+    let top_tiers = top_values(&households, |h| h.tier.as_deref(), 6);
+    let top_cats = top_values(&households, |h| h.category.as_deref(), 6);
+    let options = build_segment_options(&households, &top_tiers, &top_cats);
+
+    let tx = store.conn_mut().transaction()?;
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {GEO_CACHE_TABLE}; {}",
+        geo_cache_ddl()
+    ))?;
+    {
+        let mut st = tx.prepare(&format!(
+            "INSERT OR REPLACE INTO {GEO_CACHE_TABLE}(view_key, payload) VALUES(?1, ?2)"
+        ))?;
+        for (fy, mode) in geo_view_combos() {
+            let geo = zip_geography_inner(
+                &households,
+                fy,
+                mode,
+                None,
+                &top_tiers,
+                &top_cats,
+                options.clone(),
+            );
+            st.execute(params![
+                geo_view_key(fy, mode, &None)?,
+                serde_json::to_string(&geo)?
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Warm the geography cache in full if it doesn't already match the current build — covering
+/// a mart built before this cache existed (its `insights_built_at` is set but no cache was
+/// ever warmed) without forcing a full mart rebuild. Compares a stored stamp, so it does the
+/// one expensive household load at most once per build. Idempotent and near-free once warm.
+pub fn ensure_geo_cache_warm(store: &mut Store) -> Result<()> {
+    let built = store.get_meta("insights_built_at")?;
+    let warmed = store.get_meta("geo_cache_built_at")?;
+    if built.is_none() || built == warmed {
+        return Ok(());
+    }
+    warm_zip_geo_cache(store)?;
+    if let Some(built_at) = built {
+        store.set_meta("geo_cache_built_at", &built_at)?;
+    }
+    Ok(())
+}
+
+/// Store-backed geographic view. Serves the persisted per-build cache; on a miss (a selection
+/// outside the warmed set, or a mart built before this cache existed) it computes the view,
+/// persists it, and returns it — so it too is instant next time and after a restart. Returns
+/// an unavailable state (empty map) when no postal source yields a normalizable ZIP.
+pub fn zip_geography_view(
+    store: &Store,
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+) -> Result<ZipGeography> {
+    let mut views = zip_geography_views(store, mode, segment, &[fy])?;
+    Ok(views.pop().expect("one view per requested year"))
+}
+
+/// Many fiscal years of one mode and segment, in request order. The whole point is one lock
+/// hold and one household load for any number of years: the cache is probed per year, and if
+/// any year misses the expensive `load_geo_households` runs ONCE and fills every miss. Each
+/// computed view is persisted so it is a lookup next time.
+pub fn zip_geography_views(
+    store: &Store,
+    mode: GeoMode,
+    segment: Option<Segment>,
+    fys: &[i32],
+) -> Result<Vec<ZipGeography>> {
+    let caps = source_capabilities(store)?;
+    if !cap_available(&caps, "geography") {
+        return Ok(fys
+            .iter()
+            .map(|&fy| ZipGeography {
+                fiscal_year: fy,
+                mode,
+                segment: segment.clone(),
+                available: false,
+                cells: Vec::new(),
+                out_of_area: 0,
+                suppressed_zips: 0,
+                options: SegmentOptions::default(),
+            })
+            .collect());
+    }
+    store.conn().execute_batch(&geo_cache_ddl())?;
+    let mut views: Vec<Option<ZipGeography>> = Vec::with_capacity(fys.len());
+    for &fy in fys {
+        let key = geo_view_key(fy, mode, &segment)?;
+        let cached: Option<String> = store
+            .conn()
+            .query_row(
+                &format!("SELECT payload FROM {GEO_CACHE_TABLE} WHERE view_key = ?1"),
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // A corrupt or shape-changed row parses as a miss and is recomputed over below.
+        views.push(cached.and_then(|payload| serde_json::from_str(&payload).ok()));
+    }
+    if views.iter().any(Option::is_none) {
+        let households = load_geo_households(store)?;
+        for (slot, &fy) in views.iter_mut().zip(fys) {
+            if slot.is_some() {
+                continue;
+            }
+            let geo = zip_geography(&households, fy, mode, segment.clone());
+            // Best-effort persist: a cache-write failure must never fail a valid computed view.
+            if let Err(e) = store.conn().execute(
+                &format!("INSERT OR REPLACE INTO {GEO_CACHE_TABLE}(view_key, payload) VALUES(?1, ?2)"),
+                params![geo_view_key(fy, mode, &segment)?, serde_json::to_string(&geo)?],
+            ) {
+                tracing::warn!("zip geography cache write failed: {e}");
+            }
+            *slot = Some(geo);
+        }
+    }
+    Ok(views.into_iter().map(|v| v.expect("every year filled")).collect())
 }
 
 pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
@@ -2635,21 +3392,70 @@ pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(Stri
     })
 }
 
+/// The persisted `Insights` payload for one build. Everything in it is a function of the mart
+/// (which only changes on a rebuild) and the fiscal year it was computed for, EXCEPT the
+/// freshness facts and capabilities, which are cheap catalog reads and are re-read live so a
+/// later sync or a withheld field shows immediately. Keyed on the build stamp, the fiscal
+/// year, and the mart schema, and dropped by the rebuild transaction, so it can only ever skip
+/// a repeat of the same computation.
+const INSIGHTS_CACHE_KEY: &str = "insights_cache";
+#[derive(Serialize, Deserialize)]
+struct InsightsCache {
+    built_at: String,
+    current_fy: i32,
+    schema: String,
+    insights: Insights,
+}
+
 pub fn views(store: &Store, cur: i32) -> Result<Insights> {
-    let hh = load(store)?;
-    let household_years = load_household_years(store)?;
-    let index = HouseholdYearIndex::build(&household_years);
     let built_at = store.get_meta("insights_built_at")?;
     // Only the objects the mart reads can make it stale; this mirrors the rebuild decision
     // in `commands::ensure_fresh_with`, so the "stale" badge and the rebuild agree.
     let newest_source_sync_at = store.newest_mart_source_sync_at()?;
     let stale = matches!((&built_at, &newest_source_sync_at), (Some(built), Some(source)) if source > built);
+    let capabilities = source_capabilities(store)?;
+    if let Some(built) = &built_at {
+        let cached = store
+            .get_meta(INSIGHTS_CACHE_KEY)?
+            .and_then(|blob| serde_json::from_str::<InsightsCache>(&blob).ok());
+        if let Some(cache) = cached {
+            if &cache.built_at == built && cache.current_fy == cur && cache.schema == mart_schema_fingerprint() {
+                let mut insights = cache.insights;
+                insights.newest_source_sync_at = newest_source_sync_at;
+                insights.stale = stale;
+                insights.capabilities = capabilities;
+                return Ok(insights);
+            }
+        }
+    }
+    let insights = compute_views(store, cur, built_at.clone(), newest_source_sync_at, stale, capabilities)?;
+    if let Some(built_at) = built_at {
+        // Best-effort: a failed persist only means the next load computes again.
+        let cache = InsightsCache { built_at, current_fy: cur, schema: mart_schema_fingerprint(), insights: insights.clone() };
+        if let Err(e) = serde_json::to_string(&cache).map_err(anyhow::Error::from).and_then(|blob| store.set_meta(INSIGHTS_CACHE_KEY, &blob)) {
+            tracing::warn!("insights cache persist failed: {e}");
+        }
+    }
+    Ok(insights)
+}
+
+/// The full read-model computation over the mart: two full mart reads plus every view.
+fn compute_views(
+    store: &Store,
+    cur: i32,
+    built_at: Option<String>,
+    newest_source_sync_at: Option<String>,
+    stale: bool,
+    capabilities: Vec<SourceCapability>,
+) -> Result<Insights> {
+    let hh = load(store)?;
+    let household_years = load_household_years(store)?;
+    let index = HouseholdYearIndex::build(&household_years);
     let unavailable: Vec<String> = store
         .get_meta("insights_unavailable")?
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let at_risk = at_risk_rows(&hh, cur).len() as i64;
-    let capabilities = source_capabilities(store)?;
     // Renewal & Engagement views read optional anchor sources; keep them empty when the
     // source is unavailable so absent data is never shown as household behavior.
     let dues_view = if cap_available(&capabilities, "renewal") {
@@ -2686,7 +3492,9 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
         dues: dues_view,
         anchor_type: anchor_type(&household_years, cur, &capabilities),
         anchor_count: anchor_count_view,
-        zip_attrition: if cap_available(&capabilities, "zip_attrition") { zip_attrition(&hh, cur) } else { Vec::new() },
+        // Default panel view, off the risk-blocked lock path. Never fails insights: a geography
+        // error degrades to None and the panel falls back to fetching on its own.
+        geography: zip_geography_view(store, cur - 1, GeoMode::Density, None).ok(),
         capabilities,
     })
 }
@@ -2724,16 +3532,16 @@ mod tests {
         cols.push("BillingPostalCode");
         seed_account(&mut s, &rows, &cols);
 
-        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "geography").unwrap();
         assert!(!zip.available);
         assert!(zip.unavailable_reason.unwrap().contains("normalizable"));
 
         s.conn().execute("UPDATE \"Account\" SET \"BillingPostalCode\" = '10024-1234' WHERE \"Id\" = '001A'", []).unwrap();
-        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "geography").unwrap();
         assert!(zip.available);
 
         s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
-        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "geography").unwrap();
         assert!(!zip.available);
     }
 
@@ -2772,40 +3580,15 @@ mod tests {
         assert_eq!(b_zip.as_deref(), Some("10002"));
 
         s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
-        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "zip_attrition").unwrap();
+        let zip = source_capabilities(&s).unwrap().into_iter().find(|capability| capability.key == "geography").unwrap();
         assert!(zip.available);
     }
 
     #[test]
-    fn zip_attrition_uses_starting_households_and_suppresses_small_cells() {
-        let households = (0..5).map(|i| Hh {
-            account_id: format!("ny-{i}"), zip: Some("10024".to_string()), join_fy: Some(2024),
-            resign_fy: (i == 0).then_some(2026), ..Default::default()
-        }).chain(std::iter::once(Hh {
-            account_id: "outside".into(), zip: Some("02108".to_string()), join_fy: Some(2024),
-            ..Default::default()
-        })).chain((0..4).map(|i| Hh {
-            account_id: format!("suppressed-{i}"), zip: Some("10025".to_string()), join_fy: Some(2024),
-            ..Default::default()
-        })).collect::<Vec<_>>();
-
-        assert_eq!(zip_attrition(&households, 2027), vec![
-            ZipAttritionCell { fy: 2025, zip: "10024".into(), start_households: 5, exits: 0, attrition_rate: 0.0 },
-            ZipAttritionCell { fy: 2026, zip: "10024".into(), start_households: 5, exits: 1, attrition_rate: 20.0 },
-        ]);
-    }
-
-    #[test]
-    fn zip_attrition_retains_eligible_non_new_york_zips_for_the_ui_to_label_unmapped() {
-        let households = (0..5).map(|index| Hh {
-            account_id: format!("ma-{index}"), zip: Some("02108".to_string()), join_fy: Some(2024),
-            ..Default::default()
-        }).collect::<Vec<_>>();
-        assert!(zip_attrition(&households, 2027).iter().any(|cell| cell.fy == 2026 && cell.zip == "02108" && cell.start_households == 5));
-    }
-
-    #[test]
-    fn zip_views_expose_only_aggregate_cells_and_become_unavailable_when_withheld() {
+    fn insights_views_carry_no_zip_field_and_never_leak_raw_postal() {
+        // `get_insights` carries only the DEFAULT geography view (density · last completed FY),
+        // and only as suppressed, normalized aggregates: no raw +4 postal and no account id ever
+        // reach the payload, exactly as the standalone command guarantees.
         let (_d, mut s) = mem();
         let mut rows = Vec::new();
         for index in 0..5 {
@@ -2819,14 +3602,436 @@ mod tests {
         seed_account(&mut s, &rows, &cols);
         rebuild(&mut s).unwrap();
         let view = views(&s, 2027).unwrap();
-        assert!(view.zip_attrition.iter().any(|cell| cell.zip == "10024" && cell.start_households == 5));
         let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("zip_attrition"));
         assert!(!json.contains("10024-1234") && !json.contains("zip-0"));
+    }
 
-        s.conn().execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", []).unwrap();
-        let view = views(&s, 2027).unwrap();
-        assert!(view.zip_attrition.is_empty());
-        assert!(!view.capabilities.iter().find(|capability| capability.key == "zip_attrition").unwrap().available);
+    #[test]
+    fn insights_views_are_served_from_the_build_cache_without_rereading_the_mart() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        let first = views(&s, 2027).unwrap();
+
+        // Drop the mart: a read model that re-read it on every load would fail here. The build
+        // cache serves the same payload — the whole reason a page load is a lookup, not a scan.
+        s.conn()
+            .execute_batch("DROP TABLE _m_household_fy; DROP TABLE _m_household;")
+            .unwrap();
+        let again = views(&s, 2027).unwrap();
+        assert_eq!(
+            serde_json::to_string(&again.kpis).unwrap(),
+            serde_json::to_string(&first.kpis).unwrap()
+        );
+        assert_eq!(again.trend.len(), first.trend.len());
+        assert_eq!(again.built_at, first.built_at);
+    }
+
+    #[test]
+    fn cached_insights_still_report_a_newer_sync_as_stale() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        assert!(!views(&s, 2027).unwrap().stale);
+        // A later sync of a mart source: the payload is served from the build cache, but the
+        // freshness facts are read live so the "stale" badge never lies.
+        s.conn()
+            .execute(
+                "UPDATE _objects SET last_synced_at = '2999-01-01T00:00:00Z' WHERE name = 'Account'",
+                [],
+            )
+            .unwrap();
+        assert!(views(&s, 2027).unwrap().stale);
+    }
+
+    // ── mode-driven ZIP geography ─────────────────────────────────────────────
+
+    /// A household placed only by `zip` (no statement series), for the pure aggregations.
+    fn geo_hh(id: &str, zip: &str, join: Option<i32>, resign: Option<i32>) -> Hh {
+        Hh {
+            account_id: id.into(),
+            zip: Some(zip.into()),
+            join_fy: join,
+            cohort_fy: join,
+            resign_fy: resign,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zip_as_of_resolves_the_statement_in_force_that_fiscal_year() {
+        let h = Hh {
+            zip: Some("99999".into()), // Account fallback, shadowed once a series exists
+            zip_series: vec![(2023, "10001".into()), (2025, "10024".into())],
+            ..Default::default()
+        };
+        assert_eq!(zip_as_of(&h, 2022), Some("10001")); // before first statement → earliest
+        assert_eq!(zip_as_of(&h, 2023), Some("10001"));
+        assert_eq!(zip_as_of(&h, 2024), Some("10001")); // latest ≤ 2024 is the 2023 statement
+        assert_eq!(zip_as_of(&h, 2025), Some("10024"));
+        assert_eq!(zip_as_of(&h, 2030), Some("10024"));
+
+        let fallback = Hh { zip: Some("07030".into()), ..Default::default() };
+        assert_eq!(zip_as_of(&fallback, 2025), Some("07030")); // no series → Account fallback
+        assert_eq!(zip_as_of(&Hh::default(), 2025), None);
+    }
+
+    #[test]
+    fn density_counts_active_households_per_zip_and_suppresses_small_zips() {
+        let mut hh: Vec<Hh> = (0..6)
+            .map(|i| geo_hh(&format!("a{i}"), "10024", Some(2024), None))
+            .collect();
+        hh.extend((0..3).map(|i| geo_hh(&format!("b{i}"), "10025", Some(2024), None)));
+        let geo = zip_geography(&hh, 2025, GeoMode::Density, None);
+        assert_eq!(geo.cells.len(), 1);
+        let cell = &geo.cells[0];
+        assert_eq!(cell.zip, "10024");
+        assert_eq!(cell.measure, 6.0);
+        assert_eq!(cell.n, 6);
+        assert_eq!(geo.suppressed_zips, 1); // 10025 had only 3
+        assert_eq!(geo.out_of_area, 0);
+    }
+
+    #[test]
+    fn provenance_counts_join_year_households_at_their_as_of_zip() {
+        // Five joined FY2025; four of them filed a FY2025 statement in 10024, one moved and
+        // its as-of-2025 ZIP is still 10023 from a FY2024 statement.
+        let mut hh: Vec<Hh> = (0..5)
+            .map(|i| geo_hh(&format!("j{i}"), "10024", Some(2025), None))
+            .collect();
+        hh[4].zip_series = vec![(2024, "10023".into())];
+        // Prior-year joiners must not count.
+        hh.push(geo_hh("old", "10024", Some(2019), None));
+        let geo = zip_geography(&hh, 2025, GeoMode::Provenance, None);
+        let by: std::collections::HashMap<_, _> =
+            geo.cells.iter().map(|c| (c.zip.as_str(), c.n)).collect();
+        // 10024 has 4 new joins (the 5th resolved to 10023, which is then <5 → suppressed).
+        assert_eq!(by.get("10024"), None); // 4 < 5 → suppressed
+        assert_eq!(geo.suppressed_zips, 2);
+    }
+
+    #[test]
+    fn net_change_reports_joins_minus_exits_and_keeps_churn_in_the_tooltip() {
+        // 10024: 8 starters, 5 join, 5 exit → net 0 but churn visible.
+        let mut hh: Vec<Hh> = (0..8)
+            .map(|i| geo_hh(&format!("s{i}"), "10024", Some(2020), None))
+            .collect();
+        for i in 0..5 {
+            hh.push(geo_hh(&format!("in{i}"), "10024", Some(2025), None));
+        }
+        for h in hh.iter_mut().take(5) {
+            h.resign_fy = Some(2025); // five of the starters leave
+        }
+        let geo = zip_geography(&hh, 2025, GeoMode::NetChange, None);
+        let cell = geo.cells.iter().find(|c| c.zip == "10024").unwrap();
+        assert_eq!(cell.measure, 0.0); // 5 joins − 5 exits
+        assert_eq!(cell.joins, 5);
+        assert_eq!(cell.exits, 5);
+        assert!(cell.n >= 5);
+    }
+
+    #[test]
+    fn attrition_mode_matches_the_rate_formula_and_uses_the_ten_household_rate_floor() {
+        // 12 starters in FY2024 (member_in 2024), 3 resign in FY2025.
+        let mut hh: Vec<Hh> = (0..12)
+            .map(|i| geo_hh(&format!("r{i}"), "10024", Some(2024), None))
+            .collect();
+        for h in hh.iter_mut().take(3) {
+            h.resign_fy = Some(2025);
+        }
+        // A ZIP with 8 starters is above the count floor but below the rate floor.
+        hh.extend((0..8).map(|i| geo_hh(&format!("t{i}"), "10025", Some(2024), None)));
+
+        let geo = zip_geography(&hh, 2025, GeoMode::Attrition, None);
+        let cell = geo.cells.iter().find(|c| c.zip == "10024").unwrap();
+        assert_eq!(cell.n, 12);
+        assert_eq!(cell.exits, 3);
+        assert_eq!(cell.measure, pct(3, 12)); // 25.0
+        assert!(geo.cells.iter().all(|c| c.zip != "10025")); // 8 < 10 rate floor
+    }
+
+    #[test]
+    fn retention_reports_share_of_a_cohort_still_members_by_zip() {
+        // 12 households joined FY2020 from 10024; 9 are still members today.
+        let mut hh: Vec<Hh> = (0..12)
+            .map(|i| geo_hh(&format!("c{i}"), "10024", Some(2020), None))
+            .collect();
+        for h in hh.iter_mut().take(9) {
+            h.is_current = true;
+        }
+        // A second ZIP with only 8 in the cohort — below the stricter rate floor.
+        hh.extend((0..8).map(|i| geo_hh(&format!("d{i}"), "10025", Some(2020), None)));
+
+        let geo = zip_geography(&hh, 2020, GeoMode::Retention, None);
+        let cell = geo.cells.iter().find(|c| c.zip == "10024").unwrap();
+        assert_eq!(cell.n, 12);
+        assert_eq!(cell.retained, 9);
+        assert_eq!(cell.measure, pct(9, 12)); // 75.0
+        assert!(geo.cells.iter().all(|c| c.zip != "10025")); // 8 < 10 rate floor
+    }
+
+    #[test]
+    fn segment_filter_narrows_the_population_before_aggregation() {
+        // Six active households in 10024; only four are active religious-school families.
+        let mut hh: Vec<Hh> = (0..6)
+            .map(|i| geo_hh(&format!("f{i}"), "10024", Some(2024), None))
+            .collect();
+        for h in hh.iter_mut().take(4) {
+            h.active_rs_students = 2;
+        }
+        let seg = Some(Segment::School(SchoolLifecycle::ActiveReligiousSchool));
+        let geo = zip_geography(&hh, 2025, GeoMode::Density, seg);
+        // 4 in-segment households < 5 → the ZIP suppresses under the segment.
+        assert!(geo.cells.is_empty());
+        assert_eq!(geo.suppressed_zips, 1);
+    }
+
+    #[test]
+    fn tier_segment_buckets_beyond_the_top_six_into_other() {
+        let mut hh = Vec::new();
+        // Seven distinct tiers; the seventh ("Rare") plus null must fall into "Other".
+        for (rank, tier) in ["A", "B", "C", "D", "E", "F"].iter().enumerate() {
+            for i in 0..(10 - rank as i32) {
+                let mut h = geo_hh(&format!("{tier}{i}"), "10024", Some(2024), None);
+                h.tier = Some((*tier).to_string());
+                hh.push(h);
+            }
+        }
+        let mut rare: Vec<Hh> = (0..5)
+            .map(|i| geo_hh(&format!("rare{i}"), "10024", Some(2024), None))
+            .collect();
+        for h in &mut rare {
+            h.tier = Some("Rare".to_string());
+        }
+        hh.extend(rare);
+
+        let geo = zip_geography(&hh, 2025, GeoMode::Density, None);
+        assert!(geo.options.tiers.contains(&"Other".to_string()));
+        assert!(!geo.options.tiers.contains(&"Rare".to_string()));
+
+        let other = zip_geography(
+            &hh,
+            2025,
+            GeoMode::Density,
+            Some(Segment::Tier("Other".into())),
+        );
+        let cell = other.cells.iter().find(|c| c.zip == "10024").unwrap();
+        assert_eq!(cell.n, 5); // only the five "Rare" households
+    }
+
+    #[test]
+    fn out_of_area_counts_normalizable_non_new_york_zips_without_dropping_them_silently() {
+        let mut hh: Vec<Hh> = (0..5)
+            .map(|i| geo_hh(&format!("ny{i}"), "10024", Some(2024), None))
+            .collect();
+        // Hoboken NJ (07030) is normalizable but outside the packaged NY boundary asset.
+        hh.extend((0..3).map(|i| geo_hh(&format!("nj{i}"), "07030", Some(2024), None)));
+        let geo = zip_geography(&hh, 2025, GeoMode::Density, None);
+        assert_eq!(geo.out_of_area, 3);
+        assert!(geo.cells.iter().all(|c| c.zip == "10024"));
+    }
+
+    #[test]
+    fn zip_geography_view_gates_on_capability_and_leaks_no_raw_postal() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let mut r = fixture()[0].clone();
+            r.insert("Id".into(), serde_json::Value::String(format!("g-{index}")));
+            r.insert("BillingPostalCode".into(), serde_json::Value::String("10024-1234".into()));
+            rows.push(r);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        rebuild(&mut s).unwrap();
+
+        let geo = zip_geography_view(&s, 2027, GeoMode::Density, None).unwrap();
+        assert!(geo.available);
+        assert!(geo.cells.iter().any(|c| c.zip == "10024" && c.n == 6));
+        let json = serde_json::to_string(&geo).unwrap();
+        assert!(!json.contains("10024-1234") && !json.contains("g-0"));
+
+        s.conn()
+            .execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", [])
+            .unwrap();
+        let geo = zip_geography_view(&s, 2027, GeoMode::Density, None).unwrap();
+        assert!(!geo.available);
+        assert!(geo.cells.is_empty());
+    }
+
+    #[test]
+    fn geography_availability_is_decided_at_build_time_not_by_scanning_every_read() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let mut r = fixture()[0].clone();
+            r.insert("Id".into(), serde_json::Value::String(format!("bt-{index}")));
+            r.insert("BillingPostalCode".into(), serde_json::Value::String("10024".into()));
+            rows.push(r);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        rebuild(&mut s).unwrap();
+        assert!(cap_available(&source_capabilities(&s).unwrap(), "geography"));
+
+        // Corrupt every raw postal value in the mirror. A read that re-scanned the raw tables
+        // would now find no normalizable ZIP and flip the capability; a build-time fact holds
+        // until the next rebuild — which is what makes every read a cheap catalog lookup.
+        s.conn()
+            .execute("UPDATE \"Account\" SET \"BillingPostalCode\" = 'n/a'", [])
+            .unwrap();
+        assert!(cap_available(&source_capabilities(&s).unwrap(), "geography"));
+        let served = zip_geography_view(&s, current_fy(), GeoMode::Density, None).unwrap();
+        assert!(served.available);
+        assert!(served.cells.iter().any(|c| c.zip == "10024" && c.n == 6));
+
+        // The rebuild re-derives the fact from the data.
+        rebuild(&mut s).unwrap();
+        assert!(!cap_available(&source_capabilities(&s).unwrap(), "geography"));
+    }
+
+    #[test]
+    fn restoring_a_withheld_postal_field_rescans_instead_of_trusting_the_build_fact() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let mut r = fixture()[0].clone();
+            r.insert("Id".into(), serde_json::Value::String(format!("wh-{index}")));
+            r.insert("BillingPostalCode".into(), serde_json::Value::String("10024".into()));
+            rows.push(r);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        // Withheld at build time: the build fact records "no usable Account ZIP".
+        s.conn()
+            .execute("UPDATE _fields SET withheld = 1 WHERE object='Account' AND field='BillingPostalCode'", [])
+            .unwrap();
+        rebuild(&mut s).unwrap();
+        assert!(!cap_available(&source_capabilities(&s).unwrap(), "geography"));
+        // Restoring the field is a policy change, not a data change: the fact is re-derived
+        // rather than served stale.
+        s.conn()
+            .execute("UPDATE _fields SET withheld = 0 WHERE object='Account' AND field='BillingPostalCode'", [])
+            .unwrap();
+        assert!(cap_available(&source_capabilities(&s).unwrap(), "geography"));
+    }
+
+    #[test]
+    fn zip_geography_views_answers_many_years_in_request_order_and_persists_the_misses() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let mut r = fixture()[0].clone();
+            r.insert("Id".into(), serde_json::Value::String(format!("my-{index}")));
+            r.insert("BillingPostalCode".into(), serde_json::Value::String("10024".into()));
+            rows.push(r);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        rebuild(&mut s).unwrap();
+
+        // Two warmed cohort years plus one far outside the warmed set (a cache miss).
+        let cur = current_fy();
+        let years = [cur - 1, cur - 3, cur - 20];
+        let views = zip_geography_views(&s, GeoMode::Retention, None, &years).unwrap();
+        assert_eq!(
+            views.iter().map(|v| v.fiscal_year).collect::<Vec<_>>(),
+            years.to_vec()
+        );
+        assert!(views.iter().all(|v| v.mode == GeoMode::Retention && v.available));
+
+        // The miss was computed AND persisted, so the next ask for it is a lookup too.
+        let key = geo_view_key(cur - 20, GeoMode::Retention, &None).unwrap();
+        let persisted: Option<String> = s
+            .conn()
+            .query_row(
+                &format!("SELECT payload FROM {GEO_CACHE_TABLE} WHERE view_key = ?1"),
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(persisted.is_some());
+    }
+
+    #[test]
+    fn geography_serves_the_persisted_cache_until_the_next_rebuild() {
+        let (_d, mut s) = mem();
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let mut r = fixture()[0].clone();
+            r.insert("Id".into(), serde_json::Value::String(format!("gc-{index}")));
+            r.insert(
+                "BillingPostalCode".into(),
+                serde_json::Value::String("10024".into()),
+            );
+            rows.push(r);
+        }
+        let mut cols = ACCT_COLS.to_vec();
+        cols.push("BillingPostalCode");
+        seed_account(&mut s, &rows, &cols);
+        rebuild(&mut s).unwrap();
+
+        // The rebuild warmed the persisted cache: the default view's row exists.
+        let cur = current_fy();
+        let key = geo_view_key(cur, GeoMode::Density, &None).unwrap();
+        let cached: String = s
+            .conn()
+            .query_row(
+                &format!("SELECT payload FROM {GEO_CACHE_TABLE} WHERE view_key = ?1"),
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cached.contains("\"zip\":\"10024\""));
+
+        // Tamper the stored payload; the served view must reflect the cache verbatim — proof
+        // the read path does NOT recompute while the build is unchanged (the whole point:
+        // reopening the app can't trigger a recompute unless the data was refreshed).
+        s.conn()
+            .execute(
+                &format!("UPDATE {GEO_CACHE_TABLE} SET payload = ?1 WHERE view_key = ?2"),
+                rusqlite::params![cached.replace("10024", "19104"), key],
+            )
+            .unwrap();
+        let served = zip_geography_view(&s, cur, GeoMode::Density, None).unwrap();
+        assert!(served.cells.iter().any(|c| c.zip == "19104"));
+
+        // A rebuild is the only thing that rewarms — the tampered row is replaced by the truth.
+        rebuild(&mut s).unwrap();
+        let served = zip_geography_view(&s, cur, GeoMode::Density, None).unwrap();
+        assert!(served.cells.iter().any(|c| c.zip == "10024" && c.n == 6));
+        assert!(!served.cells.iter().any(|c| c.zip == "19104"));
+    }
+
+    #[test]
+    fn per_fiscal_year_zip_series_reads_dated_statements_and_places_by_year() {
+        let (_d, mut s) = mem();
+        let mut accounts = fixture();
+        accounts[0].insert("BillingPostalCode".into(), serde_json::Value::String("10024".into()));
+        let mut account_cols = ACCT_COLS.to_vec();
+        account_cols.push("BillingPostalCode");
+        seed_account(&mut s, &accounts, &account_cols);
+        // Two statements in different fiscal years: FY2024 (Aug 2023) in 10023, FY2025 (Aug 2024) in 10025.
+        seed_object(
+            &mut s,
+            "BillingStatement__c",
+            &["Id", "Account__c", "Date__c", "AddressPostalCode__c"],
+            &[
+                row(&[("Id", "s1"), ("Account__c", "001A"), ("Date__c", "2023-08-01"), ("AddressPostalCode__c", "10023")]),
+                row(&[("Id", "s2"), ("Account__c", "001A"), ("Date__c", "2024-08-01"), ("AddressPostalCode__c", "10025")]),
+            ],
+        );
+        let series = billing_statement_zip_series(&s).unwrap();
+        assert_eq!(
+            series.get("001A"),
+            Some(&vec![(2024, "10023".to_string()), (2025, "10025".to_string())])
+        );
     }
 
     #[test]
@@ -3454,6 +4659,48 @@ mod tests {
                 "",
             ]),
         ]
+    }
+
+    #[test]
+    fn schema_fingerprint_is_stable_and_16_hex() {
+        let a = mart_schema_fingerprint();
+        assert_eq!(a, mart_schema_fingerprint(), "an unchanged layout hashes the same");
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn schema_fingerprint_reflects_its_inputs() {
+        // A layout change moves the hash — this is what forces a rebuild automatically.
+        assert_ne!(
+            schema_fingerprint_of(&["CREATE TABLE a(x)"]),
+            schema_fingerprint_of(&["CREATE TABLE a(x, y)"]),
+        );
+        // Reindenting/rewrapping — same tokens, different runs of whitespace — does not, so
+        // a cosmetic reformat of the DDL never triggers a rebuild.
+        assert_eq!(
+            schema_fingerprint_of(&["CREATE TABLE a(x, y)"]),
+            schema_fingerprint_of(&["CREATE   TABLE\n   a(x,   y)"]),
+        );
+        // The \0 part boundary means moving text across an edge still changes the hash.
+        assert_ne!(
+            schema_fingerprint_of(&["ab", "c"]),
+            schema_fingerprint_of(&["a", "bc"]),
+        );
+    }
+
+    #[test]
+    fn rebuild_records_the_current_schema_fingerprint() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        // The stored version IS the shape fingerprint, so a later load with an unchanged
+        // layout sees a match and skips the rebuild (the `schema_current` check in
+        // `commands::ensure_fresh_with`).
+        assert_eq!(
+            s.get_meta("insights_schema_version").unwrap(),
+            Some(mart_schema_fingerprint()),
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import type React from "react";
+import { StrictMode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-library/react";
 import type { PageProps } from "../App";
@@ -40,6 +41,7 @@ vi.mock("./insights/charts", () => {
 });
 
 import InsightsPage, { _resetInsightsSnapshot } from "./InsightsPage";
+import { _resetGeoCache } from "./insights/ZipGeographyMap";
 
 const cap = (key: string, available: boolean): api.SourceCapability => ({
   key, available, required_objects: [], mirrored_columns: available ? ["A"] : [],
@@ -61,8 +63,28 @@ const fakeInsights: api.Insights = {
   outcome_by_tenure: [{ tenure_bucket: "1-2y", outcome: "No longer engaged", n: 5 }],
   school_progression: [{ group: "Nursery → Religious school", n: 8, still_members: 6, pct: 75 }],
   school_gap: [{ bucket: "0-1y", n: 4, still_members: 3, pct: 75 }],
-  dues: [], anchor_type: [], anchor_count: [],
-  zip_attrition: [],
+  dues: [], anchor_type: [], anchor_count: [], geography: null,
+};
+
+// A ZIP-geography payload for the on-demand `zip_geography` command.
+const geo = (over: Partial<api.ZipGeography> = {}): api.ZipGeography => ({
+  fiscal_year: 2026, mode: "density", segment: null, available: true,
+  cells: [
+    { zip: "10024", measure: 42, n: 42, joins: 6, exits: 2, retained: 30 },
+    { zip: "10025", measure: 18, n: 18, joins: 3, exits: 1, retained: 12 },
+  ],
+  out_of_area: 7, suppressed_zips: 2,
+  options: {
+    join_fys: [2026, 2025, 2024], tiers: ["Household", "Other"], categories: ["Voting"],
+    channels: [{ key: "religious_school", label: "Religious School" }],
+    school: [{ key: "active_religious_school", label: "Active religious school" }],
+  },
+  ...over,
+});
+/** The batch command echoes one view per requested year, in request order, like the backend. */
+const echoGeoYears = (a: unknown) => {
+  const args = a as { mode: api.GeoMode; fiscalYears: number[]; segment: api.Segment | null };
+  return args.fiscalYears.map((fy) => geo({ mode: args.mode, fiscal_year: fy, segment: args.segment }));
 };
 const fakeRisk: api.RiskSummary = {
   available: true, unavailable_reason: null, roc_auc: 0.72, top_decile_lift: 2.4, brier: 0.12, baseline_brier: 0.2,
@@ -85,18 +107,18 @@ const rebuildEvent = (over: Partial<api.InsightsProgress> = {}): api.InsightsPro
 // Table values may be factories: they are called per invocation, so a rejected or
 // never-settling promise is created lazily and only when that command is actually called.
 function mockInvoke(over: Partial<Record<string, unknown>> = {}) {
-  invoke.mockImplementation((cmd: string) => {
+  invoke.mockImplementation((cmd: string, args?: unknown) => {
     const table: Record<string, unknown> = {
       get_insights: fakeInsights, get_risk_summary: fakeRisk, get_insights_job: null,
       get_watch_list: fakeWatch, export_watch_list_csv: "C:/exports/watch.csv", ...over,
     };
     const v = cmd in table ? table[cmd] : undefined;
-    return Promise.resolve(typeof v === "function" ? v() : v);
+    return Promise.resolve(typeof v === "function" ? (v as (a: unknown) => unknown)(args) : v);
   });
 }
 
 describe("InsightsPage", () => {
-  beforeEach(() => { invoke.mockReset(); mockInvoke(); listeners.clear(); _resetInsightsSnapshot(); });
+  beforeEach(() => { invoke.mockReset(); mockInvoke(); listeners.clear(); _resetInsightsSnapshot(); _resetGeoCache(); });
   afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
   it("loads aggregates and switches the visible tab section", async () => {
@@ -225,24 +247,152 @@ describe("InsightsPage", () => {
     expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(2);
   });
 
-  it("shows aggregate ZIP attrition with a fiscal-year selector and an unavailable source state", async () => {
-    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", true)], zip_attrition: [{ fy: 2026, zip: "10024", start_households: 8, exits: 2, attrition_rate: 25 }, { fy: 2026, zip: "02108", start_households: 8, exits: 1, attrition_rate: 12.5 }, { fy: 2025, zip: "10024", start_households: 8, exits: 1, attrition_rate: 12.5 }] } });
+  it("gives an executive summary of ZIP geography by mode, segment, and fiscal year", async () => {
+    // The mock echoes the request (mode / fy / segment) like the real backend, so the
+    // component's freshness gate — which prevents rendering one mode's cells under another
+    // mode's view — is actually exercised.
+    const echoGeo = (a: unknown) => {
+      const args = a as { mode: api.GeoMode; fiscalYear: number; segment: api.Segment | null };
+      return geo({ mode: args.mode, fiscal_year: args.fiscalYear, segment: args.segment });
+    };
+    mockInvoke({
+      get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
+      zip_geography: echoGeo,
+      zip_geography_years: echoGeoYears,
+    });
     render(<InsightsPage {...props} />);
-    await screen.findByText("ZIP attrition");
-    expect(screen.getByText(/latest linked billing statement ZIP, with an Account ZIP fallback/)).toBeTruthy();
-    expect(screen.getByRole("combobox", { name: "Fiscal year" })).toBeTruthy();
-    expect(screen.getByRole("img", { name: "New York ZIP attrition map for FY2026" })).toBeTruthy();
-    expect(screen.getByLabelText("10024: 25% attrition; 2 exits from 8 starting households")).toBeTruthy();
-    expect(screen.getByText("10024")).toBeTruthy();
-    expect(screen.getByText("25%")).toBeTruthy();
-    expect(screen.getByText(/1 eligible ZIP is outside New York/)).toBeTruthy();
-    fireEvent.change(screen.getByRole("combobox", { name: "Fiscal year" }), { target: { value: "2025" } });
-    expect(screen.getByRole("img", { name: "New York ZIP attrition map for FY2025" })).toBeTruthy();
+    await screen.findByText("Membership geography");
+    // Default view leads with "Where members are" for the last COMPLETED fiscal year
+    // (currentFy 2027 is only weeks in, so the default is FY2026).
+    expect(await screen.findByRole("region", { name: "Where members are — FY2026" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Where members are" }).getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026)).toBe(true));
 
-    cleanup();
-    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("zip_attrition", false)] } });
+    // Headline stats: total mapped households, the top ZIP, and its concentration share.
+    // geo(): 10024 n=42, 10025 n=18 → 60 total, top ZIP 10024 at 70%.
+    expect(await screen.findByText("Mapped households")).toBeTruthy();
+    expect(screen.getAllByText("60").length).toBeGreaterThan(0);
+    expect(screen.getByText(/70% of total/)).toBeTruthy();
+    // Out-of-area members surface in the summary, never silently dropped.
+    expect(screen.getByText(/7 outside NY/)).toBeTruthy();
+    // Suppression is stated (count floor 5).
+    expect(screen.getByText(/2 smaller ZIPs are hidden.*fewer than 5 in this view/)).toBeTruthy();
+    expect(screen.getByTestId("zip-geography-table")).toBeTruthy();
+
+    // Retention by area: a cohort × area heatmap across eight join-year cohorts, fetched in
+    // ONE backend call — every command queues on one store lock, so eight calls would be
+    // eight waits in a row.
+    fireEvent.click(screen.getByRole("button", { name: "Retention by area" }));
+    expect(await screen.findByRole("region", { name: "Retention by area — cohort trend" })).toBeTruthy();
+    expect(await screen.findByTestId("zip-retention-table")).toBeTruthy();
+    const retentionCalls = invoke.mock.calls.filter(([c, a]) => c === "zip_geography_years" && (a as { mode: string })?.mode === "retention");
+    expect(retentionCalls.length).toBe(1);
+    expect((retentionCalls[0][1] as { fiscalYears: number[] }).fiscalYears).toEqual([2026, 2025, 2024, 2023, 2022, 2021, 2020, 2019]);
+    expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "retention")).toBe(false);
+    expect(screen.getAllByText("10024").length).toBeGreaterThan(0);
+
+    // Growth & decline splits gainers from losers.
+    fireEvent.click(screen.getByRole("button", { name: "Growth & decline" }));
+    expect(await screen.findByRole("region", { name: "Growth & decline — FY2026" })).toBeTruthy();
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "net_change")).toBe(true));
+    expect(await screen.findByText("Losing ground")).toBeTruthy();
+    expect(screen.getByText("Gaining members")).toBeTruthy();
+
+    // Attrition tightens the suppression floor to 10.
+    fireEvent.click(screen.getByRole("button", { name: "Attrition" }));
+    expect(await screen.findByRole("region", { name: "Attrition — FY2026" })).toBeTruthy();
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "attrition")).toBe(true));
+    expect(await screen.findByText(/fewer than 10 in this view/)).toBeTruthy();
+
+    // Segment filters the population before aggregation.
+    fireEvent.change(screen.getByRole("combobox", { name: "Segment" }), { target: { value: "school:active_religious_school" } });
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { segment?: { kind: string } })?.segment?.kind === "school")).toBe(true));
+
+    // The fiscal-year selector drives the time-varying views.
+    fireEvent.change(screen.getByRole("combobox", { name: "Fiscal year" }), { target: { value: "2025" } });
+    expect(await screen.findByRole("region", { name: "Attrition — FY2025" })).toBeTruthy();
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "attrition" && (a as { fiscalYear: number })?.fiscalYear === 2025)).toBe(true));
+  });
+
+  it("serves a revisited geography view from the session cache instead of refetching", async () => {
+    const echoGeo = (a: unknown) => {
+      const args = a as { mode: api.GeoMode; fiscalYear: number; segment: api.Segment | null };
+      return geo({ mode: args.mode, fiscal_year: args.fiscalYear, segment: args.segment });
+    };
+    mockInvoke({
+      get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
+      zip_geography: echoGeo,
+    });
     render(<InsightsPage {...props} />);
-    expect(await screen.findByText(/ZIP attrition is unavailable/)).toBeTruthy();
+    await screen.findByRole("region", { name: "Where members are — FY2026" });
+    const densityCalls = () => invoke.mock.calls.filter(([c, a]) =>
+      c === "zip_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026).length;
+    await waitFor(() => expect(densityCalls()).toBe(1));
+
+    // Leave the default view, then come back to the exact same selection.
+    fireEvent.click(screen.getByRole("button", { name: "Attrition" }));
+    await screen.findByRole("region", { name: "Attrition — FY2026" });
+    fireEvent.click(screen.getByRole("button", { name: "Where members are" }));
+    await screen.findByRole("region", { name: "Where members are — FY2026" });
+
+    // The revisit paints from cache — the backend was never asked a second time for it.
+    expect(densityCalls()).toBe(1);
+  });
+
+  it("asks the backend once per view even when StrictMode double-runs the mount effects", async () => {
+    // Dev-mode StrictMode mounts effects twice. Every geography view queues behind one store
+    // lock on the backend, so a duplicated request is a real, user-visible wait — the page
+    // must coalesce concurrent identical requests, not just cache settled ones.
+    const echoGeo = (a: unknown) => {
+      const args = a as { mode: api.GeoMode; fiscalYear: number; segment: api.Segment | null };
+      return geo({ mode: args.mode, fiscal_year: args.fiscalYear, segment: args.segment });
+    };
+    mockInvoke({
+      get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
+      zip_geography: echoGeo,
+    });
+    render(<StrictMode><InsightsPage {...props} /></StrictMode>);
+    await screen.findByRole("region", { name: "Where members are — FY2026" });
+    await screen.findByText("Mapped households");
+    expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(1);
+    expect(invoke.mock.calls.filter(([c]) => c === "zip_geography").length).toBe(1);
+  });
+
+  it("says what it is loading instead of a bare Loading…", async () => {
+    mockInvoke({
+      get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
+      zip_geography: pending,
+      zip_geography_years: pending,
+    });
+    render(<InsightsPage {...props} />);
+    await screen.findByRole("region", { name: "Where members are — FY2026" });
+    expect(screen.getByText("Loading member households by ZIP for FY2026…")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "New members" }));
+    expect(await screen.findByText("Loading new members by ZIP for FY2026…")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retention by area" }));
+    expect(await screen.findByText("Computing retention by ZIP for the FY2019–FY2026 cohorts…")).toBeTruthy();
+    expect(screen.queryByText("Loading…")).toBeNull();
+  });
+
+  it("paints the default geography view from the insights payload without a standalone request", async () => {
+    // zip_geography never settles here: if the panel fetched the default itself, it would
+    // hang at "Loading…" (the real-world symptom of queuing behind the risk analysis).
+    mockInvoke({
+      get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)], geography: geo() },
+      zip_geography: pending,
+    });
+    render(<InsightsPage {...props} />);
+    // The default view is on screen straight from the payload — no separate zip_geography call.
+    expect(await screen.findByRole("region", { name: "Where members are — FY2026" })).toBeTruthy();
+    expect(screen.getAllByText("60").length).toBeGreaterThan(0); // 42 + 18 mapped households
+    expect(invoke.mock.calls.some(([c]) => c === "zip_geography")).toBe(false);
+  });
+
+  it("shows the geographic-unavailable state and fetches no geography when no postal source is mirrored", async () => {
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", false)] } });
+    render(<InsightsPage {...props} />);
+    expect(await screen.findByText(/Geographic membership insights are unavailable/)).toBeTruthy();
+    expect(invoke.mock.calls.some(([c]) => c === "zip_geography")).toBe(false);
   });
 
   it.each(["Overview", "Jobs", "Renewal & Engagement", "Risk"])("lays out the aggregate report before exporting from %s", async (tab) => {

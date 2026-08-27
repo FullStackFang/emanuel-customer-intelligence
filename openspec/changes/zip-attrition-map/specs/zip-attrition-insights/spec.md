@@ -45,6 +45,26 @@ The system SHALL make ZIP attrition unavailable when neither the usable local `B
 ### Requirement: Offline New York ZIP map
 The system SHALL render eligible New York ZIP attrition aggregates against a packaged local boundary asset without a third-party map, tile, geocoding, or runtime network service. It SHALL provide an accessible table containing the same mapped aggregates.
 
+#### Scenario: Manhattan-area viewport
+- **WHEN** staff view the ZIP attrition map
+- **THEN** its visible extent is centered on Manhattan and limited to an approximately 50-mile radius, rather than the full New York State boundary extent
+
+#### Scenario: Desktop map navigation
+- **WHEN** staff need more detail in the Manhattan-area ZIP map
+- **THEN** they can zoom with the pointer wheel or keyboard-accessible controls, pan by dragging, and restore the default extent without a network map service
+
+#### Scenario: Map-stage inspection
+- **WHEN** staff inspect the Manhattan-area map
+- **THEN** the map presents an in-canvas aggregate legend and ZIP inspection panel, with navigation controls docked at the map edge, rather than separating those tools into page chrome
+
+#### Scenario: Manhattan default extent
+- **WHEN** staff open or reset the ZIP attrition map
+- **THEN** it opens centered closely on Manhattan, and clicking an eligible ZIP selects its aggregate inspection details
+
+#### Scenario: ZIP drill-in
+- **WHEN** staff click an eligible ZIP shape
+- **THEN** the map selects that ZIP and fits a closer local view around its boundary, preserving the aggregate-only inspector and the ability to reset to Manhattan
+
 #### Scenario: Staff inspect an eligible New York ZIP
 - **WHEN** staff hover or focus an eligible ZIP shape on the selected fiscal-year map
 - **THEN** they see its ZIP, attrition rate, exit count, and starting-household count

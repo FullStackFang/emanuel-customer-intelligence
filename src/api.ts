@@ -43,8 +43,29 @@ export interface SchoolGapRow { bucket: string; n: number; still_members: number
 export interface DuesRow { fy: number; active: number; billed: number; coverage_missing: number; settled: number; partially_settled: number; unsettled: number }
 export interface AnchorTypeRow { key: string; label: string; n: number; still_members: number; pct: number }
 export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
-export interface ZipAttritionCell { fy: number; zip: string; start_households: number; exits: number; attrition_rate: number }
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
+
+// ── mode-driven ZIP geography (on-demand, its own command) ────────────────────
+export type GeoMode = "density" | "provenance" | "net_change" | "attrition" | "retention";
+export type SchoolLifecycle = "active_religious_school" | "past_religious_school_cliff" | "nursery_school";
+export type Segment =
+  | { kind: "join_fy"; value: number }
+  | { kind: "tier"; value: string }
+  | { kind: "category"; value: string }
+  | { kind: "channel"; value: string }
+  | { kind: "school"; value: SchoolLifecycle };
+/** One per-ZIP aggregate. `measure` is count | net | rate% per mode; `n` is the household
+ *  denominator behind it (always shown); `joins`/`exits` back net and attrition tooltips. */
+export interface ZipGeoCell { zip: string; measure: number; n: number; joins: number; exits: number; retained: number }
+export interface SegmentOption { key: string; label: string }
+export interface SegmentOptions {
+  join_fys: number[]; tiers: string[]; categories: string[];
+  channels: SegmentOption[]; school: SegmentOption[];
+}
+export interface ZipGeography {
+  fiscal_year: number; mode: GeoMode; segment: Segment | null; available: boolean;
+  cells: ZipGeoCell[]; out_of_area: number; suppressed_zips: number; options: SegmentOptions;
+}
 export interface SourceCapability {
   key: string; available: boolean; required_objects: string[];
   mirrored_columns: string[];
@@ -58,7 +79,10 @@ export interface Insights {
   multi_job: MultiJobRow[]; outcome_by_tenure: OutcomeByTenureRow[];
   school_progression: SchoolRow[]; school_gap: SchoolGapRow[];
   dues: DuesRow[]; anchor_type: AnchorTypeRow[]; anchor_count: AnchorCountRow[];
-  zip_attrition: ZipAttritionCell[];
+  /** Default Geography view (density · last completed FY · all members), resolved on the
+   *  get_insights path so the panel paints immediately instead of a standalone zip_geography
+   *  call queuing behind the risk analysis for the store lock. */
+  geography: ZipGeography | null;
 }
 export const INSIGHT_VIEWS = [
   "trend", "year1", "cohort_matrix", "channels", "school", "reasons", "at_risk",
@@ -87,6 +111,12 @@ export const getAudit = (limit: number, offset: number) => invoke<AuditRow[]>("g
 export const purgeLocalData = () => invoke<void>("purge_local_data");
 
 export const getInsights = (forceRebuild = false) => invoke<Insights>("get_insights", { forceRebuild });
+export const zipGeography = (fiscalYear: number, mode: GeoMode, segment: Segment | null = null) =>
+  invoke<ZipGeography>("zip_geography", { fiscalYear, mode, segment });
+/** Many fiscal years of one mode and segment in a single backend call (one store-lock hold);
+ *  views come back in request order. */
+export const zipGeographyYears = (mode: GeoMode, segment: Segment | null, fiscalYears: number[]) =>
+  invoke<ZipGeography[]>("zip_geography_years", { mode, segment, fiscalYears });
 export const getAtRisk = () => invoke<AtRiskRow[]>("get_at_risk");
 export const exportInsightsCsv = (view: InsightView) => invoke<string>("export_insights_csv", { view });
 export const revealExport = (path: string) => invoke<void>("reveal_export", { path });

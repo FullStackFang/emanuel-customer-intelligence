@@ -30,3 +30,23 @@
 - [x] 5.2 Derive geography from the latest dated linked `BillingStatement__c.AddressPostalCode__c`, with `Account.BillingPostalCode` fallback, while retaining only the normalized ZIP in the mart.
 - [x] 5.3 Update ZIP source capability and UI snapshot/source copy without exposing raw postal, street, or bill-to-other data.
 - [x] 5.4 Run focused and full automated verification for the revised source behavior.
+
+## 6. Manhattan-focused map viewport
+
+- [x] 6.1 Render the ZIP choropleth against an approximately 50-mile Manhattan-centered viewport and cover it with a frontend regression test.
+
+## 7. Desktop map interaction and visual integration
+
+- [x] 7.1 Add desktop zoom, pan, and reset interactions and restyle the local SVG map with the existing product design tokens.
+
+## 8. Map-stage composition
+
+- [x] 8.1 Recompose the ZIP map as a desktop map stage with an in-canvas aggregate inspector, rate legend, and edge-docked controls, inspired by the existing Events map while preserving local aggregate-only behavior.
+
+## 9. Manhattan default extent
+
+- [x] 9.1 Make the map’s default and reset extent a close Manhattan view and allow clicking a ZIP to inspect its aggregate details.
+
+## 10. ZIP drill-in interaction
+
+- [x] 10.1 Fit the local SVG map to a clicked ZIP boundary and keep that ZIP’s aggregate inspector selected.

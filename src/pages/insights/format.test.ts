@@ -15,7 +15,7 @@ const base: Insights = {
   school: [{ group: "Both nursery and religious school", n: 98, still_members: 67, pct: 68.4 }, { group: "No school history", n: 1115, still_members: 443, pct: 39.7 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 90 }, { fy: 2026, reason: "Moved", n: 51 }],
   multi_job: [], outcome_by_tenure: [], school_progression: [], school_gap: [],
-  dues: [], anchor_type: [], anchor_count: [], zip_attrition: [],
+  dues: [], anchor_type: [], anchor_count: [], geography: null,
 };
 
 describe("insights formatting", () => {

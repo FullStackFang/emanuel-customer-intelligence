@@ -5,7 +5,7 @@ import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, Me
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
 import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsHeatmap, TableView, TrendChart, Year1Chart } from "./insights/charts";
-import { NY_ZCTAS, ZipAttritionMap } from "./insights/ZipAttritionMap";
+import { ZipGeographyMap } from "./insights/ZipGeographyMap";
 import { EVIDENCE_LABELS, fmt, fyLabel, soWhat } from "./insights/format";
 
 function SoWhat({ text }: { text: string }) {
@@ -109,8 +109,20 @@ function JobStatus({ labels, progress, elapsed, compact = false }: { labels: rea
  * revalidates in the background, instead of reloading from scratch every time.
  */
 let snapshot: { ins: api.Insights; risk: api.RiskSummary | null; riskFailed: boolean } | null = null;
+/**
+ * The one in-flight `get_insights` call, shared by concurrent loads (StrictMode's doubled
+ * mount effect, a quick tab flip). The backend serializes every command behind one store
+ * lock, so a duplicate request is not free — it is a second full read the user waits on.
+ */
+let inflightInsights: Promise<api.Insights> | null = null;
+function fetchInsights(force: boolean): Promise<api.Insights> {
+  if (force || !inflightInsights) {
+    inflightInsights = api.getInsights(force).finally(() => { inflightInsights = null; });
+  }
+  return inflightInsights;
+}
 /** Test hook: clear the session snapshot so each case starts from a cold page. */
-export function _resetInsightsSnapshot() { snapshot = null; }
+export function _resetInsightsSnapshot() { snapshot = null; inflightInsights = null; }
 
 const PDF_LAYOUT_TIMEOUT_MS = 3_000;
 
@@ -137,7 +149,7 @@ export default function InsightsPage({ status }: PageProps) {
   const [risk, setRisk] = useState<api.RiskSummary | null>(snapshot?.risk ?? null);
   const [riskFailed, setRiskFailed] = useState(snapshot?.riskFailed ?? false);
   const [watch, setWatch] = useState<api.WatchListView | null>(null);
-  const [tab, setTab] = useState<"overview" | "jobs" | "renewal" | "risk">("overview");
+  const [tab, setTab] = useState<"overview" | "jobs" | "renewal" | "geography" | "risk">("overview");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [exported, setExported] = useState<string | null>(null);
@@ -145,7 +157,6 @@ export default function InsightsPage({ status }: PageProps) {
   const [riskBusy, setRiskBusy] = useState(false);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const [zipFy, setZipFy] = useState<number | null>(null);
   const [renderingPdf, setRenderingPdf] = useState(false);
   const pdfReportRef = useRef<HTMLDivElement>(null);
 
@@ -190,7 +201,7 @@ export default function InsightsPage({ status }: PageProps) {
       // one store lock and cannot truly overlap, so awaiting insights first keeps the page
       // from waiting behind the risk compute. A risk rejection resolves to a visible
       // failure state (never a permanent spinner) and never blanks the lifecycle views.
-      const i = await api.getInsights(force);
+      const i = await fetchInsights(force);
       setIns(i);
       setProgress((p) => (p?.job === "rebuild" ? null : p));
       snapshot = { ins: i, risk: snapshot?.risk ?? null, riskFailed: snapshot?.riskFailed ?? false };
@@ -346,9 +357,9 @@ export default function InsightsPage({ status }: PageProps) {
           </Card>
 
           <div className="insights-screen-only" role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap", marginBottom: "var(--space-4)" }}>
-            {(["overview", "jobs", "renewal", "risk"] as const).map((key) => (
+            {(["overview", "jobs", "renewal", "geography", "risk"] as const).map((key) => (
               <Button key={key} size="sm" variant={tab === key ? "primary" : "secondary"} onClick={() => setTab(key)}>
-                {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : "Risk"}
+                {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : key === "geography" ? "Geography" : "Risk"}
               </Button>
             ))}
           </div>
@@ -564,36 +575,13 @@ export default function InsightsPage({ status }: PageProps) {
             )}
           </Card>
 
+          </div>
+
+          {/* ── Geography ────────────────────────────────────────────────────── */}
+          <div className={sectionClass("geography")}>
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
-            <CardHeader><CardTitle>ZIP attrition</CardTitle></CardHeader>
-            {(() => {
-              const zipCapability = ins.capabilities.find((capability) => capability.key === "zip_attrition");
-              const years = [...new Set(ins.zip_attrition.map((cell) => cell.fy))].sort((a, b) => b - a);
-              const selectedFy = zipFy ?? years[0];
-              const rows = ins.zip_attrition.filter((cell) => cell.fy === selectedFy);
-              const mappedRows = rows.filter((row) => NY_ZCTAS.has(row.zip));
-              const unmappedCount = rows.length - mappedRows.length;
-              if (!zipCapability?.available || years.length === 0) {
-                return <Lede>{`ZIP attrition is unavailable. ${zipCapability?.unavailable_reason ?? "A usable billing-statement or Account postal source is not mirrored."} Other Insights views remain available.`}</Lede>;
-              }
-              return <>
-                <Lede>Snapshot-based geography from the latest linked billing statement ZIP, with an Account ZIP fallback. ZIPs with fewer than five starting households are suppressed; eligible ZIPs outside New York or without a packaged boundary are excluded from the map.</Lede>
-                <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", marginBottom: "var(--space-3)", fontSize: "var(--text-sm)" }}>
-                  Fiscal year
-                  <select aria-label="Fiscal year" value={selectedFy} onChange={(event) => setZipFy(Number(event.target.value))}>
-                    {years.map((year) => <option key={year} value={year}>{fyLabel(year)}</option>)}
-                  </select>
-                </label>
-                <div style={{ marginBottom: "var(--space-3)" }}><ZipAttritionMap rows={mappedRows} fiscalYear={fyLabel(selectedFy)} /></div>
-                {unmappedCount > 0 && <p style={{ margin: "0 0 var(--space-3)", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>{unmappedCount} eligible ZIP {unmappedCount === 1 ? "is" : "are"} outside New York or unavailable in the bundled Census ZCTA boundary data.</p>}
-                <TableView rows={mappedRows} getRowKey={(row) => row.zip} columns={[
-                  { key: "zip", header: "ZIP", render: (row) => row.zip },
-                  { key: "rate", header: "Attrition rate", align: "right", render: (row) => `${row.attrition_rate}%` },
-                  { key: "exits", header: "Exits", align: "right", render: (row) => fmt(row.exits) },
-                  { key: "start", header: "Starting households", align: "right", render: (row) => fmt(row.start_households) },
-                ]} />
-              </>;
-            })()}
+            <CardHeader><CardTitle>Membership geography</CardTitle></CardHeader>
+            <ZipGeographyMap currentFy={ins.current_fy} capability={ins.capabilities.find((capability) => capability.key === "geography")} builtAt={ins.built_at ?? ""} initial={ins.geography ?? undefined} />
           </Card>
           </div>
 

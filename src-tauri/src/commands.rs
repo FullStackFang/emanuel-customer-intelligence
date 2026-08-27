@@ -468,10 +468,8 @@ fn ensure_fresh_with(
         (Some(b), Some(n)) => n > b, // ISO-8601 strings compare chronologically
         (Some(_), None) => false,
     };
-    let schema_current = s
-        .get_meta("insights_schema_version")?
-        .and_then(|v| v.parse::<i64>().ok())
-        == Some(insights::MART_SCHEMA_VERSION);
+    let schema_current =
+        s.get_meta("insights_schema_version")? == Some(insights::mart_schema_fingerprint());
     if force || stale || !schema_current || !s.table_exists(insights::MART)? {
         let info = insights::rebuild_with(s, progress)?;
         s.audit(
@@ -483,6 +481,10 @@ fn ensure_fresh_with(
             ),
         )?;
     }
+    // Self-heal a mart built before the geography cache existed (or a warm that failed): do the
+    // one expensive household load once and cache every all-members view, so no geography read
+    // pays it again. A no-op once the cache matches the current build.
+    insights::ensure_geo_cache_warm(s)?;
     Ok(())
 }
 
@@ -547,6 +549,63 @@ pub async fn get_insights(
     .map_err(err)?
 }
 
+/// Mode-driven ZIP geography for one fiscal year, mode, and optional segment. Loaded on
+/// demand when the map view opens, off the `get_insights` critical path. Returns only
+/// suppressed per-ZIP aggregates plus an out-of-area count — never a name, raw postal,
+/// coordinate, or bill-to-other id. Audited as aggregate access (no household identity).
+#[tauri::command]
+pub async fn zip_geography(
+    app: AppHandle,
+    fiscal_year: i32,
+    mode: insights::GeoMode,
+    segment: Option<insights::Segment>,
+    state: State<'_, AppState>,
+) -> CmdResult<insights::ZipGeography> {
+    let mut views = zip_geography_years(app, mode, segment, vec![fiscal_year], state).await?;
+    views.pop().ok_or_else(|| "no geography view returned".to_string())
+}
+
+/// As `zip_geography`, for many fiscal years of one mode and segment: ONE lock acquisition,
+/// one household load on a cache miss, one audit row. The Retention-by-area trend needs eight
+/// cohort years at once, and every command queues on the same store lock, so eight separate
+/// calls would be eight waits in a row. Views come back in request order.
+#[tauri::command]
+pub async fn zip_geography_years(
+    app: AppHandle,
+    mode: insights::GeoMode,
+    segment: Option<insights::Segment>,
+    fiscal_years: Vec<i32>,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<insights::ZipGeography>> {
+    let w = who(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("rebuild", insights::REBUILD_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            ensure_fresh_with(s, &w, false, &mut progress)?;
+            let views = insights::zip_geography_views(s, mode, segment, &fiscal_years)?;
+            s.audit(
+                &w,
+                "insights.zip_geography",
+                None,
+                Some(serde_json::json!({
+                    "fys": fiscal_years,
+                    "cells": views.iter().map(|v| v.cells.len()).sum::<usize>(),
+                    "out_of_area": views.iter().map(|v| v.out_of_area).sum::<i64>(),
+                    "available": views.iter().any(|v| v.available),
+                })),
+            )?;
+            Ok(views)
+        });
+        clear_job(state);
+        out
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>> {
     let w = who(state.inner());
@@ -563,42 +622,82 @@ pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>
     })
 }
 
-/// Rebuild if needed, then return the validated churn analysis — reused from the `_meta`
-/// cache while the analytical dataset is unchanged, recomputed from the freshest mart when
-/// it was rebuilt. Reuse never alters the model or its outputs; it only skips repeats.
+/// Resolved risk inputs: either the cached analysis (no compute needed) or the owned mart
+/// data to fit from. Produced under the store lock; the fit then runs on the owned data.
+enum RiskPrep {
+    Ready((risk::RiskModel, risk::WatchList)),
+    Compute {
+        hh: Vec<insights::Hh>,
+        years: Vec<insights::HhFy>,
+        caps: Vec<insights::SourceCapability>,
+        built: Option<String>,
+        cur: i32,
+    },
+}
+
+/// Under the store lock: rebuild if stale, then hand back either the cached analysis or the
+/// owned inputs to fit from. Deliberately does NOT run the fit — the hot read commands
+/// release the store lock across `risk::analyze_with` (a multi-second fit) so it never blocks
+/// cheap reads that need the same lock only briefly, above all the geography cache. The mart
+/// data it returns is owned, so it holds no store borrow once the lock is dropped.
+fn risk_prepare(s: &mut Store, w: &Who) -> anyhow::Result<RiskPrep> {
+    ensure_fresh(s, w, false)?;
+    // The cache is keyed on `insights_built_at`, which advances only inside the rebuild
+    // transaction, so it self-invalidates on any rebuild. A stamp mismatch, a missing cache,
+    // or an unreadable blob all fall through to the compute inputs below.
+    let built = s.get_meta("insights_built_at")?;
+    if let Some(built_at) = built.as_deref() {
+        let blob = s.get_meta(risk::RISK_CACHE_KEY)?;
+        if let Some(cached) = risk::reuse_cached(built_at, blob.as_deref()) {
+            return Ok(RiskPrep::Ready(cached));
+        }
+    }
+    let t = std::time::Instant::now();
+    let prep = RiskPrep::Compute {
+        hh: insights::load(s)?,
+        years: insights::load_household_years(s)?,
+        caps: insights::source_capabilities(s)?,
+        built,
+        cur: insights::current_fy(),
+    };
+    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk mart read");
+    Ok(prep)
+}
+
+/// Persist a freshly fitted analysis under the current build stamp. Best-effort: no stamp or
+/// an encode failure just skips the cache and the result stands unchanged.
+fn risk_write_cache(
+    s: &Store,
+    built: Option<&str>,
+    model: &risk::RiskModel,
+    list: &risk::WatchList,
+) -> anyhow::Result<()> {
+    if let Some(built_at) = built {
+        if let Some(blob) = risk::serialize_cache(built_at, model, list) {
+            s.set_meta(risk::RISK_CACHE_KEY, &blob)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild if needed, then return the validated churn analysis, reusing the cache when the
+/// dataset is unchanged. Runs the fit under whatever lock the caller already holds; the hot
+/// read commands use `risk_prepare` + `risk_write_cache` directly so they can drop the lock
+/// across the fit. Reuse never alters the model or its outputs; it only skips repeats.
 fn analyze_risk(
     s: &mut Store,
     w: &Who,
     progress: &mut Reporter<'_>,
 ) -> anyhow::Result<(risk::RiskModel, risk::WatchList)> {
-    ensure_fresh(s, w, false)?;
-    // The cache is keyed on `insights_built_at`, which advances only inside the rebuild
-    // transaction, so it self-invalidates on any rebuild. A stamp mismatch, a missing
-    // cache, or an unreadable blob all fall back to the exact compute path below.
-    let built = s.get_meta("insights_built_at")?;
-    if let Some(built_at) = built.as_deref() {
-        let blob = s.get_meta(risk::RISK_CACHE_KEY)?;
-        if let Some(cached) = risk::reuse_cached(built_at, blob.as_deref()) {
-            return Ok(cached);
+    match risk_prepare(s, w)? {
+        RiskPrep::Ready(pair) => Ok(pair),
+        RiskPrep::Compute { hh, years, caps, built, cur } => {
+            let (model, list) =
+                risk::analyze_with(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA, progress);
+            risk_write_cache(s, built.as_deref(), &model, &list)?;
+            Ok((model, list))
         }
     }
-    let cur = insights::current_fy();
-    let t = std::time::Instant::now();
-    let hh = insights::load(s)?;
-    let years = insights::load_household_years(s)?;
-    let caps = insights::source_capabilities(s)?;
-    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk mart read");
-    let t = std::time::Instant::now();
-    let (model, list) = risk::analyze_with(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA, progress);
-    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk::analyze (compute)");
-    // Persist for reuse. If there is no build stamp yet, or it cannot encode, skip caching
-    // and return the freshly computed result unchanged.
-    if let Some(built_at) = built {
-        if let Some(blob) = risk::serialize_cache(&built_at, &model, &list) {
-            s.set_meta(risk::RISK_CACHE_KEY, &blob)?;
-        }
-    }
-    Ok((model, list))
 }
 
 /// Aggregate Risk view: validation results and backtests only. No household names, so it
@@ -609,15 +708,26 @@ pub async fn get_risk_summary(
     state: State<'_, AppState>,
 ) -> CmdResult<risk::RiskSummary> {
     let w = who(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || -> CmdResult<risk::RiskSummary> {
         let state = app.state::<AppState>();
         let state = state.inner();
         let mut sink = progress_sink(&app, state);
         let mut progress = Reporter::new("risk", risk::RISK_STEPS, &mut sink);
-        let out = with_store(state, |s| {
-            let (model, list) = analyze_risk(s, &w, &mut progress)?;
+        // Hold the lock only for the quick prepare and the cache write; drop it across the fit.
+        let out = (|| -> CmdResult<risk::RiskSummary> {
+            let (model, list) = match with_store(state, |s| risk_prepare(s, &w))? {
+                RiskPrep::Ready(pair) => pair,
+                RiskPrep::Compute { hh, years, caps, built, cur } => {
+                    let t = std::time::Instant::now();
+                    let (model, list) =
+                        risk::analyze_with(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA, &mut progress);
+                    tracing::debug!(target: "insights_timing", ms = t.elapsed().as_millis(), "risk::analyze (compute, lock released)");
+                    with_store(state, |s| risk_write_cache(s, built.as_deref(), &model, &list))?;
+                    (model, list)
+                }
+            };
             Ok(risk::risk_summary(&model, &list))
-        });
+        })();
         clear_job(state);
         out
     })
@@ -633,22 +743,36 @@ pub async fn get_watch_list(
     state: State<'_, AppState>,
 ) -> CmdResult<risk::WatchListView> {
     let w = who(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || -> CmdResult<risk::WatchListView> {
         let state = app.state::<AppState>();
         let state = state.inner();
         let mut sink = progress_sink(&app, state);
         let mut progress = Reporter::new("risk", risk::RISK_STEPS, &mut sink);
-        let out = with_store(state, |s| {
-            let (model, list) = analyze_risk(s, &w, &mut progress)?;
+        let out = (|| -> CmdResult<risk::WatchListView> {
+            // Prepare under the lock, fit with the lock released, then write the cache, audit,
+            // and build the view in one final locked section.
+            let (model, list, to_cache) = match with_store(state, |s| risk_prepare(s, &w))? {
+                RiskPrep::Ready(pair) => (pair.0, pair.1, None),
+                RiskPrep::Compute { hh, years, caps, built, cur } => {
+                    let (model, list) =
+                        risk::analyze_with(&hh, &years, &caps, cur, risk::DEFAULT_ALPHA, &mut progress);
+                    (model, list, Some(built))
+                }
+            };
             let view = risk::watch_list_view(&model, &list);
-            s.audit(
-                &w,
-                "risk.watch_list.load",
-                None,
-                Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
-            )?;
-            Ok(view)
-        });
+            with_store(state, |s| {
+                if let Some(built) = &to_cache {
+                    risk_write_cache(s, built.as_deref(), &model, &list)?;
+                }
+                s.audit(
+                    &w,
+                    "risk.watch_list.load",
+                    None,
+                    Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
+                )?;
+                Ok(view)
+            })
+        })();
         clear_job(state);
         out
     })

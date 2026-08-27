@@ -82,6 +82,21 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // (b2) geography: the Retention-by-area trend's eight cohort years in one call, twice
+    // (the first may lazily fill a miss; the second must be pure cache lookups).
+    let cohorts: Vec<i32> = (1..=8).map(|i| cur - i).collect();
+    for label in ["first", "second"] {
+        let t = Instant::now();
+        let views = insights::zip_geography_views(&s, insights::GeoMode::Retention, None, &cohorts)?;
+        println!(
+            "[geo] zip_geography_views retention x{} ({label}): {} ms  (available={}, cells={})",
+            cohorts.len(),
+            t.elapsed().as_millis(),
+            views.iter().filter(|v| v.available).count(),
+            views.iter().map(|v| v.cells.len()).sum::<usize>()
+        );
+    }
+
     // (c) risk mart read
     let t = Instant::now();
     let hh = insights::load(&s)?;

@@ -8,6 +8,14 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // maplibre-gl loads its parser/worker as a separate ESM chunk that Vite's
+  // dep optimizer mangles (missing maplibre-gl-worker.mjs), which stops every
+  // GeoJSON source from loading. Excluding it from pre-bundling is the upstream
+  // fix; the map's own web worker then resolves correctly.
+  optimizeDeps: {
+    exclude: ["maplibre-gl"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
