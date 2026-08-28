@@ -1,26 +1,40 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { PageProps } from "../App";
 import * as api from "../api";
-import { Alert, Button, Card, Field, Input, Select } from "../design-system";
+import { Alert, Button, Card, Field, Input } from "../design-system";
 import { PageTitle } from "../design-system/ui-kits/grant-management/chrome.jsx";
 
-const CLOUD: Record<api.LlmProvider, boolean> = {
-  anthropic: true, openai: true, google: true, ollama: false, custom: true,
-};
-const USES_KEY: Record<api.LlmProvider, boolean> = {
-  anthropic: true, openai: true, google: true, ollama: false, custom: true,
-};
-const LABEL: Record<api.LlmProvider, string> = {
-  anthropic: "Anthropic (Claude)", openai: "OpenAI", google: "Google (Gemini)",
-  ollama: "Ollama (local)", custom: "Custom (OpenAI-compatible)",
+/** How each backend authenticates and how to sign in — all keyless. */
+const BACKEND_META: Record<api.ChatBackend, { label: string; auth: string }> = {
+  ollama: { label: "Ollama (local)", auth: "Runs entirely on this machine — nothing leaves it." },
+  claude: { label: "Claude", auth: "Uses your Claude Code CLI login. Run `claude` in a terminal to sign in." },
+  "chat-gpt": { label: "ChatGPT", auth: "Uses your Codex CLI login. Run `codex login` in a terminal to sign in." },
 };
 
-// Rebuild the full LlmSettings the backend expects from the array-shaped view.
+function StatusPill({ available }: { available: boolean }) {
+  const [bg, fg, label] = available
+    ? ["var(--color-success-50)", "var(--color-success-700)", "Available"]
+    : ["var(--bg-secondary)", "var(--text-secondary)", "Not available"];
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: "var(--space-2)",
+      padding: "2px var(--space-2)", borderRadius: "var(--radius-full, 999px)",
+      background: bg, color: fg, fontSize: "var(--text-xs)", fontWeight: "var(--font-medium)", whiteSpace: "nowrap",
+    }}>
+      <span style={{ width: 7, height: 7, borderRadius: "50%", background: available ? "var(--color-success-500)" : "var(--border-strong)" }} />
+      {label}
+    </span>
+  );
+}
+
+// Rebuild the full LlmSettings the backend expects from the array-shaped view. Only the local
+// Ollama config is user-editable here; the other providers' stored config is preserved untouched.
 function toSettings(view: api.LlmSettingsView): api.LlmSettings {
-  const byProvider = (p: api.LlmProvider) =>
-    view.providers.find((x) => x.provider === p)!.config;
+  const byProvider = (p: api.LlmProvider) => view.providers.find((x) => x.provider === p)!.config;
   return {
-    active_provider: view.active_provider,
+    // The chat never uses the API-key path, so the "active provider" is pinned to the local
+    // Ollama backend — which also keeps `set_llm_settings` clear of the cloud-egress gate.
+    active_provider: "ollama",
     cloud_egress_ack: view.cloud_egress_ack,
     anthropic: byProvider("anthropic"), openai: byProvider("openai"),
     google: byProvider("google"), ollama: byProvider("ollama"), custom: byProvider("custom"),
@@ -29,57 +43,47 @@ function toSettings(view: api.LlmSettingsView): api.LlmSettings {
 
 export default function SettingsPage(_props: PageProps) {
   const [view, setView] = useState<api.LlmSettingsView | null>(null);
-  const [selected, setSelected] = useState<api.LlmProvider>("anthropic");
-  const [keyInput, setKeyInput] = useState("");
+  const [statuses, setStatuses] = useState<api.ChatBackendStatus[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
-  const [test, setTest] = useState<api.TestResult | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = () =>
+  const load = useCallback(() =>
     api.getLlmSettings()
-      .then((v) => { setView(v); if (v.active_provider) setSelected(v.active_provider); })
-      .catch((e) => setErr(String(e)));
+      .then((v) => setView(v))
+      .catch((e) => setErr(String(e))), []);
 
-  useEffect(() => { void load(); }, []);
+  const refreshStatus = useCallback(() =>
+    api.chatBackendStatus()
+      .then(setStatuses)
+      .catch((e) => setErr(String(e))), []);
+
+  useEffect(() => { void load(); void refreshStatus(); }, [load, refreshStatus]);
   if (!view) return null;
 
-  const current = view.providers.find((p) => p.provider === selected)!;
-  const patchConfig = (p: Partial<api.ProviderConfig>) =>
+  const ollama = view.providers.find((p) => p.provider === "ollama")!.config;
+  const patchOllama = (p: Partial<api.ProviderConfig>) =>
     setView({
       ...view,
       providers: view.providers.map((x) =>
-        x.provider === selected ? { ...x, config: { ...x.config, ...p } } : x),
+        x.provider === "ollama" ? { ...x, config: { ...x.config, ...p } } : x),
     });
+  const statusOf = (b: api.ChatBackend) => statuses.find((s) => s.backend === b);
 
-  const cloudBlocked = CLOUD[selected] && !view.cloud_egress_ack;
-
-  const save = async () => {
+  const saveOllama = async () => {
     setErr(null); setMsg(null); setBusy(true);
     try {
-      await api.setLlmSettings({ ...toSettings(view), active_provider: selected });
-      if (USES_KEY[selected] && keyInput.trim()) {
-        await api.setLlmKey(selected, keyInput.trim());
-        setKeyInput("");
-      }
+      await api.setLlmSettings(toSettings(view));
       await load();
+      await refreshStatus();
       setMsg("Saved.");
     } catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   };
 
-  const runTest = async () => {
-    setErr(null); setMsg(null); setTest(null); setBusy(true);
-    try { setTest(await api.testLlmConnection(selected)); }
-    catch (e) { setErr(String(e)); }
-    finally { setBusy(false); }
-  };
-
-  const clearKey = async () => {
-    setBusy(true);
-    try { await api.clearLlmKey(selected); await load(); }
-    catch (e) { setErr(String(e)); }
-    finally { setBusy(false); }
+  const checkAgain = async () => {
+    setErr(null); setMsg(null); setBusy(true);
+    try { await refreshStatus(); } finally { setBusy(false); }
   };
 
   return (
@@ -89,69 +93,66 @@ export default function SettingsPage(_props: PageProps) {
       {msg && <Alert tone="success" style={{ marginBottom: "var(--space-4)" }}>{msg}</Alert>}
 
       <Card>
-        <h2 style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-lg)", margin: "0 0 var(--space-4)" }}>
-          AI Agent
-        </h2>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--space-3)", marginBottom: "var(--space-2)" }}>
+          <h2 style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-lg)", margin: 0 }}>AI Chat</h2>
+          <Button variant="secondary" size="sm" disabled={busy} onClick={checkAgain}>Check again</Button>
+        </div>
+        <p style={{ color: "var(--text-secondary)", fontSize: "var(--text-sm)", lineHeight: "var(--leading-normal)", margin: "0 0 var(--space-5)" }}>
+          The assistant answers questions about the membership data with no API keys. It uses your
+          computer's own <strong>Claude</strong> and <strong>ChatGPT</strong> subscriptions (through the
+          Claude&nbsp;Code and Codex command-line tools) or a local <strong>Ollama</strong> server. Only a
+          de-identified aggregate snapshot is ever sent — never a household's name, address, or record.
+        </p>
 
-        <Field label="Provider" hint={undefined} error={undefined} htmlFor={undefined}>
-          <Select
-            value={selected}
-            options={api.PROVIDERS.map((p) => ({ value: p, label: LABEL[p] }))}
-            children={undefined}
-            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => {
-              setSelected(e.target.value as api.LlmProvider); setTest(null); setKeyInput("");
-            }}
-          />
-        </Field>
-
-        <Field label="Model" hint={undefined} error={undefined} htmlFor={undefined}>
-          <Input value={current.config.model}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => patchConfig({ model: e.target.value })} />
-        </Field>
-
-        <Field label="Base URL" hint={undefined} error={undefined} htmlFor={undefined}>
-          <Input value={current.config.base_url}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => patchConfig({ base_url: e.target.value })} />
-        </Field>
-
-        <Field label="Timeout (seconds)" hint={undefined} error={undefined} htmlFor={undefined}>
-          <Input type="number" value={String(current.config.timeout_secs)}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              patchConfig({ timeout_secs: Number(e.target.value) || 0 })} />
-        </Field>
-
-        {USES_KEY[selected] && (
-          <Field label="API key" hint={undefined} error={undefined} htmlFor={undefined}>
-            {current.has_key
-              ? (<div style={{ display: "flex", gap: "var(--space-3)", alignItems: "center" }}>
-                  <span style={{ color: "var(--text-secondary)", fontSize: "var(--text-sm)" }}>•••• set</span>
-                  <Button variant="secondary" size="sm" disabled={busy} onClick={clearKey}>Clear</Button>
-                </div>)
-              : (<Input type="password" value={keyInput} placeholder="Paste key"
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeyInput(e.target.value)} />)}
-          </Field>
-        )}
-
-        {CLOUD[selected] && (
-          <Alert tone="warning" style={{ margin: "var(--space-4) 0" }}>
-            <label style={{ display: "flex", gap: "var(--space-2)", alignItems: "flex-start" }}>
-              <input type="checkbox" checked={view.cloud_egress_ack}
-                onChange={(e) => setView({ ...view, cloud_egress_ack: e.target.checked })} />
-              <span>I understand this provider sends congregation data to an external service.</span>
-            </label>
-          </Alert>
-        )}
-
-        <div style={{ display: "flex", gap: "var(--space-3)", marginTop: "var(--space-4)" }}>
-          <Button disabled={busy || cloudBlocked} onClick={save}>Save</Button>
-          <Button variant="secondary" disabled={busy || cloudBlocked} onClick={runTest}>Test connection</Button>
+        {/* Backend availability */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)", marginBottom: "var(--space-5)" }}>
+          {api.CHAT_BACKENDS.map(({ key }) => {
+            const st = statusOf(key);
+            return (
+              <div key={key} style={{
+                display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "var(--space-3)",
+                padding: "var(--space-3)", borderRadius: "var(--radius-lg)", border: "1px solid var(--border-subtle)",
+              }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: "var(--text-sm)", fontWeight: "var(--font-semibold)", color: "var(--text-primary)" }}>
+                    {BACKEND_META[key].label}
+                  </div>
+                  <div style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", marginTop: 2 }}>
+                    {BACKEND_META[key].auth}
+                  </div>
+                  {st?.detail && (
+                    <div style={{ fontSize: "var(--text-xs)", color: "var(--text-tertiary, var(--text-secondary))", marginTop: 4, fontFamily: "var(--font-mono, monospace)" }}>
+                      {st.detail}
+                    </div>
+                  )}
+                </div>
+                <StatusPill available={st?.available ?? false} />
+              </div>
+            );
+          })}
         </div>
 
-        {test && (
-          <Alert tone={test.ok ? "success" : "error"} style={{ marginTop: "var(--space-4)" }}>
-            {test.ok ? "Connection OK" : "Connection failed"} — {test.detail}
-          </Alert>
-        )}
+        {/* Keyless local Ollama configuration */}
+        <div style={{ borderTop: "1px solid var(--border-subtle)", paddingTop: "var(--space-4)" }}>
+          <h3 style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-base)", margin: "0 0 var(--space-1)" }}>
+            Local Ollama
+          </h3>
+          <p style={{ color: "var(--text-secondary)", fontSize: "var(--text-xs)", margin: "0 0 var(--space-3)" }}>
+            The address and model of your local Ollama server. Claude and ChatGPT need no settings here —
+            they use their CLI login.
+          </p>
+          <Field label="Server URL" hint={undefined} error={undefined} htmlFor={undefined}>
+            <Input value={ollama.base_url}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => patchOllama({ base_url: e.target.value })} />
+          </Field>
+          <Field label="Model" hint={undefined} error={undefined} htmlFor={undefined}>
+            <Input value={ollama.model} placeholder="e.g. llama3.1"
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => patchOllama({ model: e.target.value })} />
+          </Field>
+          <div style={{ marginTop: "var(--space-4)" }}>
+            <Button disabled={busy} onClick={saveOllama}>Save</Button>
+          </div>
+        </div>
       </Card>
     </div>
   );

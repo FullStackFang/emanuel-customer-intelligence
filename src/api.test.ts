@@ -85,4 +85,29 @@ describe("api wrappers map 1:1 to Rust commands", () => {
     ]);
     expect([...api.PROVIDERS]).toEqual(["anthropic", "openai", "google", "ollama", "custom"]);
   });
+
+  it("chat wrappers use the exact command names and camelCase args", async () => {
+    invoke.mockResolvedValue(undefined);
+    await api.chatCreateConversation("ollama", "My chat");
+    await api.chatListConversations();
+    await api.chatListMessages("conv-1");
+    await api.chatRenameConversation("conv-1", "Renamed");
+    await api.chatDeleteConversation("conv-1");
+    await api.chatClearHistory();
+    await api.chatBackendStatus();
+    await api.chatSend("conv-1", "chat-gpt", "hello");
+    await api.chatCancel("conv-1");
+    expect(invoke.mock.calls).toEqual([
+      ["chat_create_conversation", { backend: "ollama", title: "My chat" }],
+      ["chat_list_conversations"],
+      ["chat_list_messages", { conversationId: "conv-1" }],
+      ["chat_rename_conversation", { conversationId: "conv-1", title: "Renamed" }],
+      ["chat_delete_conversation", { conversationId: "conv-1" }],
+      ["chat_clear_history"],
+      ["chat_backend_status"],
+      ["chat_send", { conversationId: "conv-1", backend: "chat-gpt", message: "hello" }],
+      ["chat_cancel", { conversationId: "conv-1" }],
+    ]);
+    expect(api.CHAT_BACKENDS.map((b) => b.key)).toEqual(["ollama", "claude", "chat-gpt"]);
+  });
 });

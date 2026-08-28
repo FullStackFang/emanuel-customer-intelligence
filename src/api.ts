@@ -215,3 +215,46 @@ export const setLlmKey = (provider: LlmProvider, key: string) =>
 export const clearLlmKey = (provider: LlmProvider) => invoke<void>("clear_llm_key", { provider });
 export const testLlmConnection = (provider: LlmProvider) =>
   invoke<TestResult>("test_llm_connection", { provider });
+
+// ── Governed chat ─────────────────────────────────────────────────────────────
+/** The three keyless backends. `chat-gpt` runs the Codex CLI; `claude` runs the Claude Code CLI. */
+export type ChatBackend = "ollama" | "claude" | "chat-gpt";
+export const CHAT_BACKENDS: { key: ChatBackend; label: string }[] = [
+  { key: "ollama", label: "Ollama (local)" },
+  { key: "claude", label: "Claude" },
+  { key: "chat-gpt", label: "ChatGPT" },
+];
+export interface ChatConversation {
+  id: string; backend: string; title: string; session_id: string | null;
+  created_at: string; updated_at: string;
+}
+export interface StoredChatMessage {
+  id: string; conversation_id: string; role: string; content: string; created_at: string;
+}
+export interface ChatBackendStatus { backend: ChatBackend; available: boolean; detail: string }
+
+export const chatCreateConversation = (backend: ChatBackend, title: string) =>
+  invoke<ChatConversation>("chat_create_conversation", { backend, title });
+export const chatListConversations = () => invoke<ChatConversation[]>("chat_list_conversations");
+export const chatListMessages = (conversationId: string) =>
+  invoke<StoredChatMessage[]>("chat_list_messages", { conversationId });
+export const chatRenameConversation = (conversationId: string, title: string) =>
+  invoke<void>("chat_rename_conversation", { conversationId, title });
+export const chatDeleteConversation = (conversationId: string) =>
+  invoke<void>("chat_delete_conversation", { conversationId });
+export const chatClearHistory = () => invoke<void>("chat_clear_history");
+export const chatBackendStatus = () => invoke<ChatBackendStatus[]>("chat_backend_status");
+export const chatSend = (conversationId: string, backend: ChatBackend, message: string) =>
+  invoke<void>("chat_send", { conversationId, backend, message });
+export const chatCancel = (conversationId: string) =>
+  invoke<void>("chat_cancel", { conversationId });
+
+export interface ChatTokenPayload { conversation_id: string; token: string }
+export interface ChatDonePayload { conversation_id: string; message_id: string; content: string }
+export interface ChatErrorPayload { conversation_id: string; error: string }
+export const onChatToken = (cb: (p: ChatTokenPayload) => void): Promise<UnlistenFn> =>
+  listen<ChatTokenPayload>("chat:token", (e) => cb(e.payload));
+export const onChatDone = (cb: (p: ChatDonePayload) => void): Promise<UnlistenFn> =>
+  listen<ChatDonePayload>("chat:done", (e) => cb(e.payload));
+export const onChatError = (cb: (p: ChatErrorPayload) => void): Promise<UnlistenFn> =>
+  listen<ChatErrorPayload>("chat:error", (e) => cb(e.payload));

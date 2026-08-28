@@ -2,7 +2,10 @@
 //! Every command: (1) never returns a token, (2) audits itself, (3) never holds
 //! the store lock across an await.
 
+use crate::agent::{self, AgentRegistry};
 use crate::auth::{self, Identity};
+use crate::chat::{self, Cancel, ChatBackend};
+use crate::chat_context;
 use crate::config::Config;
 use crate::insights::{self, AtRiskRow, Insights};
 use crate::llm;
@@ -12,9 +15,11 @@ use crate::risk;
 use crate::salesforce::SfClient;
 use crate::secrets::{Secrets, TOKENS};
 use crate::segment::{self, SegmentReq, SegmentResult};
-use crate::store::{self, AuditRow, FieldRow, ObjectRow, Store, Who};
+use crate::store::{self, AuditRow, ChatConversation, FieldRow, ObjectRow, StoredChatMessage, Store, Who};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -28,6 +33,18 @@ pub struct AppState {
     /// job is running. Deliberately separate from `store` so it can be read while a rebuild
     /// holds the store lock.
     pub job: Mutex<Option<ProgressEvent>>,
+    /// In-flight chat streams: the existing agent-run registry holds each stream's task handle
+    /// (keyed by conversation id) so `chat_cancel` can abort it — which kills any CLI subprocess
+    /// via kill_on_drop — and `chat_cancels` holds each stream's cooperative cancel flag.
+    pub agents: AgentRegistry,
+    pub chat_cancels: Mutex<HashMap<String, Cancel>>,
+}
+
+/// A short unique id with a role prefix (OS randomness, matching `secrets`/`auth`).
+fn new_id(prefix: &str) -> String {
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    format!("{prefix}-{}", hex::encode(b))
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -1037,4 +1054,295 @@ pub async fn test_llm_connection(
         None => None,
     };
     Ok(llm::run_test(provider, &config, key.as_deref()).await)
+}
+
+// ── governed chat ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct ChatTokenEvent {
+    conversation_id: String,
+    token: String,
+}
+#[derive(Serialize, Clone)]
+struct ChatDoneEvent {
+    conversation_id: String,
+    message_id: String,
+    content: String,
+}
+#[derive(Serialize, Clone)]
+struct ChatErrorEvent {
+    conversation_id: String,
+    error: String,
+}
+
+/// Everything a streaming turn needs, assembled once under the store lock: the governed snapshot
+/// (the sole model input), the prior turns, and the selected backend's runtime config. The user
+/// message is persisted here too, so the turn is recorded even if generation later fails.
+struct ChatPrep {
+    snapshot: String,
+    history: Vec<chat::ChatMessage>,
+    ollama_base_url: String,
+    ollama_model: String,
+    cli_model: Option<String>,
+}
+
+#[tauri::command]
+pub async fn chat_create_conversation(
+    backend: chat::BackendKind,
+    title: String,
+    state: State<'_, AppState>,
+) -> CmdResult<ChatConversation> {
+    let id = new_id("conv");
+    let title = if title.trim().is_empty() { "New conversation".to_string() } else { title };
+    with_store(state.inner(), |s| {
+        s.create_conversation(&id, backend.as_str(), &title)?;
+        Ok(s.get_conversation(&id)?.expect("conversation just created"))
+    })
+}
+
+#[tauri::command]
+pub async fn chat_list_conversations(state: State<'_, AppState>) -> CmdResult<Vec<ChatConversation>> {
+    with_store(state.inner(), |s| s.list_conversations())
+}
+
+#[tauri::command]
+pub async fn chat_list_messages(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<StoredChatMessage>> {
+    with_store(state.inner(), |s| s.list_chat_messages(&conversation_id))
+}
+
+#[tauri::command]
+pub async fn chat_rename_conversation(
+    conversation_id: String,
+    title: String,
+    state: State<'_, AppState>,
+) -> CmdResult<()> {
+    with_store(state.inner(), |s| s.rename_conversation(&conversation_id, &title))
+}
+
+#[tauri::command]
+pub async fn chat_delete_conversation(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> CmdResult<()> {
+    with_store(state.inner(), |s| s.delete_conversation(&conversation_id))
+}
+
+/// Clear all chat history. Deletes every conversation and message; the synced mirror and Insights
+/// are untouched (a separate concern from `purge_local_data`).
+#[tauri::command]
+pub async fn chat_clear_history(state: State<'_, AppState>) -> CmdResult<()> {
+    let w = who(state.inner());
+    with_store(state.inner(), |s| {
+        s.clear_chat()?;
+        s.audit(&w, "chat.clear_history", None, None)
+    })
+}
+
+#[derive(Serialize)]
+pub struct ChatBackendStatus {
+    pub backend: chat::BackendKind,
+    pub available: bool,
+    pub detail: String,
+}
+
+/// Availability of each backend: the CLI agents via `agent::detect` (present + runnable), the
+/// local Ollama server via a reachability probe. Reads the Ollama base URL under the lock, then
+/// releases it before the (subprocess / network) probes.
+#[tauri::command]
+pub async fn chat_backend_status(state: State<'_, AppState>) -> CmdResult<Vec<ChatBackendStatus>> {
+    let ollama_base = with_store(state.inner(), |s| {
+        Ok(llm::LlmSettings::load(s)?
+            .config(llm::Provider::Ollama)
+            .base_url
+            .clone())
+    })?;
+    let mut out = Vec::with_capacity(3);
+    for b in chat::BackendKind::all() {
+        let (available, detail) = match b.agent() {
+            None => {
+                let ok = chat::ollama_reachable(&ollama_base).await;
+                let detail = if ok {
+                    format!("Local Ollama server reachable at {ollama_base}")
+                } else {
+                    format!("No local Ollama server at {ollama_base}")
+                };
+                (ok, detail)
+            }
+            Some(a) => {
+                let st = agent::detect(a).await;
+                let detail = st
+                    .version
+                    .clone()
+                    .or_else(|| st.error.clone())
+                    .unwrap_or_default();
+                (st.installed, detail)
+            }
+        };
+        out.push(ChatBackendStatus { backend: b, available, detail });
+    }
+    Ok(out)
+}
+
+/// Send a chat turn: build the governed snapshot, persist the user message, then stream the
+/// selected backend's reply as `chat:token` events, closing with `chat:done` (or `chat:error`).
+/// Returns as soon as the stream is launched; the run is registered so `chat_cancel` can abort it.
+#[tauri::command]
+pub async fn chat_send(
+    app: AppHandle,
+    conversation_id: String,
+    backend: chat::BackendKind,
+    message: String,
+    state: State<'_, AppState>,
+) -> CmdResult<()> {
+    let msg = message.trim().to_string();
+    if msg.is_empty() {
+        return Err("Message is empty.".into());
+    }
+    let w = who(state.inner());
+
+    // (a) Prepare under the store lock (a stale mart triggers a rebuild here): off the async workers.
+    let app_prep = app.clone();
+    let conv_prep = conversation_id.clone();
+    let user_prep = msg.clone();
+    let prep = tauri::async_runtime::spawn_blocking(move || -> CmdResult<ChatPrep> {
+        let state = app_prep.state::<AppState>();
+        let state = state.inner();
+        with_store(state, |s| {
+            if s.get_conversation(&conv_prep)?.is_none() {
+                return Err(anyhow::anyhow!("unknown conversation"));
+            }
+            ensure_fresh(s, &w, false)?;
+            let snapshot = chat_context::build(s, insights::current_fy())?.text;
+            let history: Vec<chat::ChatMessage> = s
+                .list_chat_messages(&conv_prep)?
+                .into_iter()
+                .map(|m| chat::ChatMessage { role: m.role, content: m.content })
+                .collect();
+            s.append_chat_message(&new_id("msg"), &conv_prep, "user", &user_prep)?;
+            let (ollama_base_url, ollama_model, cli_model) = match backend.agent() {
+                None => {
+                    let c = llm::LlmSettings::load(s)?.config(llm::Provider::Ollama).clone();
+                    (c.base_url, c.model, None)
+                }
+                Some(a) => {
+                    let model = agent::AgentSettings::load(s)?.config(a).model.clone();
+                    (String::new(), String::new(), model)
+                }
+            };
+            s.audit(
+                &w,
+                "chat.send",
+                None,
+                Some(serde_json::json!({"backend": backend, "conversation": conv_prep})),
+            )?;
+            Ok(ChatPrep { snapshot, history, ollama_base_url, ollama_model, cli_model })
+        })
+    })
+    .await
+    .map_err(err)??;
+
+    // (b) Register a cancel flag, spawn the streaming task, register its handle for abort.
+    let cancel = chat::new_cancel();
+    state
+        .chat_cancels
+        .lock()
+        .map_err(|_| "chat cancel lock poisoned".to_string())?
+        .insert(conversation_id.clone(), cancel.clone());
+    let app_run = app.clone();
+    let conv_run = conversation_id.clone();
+    let handle = tokio::spawn(async move {
+        run_chat_stream(app_run, conv_run, backend, prep, msg, cancel).await;
+    });
+    state.agents.insert(conversation_id, handle);
+    Ok(())
+}
+
+/// The streaming task body: run the selected backend, emit tokens, persist the reply, and clean up
+/// the run registry. Never holds the store lock across the stream await.
+async fn run_chat_stream(
+    app: AppHandle,
+    conversation_id: String,
+    backend: chat::BackendKind,
+    prep: ChatPrep,
+    user_msg: String,
+    cancel: Cancel,
+) {
+    let token_app = app.clone();
+    let token_conv = conversation_id.clone();
+    let mut on_token = move |tok: &str| {
+        let _ = token_app.emit(
+            "chat:token",
+            ChatTokenEvent { conversation_id: token_conv.clone(), token: tok.to_string() },
+        );
+    };
+
+    let result = match backend.agent() {
+        None => {
+            let b = chat::OllamaBackend { base_url: prep.ollama_base_url, model: prep.ollama_model };
+            b.stream(&prep.snapshot, &prep.history, &user_msg, &mut on_token, &cancel).await
+        }
+        Some(a) => {
+            let mut seed = [0u8; 8];
+            let _ = getrandom::fill(&mut seed);
+            let b = chat::CliAgentBackend { agent: a, model: prep.cli_model, seed: u64::from_le_bytes(seed) };
+            b.stream(&prep.snapshot, &prep.history, &user_msg, &mut on_token, &cancel).await
+        }
+    };
+
+    // Clean up the run registry regardless of outcome.
+    let state = app.state::<AppState>();
+    let st = state.inner();
+    if let Ok(mut m) = st.chat_cancels.lock() {
+        m.remove(&conversation_id);
+    }
+    st.agents.remove(&conversation_id);
+
+    // A cancelled turn stops silently: the frontend already returned to idle on the cancel action,
+    // and a partial reply is not persisted.
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    match result {
+        Ok(outcome) => {
+            let message_id = new_id("msg");
+            let content = outcome.text.clone();
+            let conv = conversation_id.clone();
+            let _ = with_store(st, |s| {
+                s.append_chat_message(&message_id, &conv, "assistant", &content)?;
+                if let Some(sid) = &outcome.session_id {
+                    s.set_conversation_session(&conv, sid)?;
+                }
+                Ok(())
+            });
+            let _ = app.emit(
+                "chat:done",
+                ChatDoneEvent { conversation_id, message_id, content },
+            );
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "chat:error",
+                ChatErrorEvent { conversation_id, error: e.to_string() },
+            );
+        }
+    }
+}
+
+/// Cancel an in-progress chat turn: flip its cooperative cancel flag and abort its task, which
+/// terminates any CLI subprocess (kill_on_drop) and closes any Ollama stream.
+#[tauri::command]
+pub async fn chat_cancel(conversation_id: String, state: State<'_, AppState>) -> CmdResult<()> {
+    if let Some(c) = state
+        .chat_cancels
+        .lock()
+        .map_err(|_| "chat cancel lock poisoned".to_string())?
+        .remove(&conversation_id)
+    {
+        c.store(true, Ordering::Relaxed);
+    }
+    state.agents.kill(&conversation_id).await;
+    Ok(())
 }

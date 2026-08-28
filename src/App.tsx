@@ -9,6 +9,7 @@ import DataPage from "./pages/DataPage";
 import InsightsPage from "./pages/InsightsPage";
 import AuditPage from "./pages/AuditPage";
 import SettingsPage from "./pages/SettingsPage";
+import ChatWidget from "./ChatWidget";
 
 export type PageKey = "overview" | "data" | "insights" | "audit" | "settings";
 export interface PageProps { status: api.StatusView; refresh: () => Promise<void> }
@@ -102,12 +103,16 @@ export default function App() {
     : { initials: "…", name: "Signing in…", role: "Salesforce" };
   const props: PageProps = { status, refresh };
   return (
-    <AppFrame nav={NAV} active={page} onNav={(k: string) => setPage(k as PageKey)} user={user}>
-      {page === "overview" && <OverviewPage {...props} />}
-      {page === "data" && <DataPage {...props} />}
-      {page === "insights" && <InsightsPage {...props} />}
-      {page === "audit" && <AuditPage {...props} />}
-      {page === "settings" && <SettingsPage {...props} />}
-    </AppFrame>
+    <>
+      <AppFrame nav={NAV} active={page} onNav={(k: string) => setPage(k as PageKey)} user={user}>
+        {page === "overview" && <OverviewPage {...props} />}
+        {page === "data" && <DataPage {...props} />}
+        {page === "insights" && <InsightsPage {...props} />}
+        {page === "audit" && <AuditPage {...props} />}
+        {page === "settings" && <SettingsPage {...props} />}
+      </AppFrame>
+      {/* Global chat overlay: outside the page router so it is available on every page. */}
+      <ChatWidget />
+    </>
   );
 }

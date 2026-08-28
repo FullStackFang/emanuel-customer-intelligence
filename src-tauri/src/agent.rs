@@ -513,6 +513,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_kill_aborts_an_in_flight_run() {
+        // The mechanism behind `chat_cancel`: killing a registered run aborts its task so it
+        // never completes (which, for a real CLI run, kills the subprocess via kill_on_drop).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let reg = AgentRegistry::default();
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        reg.insert("run-1".to_string(), handle);
+        assert!(reg.kill("run-1").await, "kill finds and aborts the run");
+        assert!(!reg.kill("run-1").await, "the run is removed after being killed");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !completed.load(Ordering::Relaxed),
+            "the aborted task never ran to completion"
+        );
+    }
+
+    #[tokio::test]
     async fn run_streaming_times_out_and_kills() {
         let (program, args): (std::path::PathBuf, Vec<String>) = if cfg!(windows) {
             // ping sleeps ~2s; timeout is 100ms so it must be killed.

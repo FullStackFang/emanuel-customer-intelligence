@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod auth;
+pub mod chat;
+pub mod chat_context;
 pub mod commands;
 pub mod config;
 pub mod insights;
@@ -38,6 +40,8 @@ pub fn run() {
                 store: Mutex::new(None),
                 identity: Mutex::new(None),
                 job: Mutex::new(None),
+                agents: Default::default(),
+                chat_cancels: Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
         })
@@ -74,6 +78,15 @@ pub fn run() {
             commands::set_llm_key,
             commands::clear_llm_key,
             commands::test_llm_connection,
+            commands::chat_create_conversation,
+            commands::chat_list_conversations,
+            commands::chat_list_messages,
+            commands::chat_rename_conversation,
+            commands::chat_delete_conversation,
+            commands::chat_clear_history,
+            commands::chat_backend_status,
+            commands::chat_send,
+            commands::chat_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

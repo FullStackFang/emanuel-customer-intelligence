@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS _audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
   sf_user_id TEXT, sf_username TEXT, action TEXT NOT NULL,
   object TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS _chat_conversations(
+  id TEXT PRIMARY KEY, backend TEXT NOT NULL, title TEXT NOT NULL,
+  session_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS _chat_messages(
+  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+  content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS _chat_messages_conv ON _chat_messages(conversation_id);
 ";
 
 pub fn open(path: &Path, key_hex: &str) -> Result<Store> {
@@ -116,6 +123,28 @@ pub struct Status {
     pub selected_count: i64,
     pub synced_rows: i64,
     pub last_scan_at: Option<String>,
+}
+
+/// A saved chat conversation. `backend` records which model produced it; `session_id` is the CLI
+/// agent's own session id when one was captured (informational). Independent of the synced mirror.
+#[derive(Serialize, Debug, Clone)]
+pub struct ChatConversation {
+    pub id: String,
+    pub backend: String,
+    pub title: String,
+    pub session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One persisted chat message. `role` is "user" or "assistant".
+#[derive(Serialize, Debug, Clone)]
+pub struct StoredChatMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
 }
 
 fn now_iso() -> String {
@@ -431,6 +460,130 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ── chat conversations (independent of the synced mirror) ────────────
+    pub fn create_conversation(&self, id: &str, backend: &str, title: &str) -> Result<()> {
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO _chat_conversations(id, backend, title, session_id, created_at, updated_at)
+             VALUES(?1, ?2, ?3, NULL, ?4, ?4)",
+            params![id, backend, title, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_conversations(&self) -> Result<Vec<ChatConversation>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, backend, title, session_id, created_at, updated_at
+             FROM _chat_conversations ORDER BY updated_at DESC, rowid DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(ChatConversation {
+                id: r.get(0)?,
+                backend: r.get(1)?,
+                title: r.get(2)?,
+                session_id: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn get_conversation(&self, id: &str) -> Result<Option<ChatConversation>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, backend, title, session_id, created_at, updated_at
+                 FROM _chat_conversations WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(ChatConversation {
+                        id: r.get(0)?,
+                        backend: r.get(1)?,
+                        title: r.get(2)?,
+                        session_id: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE _chat_conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, title, now_iso()],
+        )?;
+        if n == 0 {
+            return Err(anyhow!("unknown conversation: {id}"));
+        }
+        Ok(())
+    }
+
+    pub fn set_conversation_session(&self, id: &str, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _chat_conversations SET session_id = ?2 WHERE id = ?1",
+            params![id, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_conversation(&mut self, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM _chat_messages WHERE conversation_id = ?1", params![id])?;
+        tx.execute("DELETE FROM _chat_conversations WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Append a message and bump its conversation's `updated_at`, so the conversation list is
+    /// ordered by most recent activity.
+    pub fn append_chat_message(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO _chat_messages(id, conversation_id, role, content, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, conversation_id, role, content, now],
+        )?;
+        self.conn.execute(
+            "UPDATE _chat_conversations SET updated_at = ?2 WHERE id = ?1",
+            params![conversation_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_chat_messages(&self, conversation_id: &str) -> Result<Vec<StoredChatMessage>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, conversation_id, role, content, created_at
+             FROM _chat_messages WHERE conversation_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let rows = st.query_map(params![conversation_id], |r| {
+            Ok(StoredChatMessage {
+                id: r.get(0)?,
+                conversation_id: r.get(1)?,
+                role: r.get(2)?,
+                content: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Delete every conversation and message. Leaves the synced mirror and Insights untouched.
+    pub fn clear_chat(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM _chat_messages; DELETE FROM _chat_conversations;",
+        )?;
+        Ok(())
+    }
+
     // ── status ──────────────────────────────────────────────────────────
     pub fn status(&self) -> Result<Status> {
         let object_count: i64 = self
@@ -644,6 +797,64 @@ mod tests {
         assert_eq!(s.status().unwrap().synced_rows, 0);
         assert!(s.synced_objects().unwrap().is_empty());
         assert_eq!(s.list_objects().unwrap().len(), 1, "catalog survives purge");
+    }
+
+    #[test]
+    fn chat_round_trips_messages_and_deletes() {
+        let (_d, mut s) = mem();
+        s.create_conversation("c1", "ollama", "Cohort question").unwrap();
+        s.append_chat_message("m1", "c1", "user", "who is most profitable?").unwrap();
+        s.append_chat_message("m2", "c1", "assistant", "The FY2015 cohort.").unwrap();
+
+        let convs = s.list_conversations().unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].backend, "ollama");
+        assert_eq!(convs[0].title, "Cohort question");
+
+        let msgs = s.list_chat_messages("c1").unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!((msgs[0].role.as_str(), msgs[0].content.as_str()), ("user", "who is most profitable?"));
+        assert_eq!(msgs[1].role, "assistant");
+
+        s.rename_conversation("c1", "Profitability").unwrap();
+        assert_eq!(s.get_conversation("c1").unwrap().unwrap().title, "Profitability");
+        s.set_conversation_session("c1", "sess-xyz").unwrap();
+        assert_eq!(s.get_conversation("c1").unwrap().unwrap().session_id.as_deref(), Some("sess-xyz"));
+
+        s.delete_conversation("c1").unwrap();
+        assert!(s.list_conversations().unwrap().is_empty());
+        assert!(s.list_chat_messages("c1").unwrap().is_empty(), "delete removes messages too");
+    }
+
+    #[test]
+    fn clear_chat_empties_both_tables() {
+        let (_d, s) = mem();
+        s.create_conversation("c1", "claude", "A").unwrap();
+        s.create_conversation("c2", "codex", "B").unwrap();
+        s.append_chat_message("m1", "c1", "user", "hi").unwrap();
+        s.clear_chat().unwrap();
+        assert!(s.list_conversations().unwrap().is_empty());
+        assert!(s.list_chat_messages("c1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mirror_purge_preserves_chat_history() {
+        let (_d, mut s) = mem();
+        // Some synced mirror data plus a saved conversation.
+        s.upsert_object("A", "A", 1).unwrap();
+        s.upsert_field("A", "Id", "id", "Id", false).unwrap();
+        let mut r = Row::new();
+        r.insert("Id".into(), serde_json::Value::String("1".into()));
+        s.replace_mirror("A", &["Id".to_string()], &[r]).unwrap();
+        s.create_conversation("c1", "ollama", "Kept").unwrap();
+        s.append_chat_message("m1", "c1", "user", "still here?").unwrap();
+
+        s.purge_mirror().unwrap();
+
+        assert_eq!(s.status().unwrap().synced_rows, 0, "mirror is purged");
+        let convs = s.list_conversations().unwrap();
+        assert_eq!(convs.len(), 1, "conversation survives a mirror purge");
+        assert_eq!(s.list_chat_messages("c1").unwrap().len(), 1, "messages survive a mirror purge");
     }
 
     #[test]
