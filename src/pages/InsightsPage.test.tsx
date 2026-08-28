@@ -28,8 +28,9 @@ vi.mock("./insights/charts", () => {
   const N = () => <div className="recharts-responsive-container" data-insights-chart />;
   type Col = { key: string; render: (r: unknown) => React.ReactNode };
   return {
-    TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N,
+    TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N, CohortMakeupChart: N,
     HBarChart: N, ReasonsHeatmap: N, OutcomeByTenureChart: N, DuesChart: N,
+    ConcentrationChart: N, RevenueMixChart: N,
     TableView: ({ rows, columns, getRowKey }: { rows: unknown[]; columns: Col[]; getRowKey: (r: unknown) => string }) => (
       <div data-testid="table">
         {rows.map((r) => (
@@ -39,6 +40,12 @@ vi.mock("./insights/charts", () => {
     ),
   };
 });
+
+// The neighborhood map is a maplibre-gl surface that cannot mount in jsdom (no WebGL); stub it
+// so the Retention-mode tests exercise the ZIP-level heatmap that renders beside it.
+vi.mock("./insights/NeighborhoodRetentionMap", () => ({
+  NeighborhoodRetentionMap: () => <div data-testid="neighborhood-map" />,
+}));
 
 import InsightsPage, { _resetInsightsSnapshot } from "./InsightsPage";
 import { _resetGeoCache } from "./insights/ZipGeographyMap";
@@ -56,6 +63,7 @@ const fakeInsights: api.Insights = {
   trend: [{ fy: 2025, joins: 5, resigns: 4, active_end_of_fy: 100 }],
   year1: [{ cohort: 2024, n: 10, pct_retained: 70 }],
   cohort_matrix: [{ cohort: 2020, n: 10, k: 5, pct_retained: 60 }],
+  cohort_makeup: [{ cohort: 2020, current: 6, pct_of_base: 6 }, { cohort: 2026, current: 4, pct_of_base: 4 }],
   channels: [{ key: "clergy", label: "Clergy", n: 20, still_members: 14, pct: 70, avg_tenure: 5, left_within_2y: 2 }],
   school: [{ group: "No school history", n: 50, still_members: 20, pct: 40 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 10 }],
@@ -63,7 +71,7 @@ const fakeInsights: api.Insights = {
   outcome_by_tenure: [{ tenure_bucket: "1-2y", outcome: "No longer engaged", n: 5 }],
   school_progression: [{ group: "Nursery → Religious school", n: 8, still_members: 6, pct: 75 }],
   school_gap: [{ bucket: "0-1y", n: 4, still_members: 3, pct: 75 }],
-  dues: [], anchor_type: [], anchor_count: [], geography: null,
+  dues: [], anchor_type: [], anchor_count: [], geography: null, financials: null,
 };
 
 // A ZIP-geography payload for the on-demand `zip_geography` command.
@@ -129,6 +137,31 @@ describe("InsightsPage", () => {
     expect(jobs.className).toContain("insights-section-hidden");
     fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
     expect(jobs.className).not.toContain("insights-section-hidden");
+  });
+
+  it("renders the financials tab from aggregate figures when billing is available", async () => {
+    const financials: api.Financials = {
+      fiscal_year: 2025, households: 100, paying_households: 90,
+      total_billed: 200000, total_received: 180000,
+      by_class: [
+        { key: "membership", label: "Dues", billed: 150000, received: 140000 },
+        { key: "tuition", label: "Tuition", billed: 50000, received: 40000 },
+      ],
+      concentration: Array.from({ length: 10 }, (_, i) => ({
+        decile: i + 1, households: 10, billed_share: 10, received_share: 10,
+        cumulative_billed_share: (i + 1) * 10, cumulative_received_share: (i + 1) * 10,
+      })),
+    };
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [cap("membership", true), cap("renewal", true), cap("school", false), cap("committee", false)], financials } });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    fireEvent.click(screen.getByRole("button", { name: "Financials" }));
+    // All three panels render, and the collection figures read off the totals.
+    expect(screen.getByText("Who carries the dues base")).toBeTruthy();
+    expect(screen.getByText("Where the money comes in")).toBeTruthy();
+    expect(screen.getByText("Collection: billed vs received")).toBeTruthy();
+    expect(screen.getByText("$180,000")).toBeTruthy(); // total received
+    expect(screen.getByText("$20,000")).toBeTruthy();   // outstanding = billed - received
   });
 
   it("shows an unavailable state when an optional source is not synced", async () => {
@@ -247,7 +280,7 @@ describe("InsightsPage", () => {
     expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(2);
   });
 
-  it("gives an executive summary of ZIP geography by mode, segment, and fiscal year", async () => {
+  it("gives an executive summary of ZIP geography by mode and fiscal year", async () => {
     // The mock echoes the request (mode / fy / segment) like the real backend, so the
     // component's freshness gate — which prevents rendering one mode's cells under another
     // mode's view — is actually exercised.
@@ -303,10 +336,6 @@ describe("InsightsPage", () => {
     expect(await screen.findByRole("region", { name: "Attrition — FY2026" })).toBeTruthy();
     await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "attrition")).toBe(true));
     expect(await screen.findByText(/fewer than 10 in this view/)).toBeTruthy();
-
-    // Segment filters the population before aggregation.
-    fireEvent.change(screen.getByRole("combobox", { name: "Segment" }), { target: { value: "school:active_religious_school" } });
-    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { segment?: { kind: string } })?.segment?.kind === "school")).toBe(true));
 
     // The fiscal-year selector drives the time-varying views.
     fireEvent.change(screen.getByRole("combobox", { name: "Fiscal year" }), { target: { value: "2025" } });

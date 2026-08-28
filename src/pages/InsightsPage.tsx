@@ -4,9 +4,9 @@ import * as api from "../api";
 import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
-import { CohortHeatmap, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsHeatmap, TableView, TrendChart, Year1Chart } from "./insights/charts";
+import { CohortHeatmap, CohortMakeupChart, ConcentrationChart, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsHeatmap, RevenueMixChart, TableView, TrendChart, Year1Chart } from "./insights/charts";
 import { ZipGeographyMap } from "./insights/ZipGeographyMap";
-import { EVIDENCE_LABELS, fmt, fyLabel, soWhat } from "./insights/format";
+import { EVIDENCE_LABELS, fmt, fmtMoney, fyLabel, soWhat } from "./insights/format";
 
 function SoWhat({ text }: { text: string }) {
   return (
@@ -144,12 +144,23 @@ export async function waitForPdfReportLayout(surface: HTMLElement): Promise<void
   }
 }
 
+/** Reset the surrounding scroll container to the top. Switching tabs should always land on the
+ *  top of the report — the KPI cards, then the pinned tab bar — the same place every time. The
+ *  previous handler called scrollIntoView on the tab bar, which only moved when you happened to
+ *  be scrolled down, so it looked like the header "occasionally" jumped. */
+function scrollScrollportToTop(from: HTMLElement | null) {
+  for (let n: HTMLElement | null = from; n; n = n.parentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if (oy === "auto" || oy === "scroll") { n.scrollTo({ top: 0 }); return; }
+  }
+}
+
 export default function InsightsPage({ status }: PageProps) {
   const [ins, setIns] = useState<api.Insights | null>(snapshot?.ins ?? null);
   const [risk, setRisk] = useState<api.RiskSummary | null>(snapshot?.risk ?? null);
   const [riskFailed, setRiskFailed] = useState(snapshot?.riskFailed ?? false);
   const [watch, setWatch] = useState<api.WatchListView | null>(null);
-  const [tab, setTab] = useState<"overview" | "jobs" | "renewal" | "geography" | "risk">("overview");
+  const [tab, setTab] = useState<"overview" | "jobs" | "renewal" | "geography" | "financials" | "risk">("overview");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [exported, setExported] = useState<string | null>(null);
@@ -159,6 +170,7 @@ export default function InsightsPage({ status }: PageProps) {
   const [now, setNow] = useState(() => Date.now());
   const [renderingPdf, setRenderingPdf] = useState(false);
   const pdfReportRef = useRef<HTMLDivElement>(null);
+  const tabsRef = useRef<HTMLDivElement>(null);
 
   // Live job progress: the backend emits phase events only while a rebuild or risk fit runs,
   // so this stays null on the cached paths. On mount, ask whether a job is already running so
@@ -254,6 +266,9 @@ export default function InsightsPage({ status }: PageProps) {
   const missingSchoolCol = schoolCols.find(missing);
   const s = ins ? soWhat(ins) : null;
   const latestTwo = ins ? ins.year1.slice(-2).map((r) => r.cohort) : [];
+  const makeupLatestTwo = ins ? ins.cohort_makeup.slice(-2).map((r) => r.cohort) : [];
+  const makeupUndated = ins ? ins.kpis.members_now - ins.cohort_makeup.reduce((sum, r) => sum + r.current, 0) : 0;
+  const fin = ins?.financials ?? null;
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
   const anyAnchor = capOn("renewal") || capOn("school") || capOn("committee");
   const sectionClass = (key: typeof tab) => `insights-section${renderingPdf || tab === key ? "" : " insights-section-hidden"}`;
@@ -331,35 +346,10 @@ export default function InsightsPage({ status }: PageProps) {
             <Stat label="Households at risk" value={fmt(ins.kpis.at_risk_count)} sub="current members matching a churn pattern" icon="triangle-alert" tone="accent" />
           </div>
 
-          <Card className="insights-screen-only" style={{ marginBottom: "var(--space-4)" }}>
-            <CardHeader><CardTitle>Lifecycle data coverage</CardTitle></CardHeader>
-            <Lede>{ins.stale && !rebuilding ? "The local analysis is older than a source sync; it rebuilds automatically the next time Insights loads." : "Source availability is checked independently; unavailable sources are never treated as household behavior."}</Lede>
-            <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
-              {ins.capabilities.map((capability) => (
-                <Badge key={capability.key} tone={capability.available ? "success" : "neutral"}>
-                  {capability.key}: {capability.available ? `${capability.mirrored_columns.length} fields available` : "not synced"}
-                </Badge>
-              ))}
-            </div>
-            {ins.capabilities.filter((capability) => !capability.available).map((capability) => (
-              <p key={capability.key} style={{ margin: "var(--space-2) 0 0", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                {capability.unavailable_reason}
-              </p>
-            ))}
-            {ins.capabilities.filter((capability) => capability.available).map((capability) => (
-              <details key={`${capability.key}-fields`} style={{ marginTop: "var(--space-2)", fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                <summary>{capability.key} synced fields</summary>
-                <p style={{ margin: "var(--space-1) 0 0", fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
-                  {capability.mirrored_columns.join(", ")}
-                </p>
-              </details>
-            ))}
-          </Card>
-
-          <div className="insights-screen-only" role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap", marginBottom: "var(--space-4)" }}>
-            {(["overview", "jobs", "renewal", "geography", "risk"] as const).map((key) => (
-              <Button key={key} size="sm" variant={tab === key ? "primary" : "secondary"} onClick={() => setTab(key)}>
-                {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : key === "geography" ? "Geography" : "Risk"}
+          <div ref={tabsRef} className="insights-screen-only" role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg-secondary)", paddingTop: "var(--space-3)", paddingBottom: "var(--space-3)", marginBottom: "var(--space-2)" }}>
+            {(["overview", "jobs", "renewal", "geography", "financials", "risk"] as const).map((key) => (
+              <Button key={key} size="sm" variant={tab === key ? "primary" : "secondary"} onClick={() => { if (key === tab) return; setTab(key); scrollScrollportToTop(tabsRef.current); }}>
+                {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : key === "geography" ? "Geography" : key === "financials" ? "Financials" : "Risk"}
               </Button>
             ))}
           </div>
@@ -404,6 +394,23 @@ export default function InsightsPage({ status }: PageProps) {
               { key: "k", header: "Years after", align: "right", render: (r) => r.k },
               { key: "p", header: "Still members", align: "right", render: (r) => `${r.pct_retained}%` },
             ]} />
+          </Card>
+
+          <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+            <CardHeader><CardTitle>Cohort makeup of current members</CardTitle></CardHeader>
+            <Lede>The other side of retention: of today's member households, how many joined in each fiscal year. The retention grid shows the rate each cohort keeps; this shows how many members each cohort still puts on the board. The two newest cohorts are highlighted.</Lede>
+            <CohortMakeupChart rows={ins.cohort_makeup} emphasize={makeupLatestTwo} />
+            <SoWhat text={s!.makeup} />
+            <TableView rows={ins.cohort_makeup} getRowKey={(r) => String(r.cohort)} columns={[
+              { key: "c", header: "Cohort", render: (r) => fyLabel(r.cohort) },
+              { key: "n", header: "Current members", align: "right", render: (r) => fmt(r.current) },
+              { key: "p", header: "Share of base", align: "right", render: (r) => `${r.pct_of_base}%` },
+            ]} />
+            {makeupUndated > 0 && (
+              <p style={{ margin: "var(--space-2) 0 0", fontSize: "var(--text-xs)", color: "var(--text-tertiary)" }}>
+                {fmt(makeupUndated)} current household{makeupUndated === 1 ? " has" : "s have"} no usable join date and {makeupUndated === 1 ? "is" : "are"} not shown above.
+              </p>
+            )}
           </Card>
 
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
@@ -583,6 +590,58 @@ export default function InsightsPage({ status }: PageProps) {
             <CardHeader><CardTitle>Membership geography</CardTitle></CardHeader>
             <ZipGeographyMap currentFy={ins.current_fy} capability={ins.capabilities.find((capability) => capability.key === "geography")} builtAt={ins.built_at ?? ""} initial={ins.geography ?? undefined} />
           </Card>
+          </div>
+
+          {/* ── Financials ───────────────────────────────────────────────────── */}
+          <div className={sectionClass("financials")}>
+          {!capOn("renewal") || !fin ? (
+            <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+              <CardHeader><CardTitle>Financials</CardTitle></CardHeader>
+              <Unavailable column="BillingStatement__c and BillingStatementLine__c with charge and received amounts" />
+            </Card>
+          ) : (
+            <>
+              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+                <CardHeader><CardTitle>Who carries the dues base</CardTitle></CardHeader>
+                <Lede>{`Across today's member households, the cumulative share of ${fyLabel(fin.fiscal_year)} money held by the top-paying tenth, fifth, and so on — ranked by cash received. A steep early climb means a few households carry the base. Figures are aggregate; the smallest unit shown is a tenth of the membership, never a household.`}</Lede>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
+                  <Stat label="Top 10% of members" value={`${fin.concentration[0]?.cumulative_received_share ?? 0}%`} sub="of cash received" icon="trending-up" tone="primary" />
+                  <Stat label="Top 20% of members" value={`${fin.concentration[1]?.cumulative_received_share ?? 0}%`} sub="of cash received" icon="users" tone="neutral" />
+                  <Stat label="Paying households" value={fmt(fin.paying_households)} sub={`of ${fmt(fin.households)} members`} icon="badge-dollar-sign" tone="success" />
+                </div>
+                <ConcentrationChart rows={fin.concentration} />
+                <TableView rows={fin.concentration} getRowKey={(r) => String(r.decile)} columns={[
+                  { key: "d", header: "Member band", render: (r) => `Top ${r.decile * 10}%` },
+                  { key: "h", header: "Households", align: "right", render: (r) => fmt(r.households) },
+                  { key: "cr", header: "Cumulative received", align: "right", render: (r) => `${r.cumulative_received_share}%` },
+                  { key: "cb", header: "Cumulative billed", align: "right", render: (r) => `${r.cumulative_billed_share}%` },
+                ]} />
+              </Card>
+
+              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+                <CardHeader><CardTitle>Where the money comes in</CardTitle></CardHeader>
+                <Lede>{`${fyLabel(fin.fiscal_year)} money in by product class, across today's member households — cash received (colored) over the amount billed (grey), so the gap is what's still uncollected for that class.`}</Lede>
+                <RevenueMixChart rows={fin.by_class} />
+                <TableView rows={fin.by_class} getRowKey={(r) => r.key} columns={[
+                  { key: "l", header: "Product class", render: (r) => r.label },
+                  { key: "b", header: "Billed", align: "right", render: (r) => fmtMoney(r.billed) },
+                  { key: "r", header: "Received", align: "right", render: (r) => fmtMoney(r.received) },
+                  { key: "s", header: "Share of received", align: "right", render: (r) => `${fin.total_received > 0 ? Math.round((1000 * r.received) / fin.total_received) / 10 : 0}%` },
+                ]} />
+              </Card>
+
+              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+                <CardHeader><CardTitle>Collection: billed vs received</CardTitle></CardHeader>
+                <Lede>{`How much of what was billed in ${fyLabel(fin.fiscal_year)} has been collected, across today's member households. Received and outstanding are eventual states from the mirror, not the position as of any single date.`}</Lede>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--space-3)" }}>
+                  <Stat label="Billed" value={fmtMoney(fin.total_billed)} sub={`${fyLabel(fin.fiscal_year)} · member households`} icon="file-text" tone="neutral" />
+                  <Stat label="Received" value={fmtMoney(fin.total_received)} sub="cash settled" icon="badge-dollar-sign" tone="success" />
+                  <Stat label="Collected" value={`${fin.total_billed > 0 ? Math.round((1000 * fin.total_received) / fin.total_billed) / 10 : 0}%`} sub="of amount billed" icon="percent" tone="primary" />
+                  <Stat label="Outstanding" value={fmtMoney(Math.max(0, fin.total_billed - fin.total_received))} sub="billed, not yet received" icon="triangle-alert" tone="accent" />
+                </div>
+              </Card>
+            </>
+          )}
           </div>
 
           {/* ── Risk ─────────────────────────────────────────────────────────── */}

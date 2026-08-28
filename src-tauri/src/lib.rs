@@ -60,6 +60,7 @@ pub fn run() {
             commands::get_insights_job,
             commands::zip_geography,
             commands::zip_geography_years,
+            commands::neighborhood_retention_years,
             commands::get_at_risk,
             commands::get_risk_summary,
             commands::get_watch_list,

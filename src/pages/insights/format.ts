@@ -2,6 +2,9 @@ import type { Insights } from "../../api";
 
 export const fyLabel = (fy: number) => `FY${fy}`;
 export const fmt = (n: number) => n.toLocaleString();
+/** Whole-dollar currency, e.g. $1,234,000. Financial figures are aggregate totals, so
+ *  cents add noise; round to the dollar. */
+export const fmtMoney = (n: number) => n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 
 /** 7-step sequential ramp index for a retention percentage: 30% -> 0, 90% -> 6. */
 export function heatStep(pct: number): number {
@@ -41,6 +44,12 @@ export function soWhat(ins: Insights) {
   const cohort = best && worst
     ? `Five-year retention ranges from ${worst.pct_retained}% (${fyLabel(worst.cohort)} cohort) to ${best.pct_retained}% (${fyLabel(best.cohort)} cohort).`
     : "Five-year retention needs at least one cohort with five years of history.";
+  const recentCut = ins.current_fy - 5;
+  const recentShare = ins.cohort_makeup.filter((r) => r.cohort > recentCut).reduce((sum, r) => sum + r.pct_of_base, 0);
+  const topCohort = [...ins.cohort_makeup].sort((a, b) => b.current - a.current)[0];
+  const makeup = topCohort
+    ? `The five most recent cohorts make up ${Math.round(recentShare * 10) / 10}% of today's members; the ${fyLabel(topCohort.cohort)} cohort alone contributes ${fmt(topCohort.current)} (${topCohort.pct_of_base}% of the base).`
+    : "Not enough cohort history yet.";
   const chTop = ins.channels[0];
   const chBottom = ins.channels[ins.channels.length - 1];
   const channels = chTop && chBottom
@@ -55,5 +64,5 @@ export function soWhat(ins: Insights) {
   const reasons = topReason
     ? `In ${fyLabel(latestFy)} the leading coded reason was ${topReason.reason} (${fmt(topReason.n)} households).`
     : "No coded resignation reasons yet.";
-  return { trend, year1, cohort, channels, school, reasons };
+  return { trend, year1, cohort, makeup, channels, school, reasons };
 }

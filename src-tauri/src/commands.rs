@@ -606,6 +606,47 @@ pub async fn zip_geography_years(
     .map_err(err)?
 }
 
+/// Cohort retention rolled up to New York City neighborhoods, for many cohort years and an
+/// optional segment, in one lock hold. The neighborhood map opens all its cohort years at once,
+/// so this mirrors `zip_geography_years`: one household load, one audit row, request-ordered.
+/// Returns only suppressed per-neighborhood aggregates plus an out-of-area count — never a
+/// name, ZIP, coordinate, or bill-to-other id.
+#[tauri::command]
+pub async fn neighborhood_retention_years(
+    app: AppHandle,
+    segment: Option<insights::Segment>,
+    cohort_fys: Vec<i32>,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<insights::NeighborhoodRetention>> {
+    let w = who(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("rebuild", insights::REBUILD_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            ensure_fresh_with(s, &w, false, &mut progress)?;
+            let views = insights::neighborhood_retention_views(s, segment, &cohort_fys)?;
+            s.audit(
+                &w,
+                "insights.neighborhood_retention",
+                None,
+                Some(serde_json::json!({
+                    "cohort_fys": cohort_fys,
+                    "cells": views.iter().map(|v| v.cells.len()).sum::<usize>(),
+                    "out_of_area": views.iter().map(|v| v.out_of_area).sum::<i64>(),
+                    "available": views.iter().any(|v| v.available),
+                })),
+            )?;
+            Ok(views)
+        });
+        clear_job(state);
+        out
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>> {
     let w = who(state.inner());

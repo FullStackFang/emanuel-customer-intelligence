@@ -4,9 +4,9 @@ import {
   Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import type { RenderableText } from "recharts";
-import type { CohortCell, CohortYear1, DuesRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
+import type { CohortCell, CohortMakeupRow, CohortYear1, ConcentrationRow, DuesRow, FinancialClassRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
 import { Table } from "../../design-system";
-import { fmt, fyLabel, heatInk, heatStep } from "./format";
+import { fmt, fmtMoney, fyLabel, heatInk, heatStep } from "./format";
 
 /* Palette — validated with dataviz/scripts/validate_palette.js (light, white surface).
    Hex values are the design-system tokens named beside them. Do not reorder. */
@@ -96,6 +96,29 @@ export function Year1Chart({ rows, emphasize }: { rows: CohortYear1[]; emphasize
   );
 }
 
+/** How many of today's members each join-year cohort still contributes — the count
+    complement of the retention grid. Two newest cohorts emphasized, matching Year1Chart. */
+export function CohortMakeupChart({ rows, emphasize }: { rows: CohortMakeupRow[]; emphasize: number[] }) {
+  const data = rows.map((r) => ({
+    fy: fyLabel(r.cohort),
+    main: emphasize.includes(r.cohort) ? r.current : null,
+    rest: emphasize.includes(r.cohort) ? null : r.current,
+    pct: r.pct_of_base,
+  }));
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="35%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} tickFormatter={(v: number) => fmt(v)} width={44} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: { pct?: number } }) => [`${fmt(Number(v))} households · ${item.payload?.pct ?? 0}% of base`, "Still members"]} />
+        <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+        <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
 export function CohortHeatmap({ cells }: { cells: CohortCell[] }) {
   const cohorts = [...new Set(cells.map((c) => c.cohort))].sort();
   const ks = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -152,6 +175,50 @@ export function HBarChart({ rows, emphasize }: { rows: HBarRow[]; emphasize?: st
         <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: HBarRow }) => [`${v}% (${fmt(item.payload?.still ?? 0)} of ${fmt(item.payload?.n ?? 0)})`, "Still members"]} />
         <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[0, 4, 4, 0]} maxBarSize={18} isAnimationActive={false} />
         <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[0, 4, 4, 0]} maxBarSize={18} isAnimationActive={false} label={{ position: "right", fontSize: 12, fill: PALETTE.ink, formatter: (v: RenderableText) => `${v}%` }} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Pareto of the money in: the cumulative share of the year's dollars held by the top N%
+    of member households, ranked by cash received. Received is the primary lens; billed
+    (dashed) sits alongside so the reader sees whether the biggest payers are billed as
+    heavily as they pay. A steep early rise means the base leans on a few households. */
+export function ConcentrationChart({ rows }: { rows: ConcentrationRow[] }) {
+  const data = rows.map((r) => ({
+    band: `Top ${r.decile * 10}%`,
+    Received: r.cumulative_received_share,
+    Billed: r.cumulative_billed_share,
+  }));
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <LineChart data={data} margin={{ top: 8, right: 24, bottom: 0, left: 0 }}>
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="band" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={0} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(v: number) => `${v}%`} width={44} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [`${v}% of the year's ${String(name).toLowerCase()}`, name]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Line type="monotone" dataKey="Received" stroke={PALETTE.series[0]} strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+        <Line type="monotone" dataKey="Billed" stroke={PALETTE.series[1]} strokeWidth={2} strokeDasharray="4 3" dot={{ r: 3 }} isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Where the money comes in, by product class: received (cash in, colored) over billed
+    (charged, grey) so the gap between the two bars is the uncollected amount for that class. */
+export function RevenueMixChart({ rows }: { rows: FinancialClassRow[] }) {
+  const data = rows.map((r) => ({ label: r.label, Received: r.received, Billed: r.billed }));
+  return (
+    <ResponsiveContainer width="100%" height={44 * rows.length + 44}>
+      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2} barCategoryGap="30%">
+        <CartesianGrid horizontal={false} stroke={PALETTE.grid} />
+        <XAxis type="number" tick={axisTick} tickLine={false} axisLine={false} tickFormatter={(v: number) => fmtMoney(v)} />
+        <YAxis type="category" dataKey="label" width={150} tick={axisTick} tickLine={false} axisLine={false} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [fmtMoney(Number(v)), name]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Bar dataKey="Received" fill={PALETTE.series[4]} radius={[0, 4, 4, 0]} maxBarSize={14} isAnimationActive={false} />
+        <Bar dataKey="Billed" fill={PALETTE.deemphasis} radius={[0, 4, 4, 0]} maxBarSize={14} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   );

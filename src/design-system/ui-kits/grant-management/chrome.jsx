@@ -50,8 +50,14 @@ export function AppFrame({ nav, active, onNav, user, children }) {
       {/* No width cap: admin pages are table-heavy and the 1200px column left
           dead margin on any real monitor. A page whose content genuinely reads
           better narrow (a single-column form) caps itself. */}
-      <main style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-8)' }}>
-        {children}
+      <main style={{ flex: 1, overflowY: 'auto', padding: '0 var(--space-8) var(--space-8)' }}>
+        {/* The top gap lives on this inner wrapper, not on <main> itself, so it scrolls away
+            with the content. If it sat on the scroll container, a `position: sticky; top: 0`
+            child would pin one space-8 below the scrollport edge and let content bleed through
+            the uncovered band above it (see the Insights section tabs). */}
+        <div style={{ paddingTop: 'var(--space-8)' }}>
+          {children}
+        </div>
       </main>
     </div>
   );

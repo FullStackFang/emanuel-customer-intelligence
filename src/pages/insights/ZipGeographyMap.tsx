@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { zipGeography, zipGeographyYears, type GeoMode, type Segment, type SourceCapability, type ZipGeoCell, type ZipGeography } from "../../api";
 import { Stat } from "../../design-system/ui-kits/grant-management/chrome.jsx";
+import { NeighborhoodRetentionMap } from "./NeighborhoodRetentionMap";
 import { fmt, fyLabel } from "./format";
 
 // Executive framing of ZIP geography: lead with the headline (where members are, where
@@ -23,15 +24,6 @@ const MODE_ORDER: GeoMode[] = ["density", "provenance", "retention", "net_change
 
 const SEGMENT_ALL = "";
 const encodeSegment = (seg: Segment | null): string => (seg == null ? SEGMENT_ALL : `${seg.kind}:${seg.value}`);
-const decodeSegment = (raw: string): Segment | null => {
-  if (raw === SEGMENT_ALL) return null;
-  const idx = raw.indexOf(":");
-  const kind = raw.slice(0, idx) as Segment["kind"];
-  const value = raw.slice(idx + 1);
-  if (kind === "join_fy") return { kind, value: Number(value) };
-  if (kind === "school") return { kind, value: value as Segment["value"] as never };
-  return { kind, value } as Segment;
-};
 const pctOf = (part: number, whole: number) => (whole > 0 ? Math.round((part / whole) * 1000) / 10 : 0);
 
 // Session cache of loaded ZIP-geography views, so revisiting one (flipping a mode back,
@@ -108,7 +100,9 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
   // (in-progress) snapshot if they want it.
   const lastCompleteFy = currentFy - 1;
   const [mode, setMode] = useState<GeoMode>("density");
-  const [segment, setSegment] = useState<Segment | null>(null);
+  // Segment filtering was removed from the UI; every view is all-members. Kept as a null
+  // constant so the fetch/cache keys and the child maps' props stay unchanged.
+  const segment: Segment | null = null;
   const [fy, setFy] = useState<number>(lastCompleteFy);
   // Retention has its own multi-cohort trend view (below); the single-fetch model here
   // drives the other four modes.
@@ -146,7 +140,6 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
   const fresh = loaded?.key === key;
   const freshData = fresh ? loaded?.data : undefined;
   const freshError = fresh ? loaded?.error : undefined;
-  const options = loaded?.data?.options; // last known; segment options don't depend on mode/year
   const cells = freshData?.available ? freshData.cells : [];
   const totalN = useMemo(() => cells.reduce((s, c) => s + c.n, 0), [cells]);
 
@@ -173,30 +166,27 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
           <button key={m} type="button" aria-pressed={mode === m} onClick={() => setMode(m)} style={controlBtn(mode === m)}>{MODES[m].tab}</button>
         ))}
       </div>
-      <div style={{ display: "flex", gap: "var(--space-4)", flexWrap: "wrap", marginBottom: "var(--space-4)" }}>
-        <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", fontSize: "var(--text-sm)" }}>
-          Segment
-          <select aria-label="Segment" value={encodeSegment(segment)} onChange={(e) => setSegment(decodeSegment(e.target.value))}>
-            <option value={SEGMENT_ALL}>All members</option>
-            {options?.join_fys.length ? (<optgroup label="Join year">{options.join_fys.map((y) => <option key={`jf-${y}`} value={`join_fy:${y}`}>{fyLabel(y)}</option>)}</optgroup>) : null}
-            {options?.tiers.length ? (<optgroup label="Tier">{options.tiers.map((t) => <option key={`ti-${t}`} value={`tier:${t}`}>{t}</option>)}</optgroup>) : null}
-            {options?.categories.length ? (<optgroup label="Member category">{options.categories.map((c) => <option key={`ca-${c}`} value={`category:${c}`}>{c}</option>)}</optgroup>) : null}
-            {options?.channels.length ? (<optgroup label="Join channel">{options.channels.map((c) => <option key={`ch-${c.key}`} value={`channel:${c.key}`}>{c.label}</option>)}</optgroup>) : null}
-            <optgroup label="School family">{(options?.school ?? []).map((c) => <option key={`sc-${c.key}`} value={`school:${c.key}`}>{c.label}</option>)}</optgroup>
-          </select>
-        </label>
-        {!isRetention && (
+      {!isRetention && (
+        <div style={{ display: "flex", gap: "var(--space-4)", flexWrap: "wrap", marginBottom: "var(--space-4)" }}>
           <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", fontSize: "var(--text-sm)" }}>
             Fiscal year
             <select aria-label="Fiscal year" value={fy} onChange={(e) => setFy(Number(e.target.value))}>
               {fyOptions.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
             </select>
           </label>
-        )}
-      </div>
+        </div>
+      )}
 
       {isRetention ? (
-        <RetentionTrend segment={segment} currentFy={currentFy} builtAt={builtAt} />
+        <>
+          <NeighborhoodRetentionMap currentFy={currentFy} segment={segment} builtAt={builtAt} />
+          <details style={{ marginTop: "var(--space-4)" }}>
+            <summary style={{ cursor: "pointer", fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>ZIP-level cohort detail</summary>
+            <div style={{ marginTop: "var(--space-3)" }}>
+              <RetentionTrend segment={segment} currentFy={currentFy} builtAt={builtAt} />
+            </div>
+          </details>
+        </>
       ) : (
         <>
           <div data-testid="zip-geography-summary" role="region" aria-label={`${MODES[mode].tab} — ${fyLabel(fy)}`}>

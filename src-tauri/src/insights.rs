@@ -1641,6 +1641,17 @@ pub struct CohortCell {
     pub k: i32,
     pub pct_retained: f64,
 }
+/// One join-year cohort's contribution to today's member base: how many current members
+/// joined in that fiscal year, and the share of the whole base they make up. The
+/// complement of the retention grid — that shows the *rate* each cohort keeps, this shows
+/// how many members each cohort still puts on the board. Keyed on join fiscal year, the
+/// same cohort axis the retention grid uses, so the two views reconcile.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CohortMakeupRow {
+    pub cohort: i32,
+    pub current: i64,
+    pub pct_of_base: f64,
+}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChannelRow {
     pub key: String,
@@ -1701,6 +1712,42 @@ pub struct DuesRow {
     pub partially_settled: i64,
     pub unsettled: i64,
 }
+/// One product class's share of the money in during a fiscal year. Billed is the amount
+/// charged; received is the cash eventually settled against it. Aggregate only.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FinancialClassRow {
+    pub key: String,
+    pub label: String,
+    pub billed: f64,
+    pub received: f64,
+}
+/// One tenth of the member base, ranked by cash received (top decile first). `share` is
+/// this band's own slice of the year's total; `cumulative_*` runs the Pareto curve. The
+/// band is the smallest unit ever exposed — no household figure leaves the backend.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConcentrationRow {
+    pub decile: i32,
+    pub households: i64,
+    pub billed_share: f64,
+    pub received_share: f64,
+    pub cumulative_billed_share: f64,
+    pub cumulative_received_share: f64,
+}
+/// The aggregate financial picture for one complete fiscal year, across today's member
+/// households: how concentrated the money is (Pareto by decile), where it comes in by
+/// product class, and how much of what is billed is collected. Every figure is a total or
+/// a decile band — deliberately never a household — so the tab cannot expose one member's
+/// finances.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Financials {
+    pub fiscal_year: i32,
+    pub households: i64,
+    pub paying_households: i64,
+    pub total_billed: f64,
+    pub total_received: f64,
+    pub by_class: Vec<FinancialClassRow>,
+    pub concentration: Vec<ConcentrationRow>,
+}
 /// Retention of households that recently held one kind of Relationship Anchor.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnchorTypeRow {
@@ -1750,6 +1797,7 @@ pub struct Insights {
     pub trend: Vec<TrendRow>,
     pub year1: Vec<CohortYear1>,
     pub cohort_matrix: Vec<CohortCell>,
+    pub cohort_makeup: Vec<CohortMakeupRow>,
     pub channels: Vec<ChannelRow>,
     pub school: Vec<SchoolRow>,
     pub reasons: Vec<ReasonCell>,
@@ -1760,6 +1808,9 @@ pub struct Insights {
     pub dues: Vec<DuesRow>,
     pub anchor_type: Vec<AnchorTypeRow>,
     pub anchor_count: Vec<AnchorCountRow>,
+    /// Aggregate financial picture (its own tab). None when the billing source or its money
+    /// columns are absent — the tab then shows an unavailable state instead of zeros.
+    pub financials: Option<Financials>,
     /// The Geography panel's default view (density · last completed fiscal year · all members),
     /// resolved on the get_insights path so the panel paints with the rest of the page. This
     /// matters because get_insights releases the store lock before the risk analysis grabs it,
@@ -1815,6 +1866,20 @@ fn ny_zctas() -> &'static std::collections::HashSet<&'static str> {
 }
 fn is_mapped_zip(zip: &str) -> bool {
     ny_zctas().contains(zip)
+}
+
+/// ZIP(ZCTA) → New York City neighborhood, as an index into the packaged neighborhood list
+/// (`src/assets/nta-meta.json`); the webview resolves the index to a name. Covers the ~214
+/// ZCTAs that overlap an NYC neighborhood, derived offline by dominant overlap (regenerate
+/// with `src/assets/nta-meta.md` if the neighborhood geometry changes). A ZIP absent here has
+/// no NYC neighborhood — the neighborhood map counts it out-of-area rather than misplacing it.
+static ZIP_NTA: std::sync::OnceLock<std::collections::HashMap<String, u16>> =
+    std::sync::OnceLock::new();
+fn zip_nta() -> &'static std::collections::HashMap<String, u16> {
+    ZIP_NTA.get_or_init(|| {
+        serde_json::from_str(include_str!("zip_nta_crosswalk.json"))
+            .expect("zip_nta_crosswalk.json is valid {zip: nta_index}")
+    })
 }
 
 /// The household's ZIP as of a fiscal year: the ZIP of its latest statement in or before
@@ -1949,6 +2014,36 @@ pub struct ZipGeography {
     pub out_of_area: i64,
     /// Mapped ZIPs dropped for falling under the mode's suppression floor.
     pub suppressed_zips: i64,
+    pub options: SegmentOptions,
+}
+
+/// One neighborhood (NTA) cohort-retention aggregate. `nta` indexes the packaged neighborhood
+/// list (`nta-meta.json`); the webview resolves it to a name and geometry. `measure` is the
+/// share of the cohort still members; `n` the cohort household denominator; `retained` the
+/// numerator. No name, ZIP, or coordinate crosses the boundary — only the neighborhood index.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NeighborhoodCell {
+    pub nta: u16,
+    pub measure: f64,
+    pub n: i64,
+    pub retained: i64,
+}
+
+/// Cohort retention rolled up to New York City neighborhoods for one join-cohort year. The
+/// neighborhood counterpart of `ZipGeography` in Retention mode: each cohort household is
+/// placed at its join-year ZIP, that ZIP rolled up to its NYC neighborhood, and neighborhoods
+/// under ten cohort households are suppressed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NeighborhoodRetention {
+    pub cohort_fy: i32,
+    pub segment: Option<Segment>,
+    /// False when the geographic capability is unavailable: an empty map, not a zeroed one.
+    pub available: bool,
+    pub cells: Vec<NeighborhoodCell>,
+    /// Cohort members whose ZIP maps to no NYC neighborhood (e.g. outside the city).
+    pub out_of_area: i64,
+    /// Neighborhoods dropped for fewer than ten cohort households.
+    pub suppressed_neighborhoods: i64,
     pub options: SegmentOptions,
 }
 
@@ -2170,6 +2265,76 @@ fn zip_geography_inner(
         cells,
         out_of_area,
         suppressed_zips,
+        options,
+    }
+}
+
+/// Aggregate the mart into per-neighborhood cohort-retention cells for one cohort year and
+/// optional segment. Pure over `Hh` (ZIP series attached). Mirrors `GeoMode::Retention`: the
+/// population is the cohort that joined in `cohort_fy`, each placed at its join-year ZIP, but
+/// the ZIP is then rolled up to its NYC neighborhood via the crosswalk. Neighborhoods under
+/// ten cohort households are suppressed; cohort members with no NYC neighborhood are counted
+/// out-of-area, never misplaced.
+fn neighborhood_retention_inner(
+    households: &[Hh],
+    cohort_fy: i32,
+    segment: Option<Segment>,
+    top_tiers: &[String],
+    top_cats: &[String],
+    options: SegmentOptions,
+) -> NeighborhoodRetention {
+    let asof = GeoMode::Retention.as_of(cohort_fy);
+    let mut by_nta: std::collections::BTreeMap<u16, GeoAcc> = Default::default();
+    let mut out_of_area: i64 = 0;
+
+    for h in households {
+        if let Some(seg) = &segment {
+            if !in_segment(h, seg, top_tiers, top_cats) {
+                continue;
+            }
+        }
+        if h.cohort_fy != Some(cohort_fy) {
+            continue;
+        }
+        let Some(zip) = zip_as_of(h, asof) else {
+            continue;
+        };
+        match zip_nta().get(zip) {
+            Some(&nta) => {
+                let acc = by_nta.entry(nta).or_default();
+                acc.pop += 1;
+                if h.is_current {
+                    acc.retained += 1;
+                }
+            }
+            None => out_of_area += 1,
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut suppressed_neighborhoods = 0i64;
+    for (nta, acc) in by_nta {
+        // Same 10-household rate floor as Retention-by-ZIP: a neighborhood cohort denominator
+        // is small enough to leak a family, and a rate on a handful is noise.
+        if acc.pop < 10 {
+            suppressed_neighborhoods += 1;
+            continue;
+        }
+        cells.push(NeighborhoodCell {
+            nta,
+            measure: pct(acc.retained, acc.pop),
+            n: acc.pop,
+            retained: acc.retained,
+        });
+    }
+
+    NeighborhoodRetention {
+        cohort_fy,
+        segment,
+        available: true,
+        cells,
+        out_of_area,
+        suppressed_neighborhoods,
         options,
     }
 }
@@ -2432,6 +2597,50 @@ pub fn zip_geography_views(
     Ok(views.into_iter().map(|v| v.expect("every year filled")).collect())
 }
 
+/// Store-backed neighborhood cohort-retention for many cohort years, in request order, in one
+/// lock hold and one household load. Gates on the `geography` capability like the ZIP views.
+/// The neighborhood map opens all its cohort years at once (to colour the picked year and draw
+/// each neighborhood's trend), so a single load answers the whole panel; no persisted cache is
+/// kept here — the household load is the cost, and it happens once per open.
+pub fn neighborhood_retention_views(
+    store: &Store,
+    segment: Option<Segment>,
+    cohort_fys: &[i32],
+) -> Result<Vec<NeighborhoodRetention>> {
+    let caps = source_capabilities(store)?;
+    if !cap_available(&caps, "geography") {
+        return Ok(cohort_fys
+            .iter()
+            .map(|&fy| NeighborhoodRetention {
+                cohort_fy: fy,
+                segment: segment.clone(),
+                available: false,
+                cells: Vec::new(),
+                out_of_area: 0,
+                suppressed_neighborhoods: 0,
+                options: SegmentOptions::default(),
+            })
+            .collect());
+    }
+    let households = load_geo_households(store)?;
+    let top_tiers = top_values(&households, |h| h.tier.as_deref(), 6);
+    let top_cats = top_values(&households, |h| h.category.as_deref(), 6);
+    let options = build_segment_options(&households, &top_tiers, &top_cats);
+    Ok(cohort_fys
+        .iter()
+        .map(|&fy| {
+            neighborhood_retention_inner(
+                &households,
+                fy,
+                segment.clone(),
+                &top_tiers,
+                &top_cats,
+                options.clone(),
+            )
+        })
+        .collect())
+}
+
 pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
     (FIRST_TREND_FY..=cur)
         .map(|fy| TrendRow {
@@ -2602,6 +2811,28 @@ pub fn cohort_matrix_indexed(
         }
     }
     out
+}
+
+/// Composition of today's member base by join-year cohort. The denominator is every
+/// current member (matching the `members_now` KPI), so the rows sum to the base minus any
+/// current member whose join date is undated — the frontend surfaces that remainder rather
+/// than hiding it. Rows ascend by cohort.
+pub fn cohort_makeup(hh: &[Hh]) -> Vec<CohortMakeupRow> {
+    let base = hh.iter().filter(|h| h.is_current).count() as i64;
+    let mut by_cohort: std::collections::BTreeMap<i32, i64> = std::collections::BTreeMap::new();
+    for h in hh.iter().filter(|h| h.is_current) {
+        if let Some(join_fy) = h.join_fy {
+            *by_cohort.entry(join_fy).or_default() += 1;
+        }
+    }
+    by_cohort
+        .into_iter()
+        .map(|(cohort, current)| CohortMakeupRow {
+            cohort,
+            current,
+            pct_of_base: pct(current, base),
+        })
+        .collect()
 }
 
 /// Joiners old enough to judge: at least four full membership years, at most twelve.
@@ -2907,6 +3138,188 @@ pub fn dues(rows: &[HhFy], cur: i32) -> Vec<DuesRow> {
             })
         })
         .collect()
+}
+
+/// A percentage of a money total, rounded to a tenth. Zero when the denominator is
+/// non-positive, so an all-unpaid or empty year reads as 0% rather than NaN.
+fn share(num: f64, den: f64) -> f64 {
+    if den <= 0.0 {
+        0.0
+    } else {
+        (1000.0 * num / den).round() / 10.0
+    }
+}
+
+/// Stable key and human label for each billing product class. The order they are listed
+/// in `financials` (dues first) comes from `CLASS_ORDER`, not this map.
+fn class_label(class: DuesClass) -> (&'static str, &'static str) {
+    match class {
+        DuesClass::Membership => ("membership", "Dues"),
+        DuesClass::Tuition => ("tuition", "Tuition"),
+        DuesClass::SecurityFee => ("security_fee", "Security fees"),
+        DuesClass::Gift => ("gift", "Gifts & donations"),
+        DuesClass::Event => ("event", "Events & tickets"),
+        DuesClass::Sale => ("sale", "Sales & merchandise"),
+        DuesClass::Other => ("other", "Other"),
+    }
+}
+
+/// The aggregate financial picture across today's member households for the latest complete
+/// fiscal year: Pareto concentration by decile, the revenue mix by product class, and the
+/// billed-vs-received collection gap. Every output is a total or a decile band — never a
+/// household — so no member's finances can be read off it. Returns None when the billing
+/// source or its money columns are absent, or no complete year carries member money yet.
+fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> {
+    let statement_cols = store.mirror_columns("BillingStatement__c")?;
+    let line_cols = store.mirror_columns("BillingStatementLine__c")?;
+    let s_id = resolve_col(&statement_cols, STATEMENT_FIELDS.id);
+    let s_hh = resolve_col(&statement_cols, STATEMENT_FIELDS.household);
+    let s_date = resolve_col(&statement_cols, STATEMENT_FIELDS.date);
+    let l_parent = resolve_col(&line_cols, LINE_FIELDS.parent);
+    let l_fam = resolve_col(&line_cols, LINE_FIELDS.product_family);
+    let l_name = resolve_col(&line_cols, LINE_FIELDS.product_name);
+    let l_amt = resolve_col(&line_cols, LINE_FIELDS.amount);
+    let l_recv = resolve_col(&line_cols, LINE_FIELDS.received);
+    // Without the household/parent/date joins there is no defensible statement-to-year link;
+    // without either money column there is nothing to total. Either way, no financial view.
+    if s_id.is_none() || s_hh.is_none() || s_date.is_none() || l_parent.is_none() || (l_amt.is_none() && l_recv.is_none()) {
+        return Ok(None);
+    }
+    let statement_rows = store.mirror_rows("BillingStatement__c")?;
+    let line_rows = store.mirror_rows("BillingStatementLine__c")?;
+
+    // Statement id -> (household id, fiscal year), for statements that name a household and
+    // carry a parseable date. First writer wins; `""` is a legal id.
+    let mut statement_meta: std::collections::HashMap<&str, (&str, i32)> =
+        std::collections::HashMap::with_capacity(statement_rows.len());
+    for row in &statement_rows {
+        let (Some(id), Some(household_id), Some(fy)) = (
+            field(row, &s_id),
+            field(row, &s_hh),
+            field(row, &s_date).and_then(fy_of),
+        ) else {
+            continue;
+        };
+        statement_meta.entry(id).or_insert((household_id, fy));
+    }
+    // The latest complete fiscal year with billing: the newest statement year before the
+    // in-progress one. None -> no complete year to report yet.
+    let Some(fiscal_year) = statement_meta
+        .values()
+        .map(|(_, fy)| *fy)
+        .filter(|fy| *fy < cur)
+        .max()
+    else {
+        return Ok(None);
+    };
+
+    // Every current member seeded at zero, so the decile base is the whole membership — not
+    // only those who happened to be billed. `per_hh[i]` is (billed, received).
+    let current_ids: Vec<&str> = hh
+        .iter()
+        .filter(|h| h.is_current)
+        .map(|h| h.account_id.as_str())
+        .collect();
+    let index: std::collections::HashMap<&str, usize> =
+        current_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let mut per_hh: Vec<(f64, f64)> = vec![(0.0, 0.0); current_ids.len()];
+    let mut by_class: std::collections::HashMap<&'static str, (f64, f64)> =
+        std::collections::HashMap::new();
+
+    for row in &line_rows {
+        let Some(parent) = field(row, &l_parent) else {
+            continue;
+        };
+        let Some(&(household_id, fy)) = statement_meta.get(parent) else {
+            continue;
+        };
+        if fy != fiscal_year {
+            continue;
+        }
+        let Some(&i) = index.get(household_id) else {
+            continue; // a statement for a household that is not a current member
+        };
+        let billed = field(row, &l_amt).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let received = field(row, &l_recv).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        per_hh[i].0 += billed;
+        per_hh[i].1 += received;
+        let (key, _) = class_label(dues_class(field(row, &l_fam), field(row, &l_name)));
+        let entry = by_class.entry(key).or_insert((0.0, 0.0));
+        entry.0 += billed;
+        entry.1 += received;
+    }
+
+    let total_billed: f64 = per_hh.iter().map(|(b, _)| *b).sum();
+    let total_received: f64 = per_hh.iter().map(|(_, r)| *r).sum();
+    // No member money in the latest complete year: nothing worth a tab.
+    if total_billed <= 0.0 && total_received <= 0.0 {
+        return Ok(None);
+    }
+    let paying_households = per_hh.iter().filter(|(_, r)| *r > 0.0).count() as i64;
+
+    // Revenue mix, dues first, only classes that carried money.
+    const CLASS_ORDER: [DuesClass; 7] = [
+        DuesClass::Membership,
+        DuesClass::Tuition,
+        DuesClass::SecurityFee,
+        DuesClass::Gift,
+        DuesClass::Event,
+        DuesClass::Sale,
+        DuesClass::Other,
+    ];
+    let by_class: Vec<FinancialClassRow> = CLASS_ORDER
+        .iter()
+        .filter_map(|class| {
+            let (key, label) = class_label(*class);
+            let (billed, received) = by_class.get(key).copied().unwrap_or((0.0, 0.0));
+            (billed > 0.0 || received > 0.0).then(|| FinancialClassRow {
+                key: key.to_string(),
+                label: label.to_string(),
+                billed,
+                received,
+            })
+        })
+        .collect();
+
+    // Concentration: rank by cash received (billed as a fallback if no cash is recorded),
+    // then split the base into ten equal-count bands, top first, and run the Pareto curve.
+    let rank_received = total_received > 0.0;
+    per_hh.sort_by(|a, b| {
+        let (primary_a, primary_b) = if rank_received { (a.1, b.1) } else { (a.0, b.0) };
+        primary_b
+            .partial_cmp(&primary_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n = per_hh.len();
+    let mut concentration = Vec::with_capacity(10);
+    let (mut cum_billed, mut cum_received) = (0.0, 0.0);
+    for decile in 1..=10usize {
+        let start = ((decile - 1) * n) / 10;
+        let end = (decile * n) / 10;
+        let band = &per_hh[start..end];
+        let billed: f64 = band.iter().map(|(b, _)| *b).sum();
+        let received: f64 = band.iter().map(|(_, r)| *r).sum();
+        cum_billed += billed;
+        cum_received += received;
+        concentration.push(ConcentrationRow {
+            decile: decile as i32,
+            households: band.len() as i64,
+            billed_share: share(billed, total_billed),
+            received_share: share(received, total_received),
+            cumulative_billed_share: share(cum_billed, total_billed),
+            cumulative_received_share: share(cum_received, total_received),
+        });
+    }
+
+    Ok(Some(Financials {
+        fiscal_year,
+        households: n as i64,
+        paying_households,
+        total_billed,
+        total_received,
+        by_class,
+        concentration,
+    }))
 }
 
 /// Account ids active at the end of the current fiscal year.
@@ -3396,9 +3809,24 @@ pub fn to_csv(view: &str, ins: &Insights, at_risk: &[AtRiskRow]) -> Result<(Stri
 /// (which only changes on a rebuild) and the fiscal year it was computed for, EXCEPT the
 /// freshness facts and capabilities, which are cheap catalog reads and are re-read live so a
 /// later sync or a withheld field shows immediately. Keyed on the build stamp, the fiscal
-/// year, and the mart schema, and dropped by the rebuild transaction, so it can only ever skip
-/// a repeat of the same computation.
+/// year, the mart schema, and the read-model revision, and dropped by the rebuild transaction,
+/// so it can only ever skip a repeat of the same computation.
 const INSIGHTS_CACHE_KEY: &str = "insights_cache";
+
+/// Bumped whenever the computed `Insights` shape or a view's computation changes without a
+/// mart change — a new field, a new or altered view. It invalidates the persisted insights
+/// cache so the next read recomputes; unlike `LOGIC_REVISION` it does NOT feed
+/// `mart_schema_fingerprint`, so it never forces a mart rebuild — the mart already holds
+/// everything the read model reads, only the cached read model is stale. Serde treats a
+/// missing `Option` field as `None`, so without this an added optional field (e.g.
+/// `financials`) would deserialize from an older cache as absent and never recompute.
+const READ_MODEL_REVISION: u32 = 2;
+
+/// Cache-validity fingerprint: the mart schema plus the read-model revision. A change to
+/// either invalidates the persisted insights cache.
+fn insights_cache_fingerprint() -> String {
+    format!("{}::rm{READ_MODEL_REVISION}", mart_schema_fingerprint())
+}
 #[derive(Serialize, Deserialize)]
 struct InsightsCache {
     built_at: String,
@@ -3419,7 +3847,7 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
             .get_meta(INSIGHTS_CACHE_KEY)?
             .and_then(|blob| serde_json::from_str::<InsightsCache>(&blob).ok());
         if let Some(cache) = cached {
-            if &cache.built_at == built && cache.current_fy == cur && cache.schema == mart_schema_fingerprint() {
+            if &cache.built_at == built && cache.current_fy == cur && cache.schema == insights_cache_fingerprint() {
                 let mut insights = cache.insights;
                 insights.newest_source_sync_at = newest_source_sync_at;
                 insights.stale = stale;
@@ -3431,7 +3859,7 @@ pub fn views(store: &Store, cur: i32) -> Result<Insights> {
     let insights = compute_views(store, cur, built_at.clone(), newest_source_sync_at, stale, capabilities)?;
     if let Some(built_at) = built_at {
         // Best-effort: a failed persist only means the next load computes again.
-        let cache = InsightsCache { built_at, current_fy: cur, schema: mart_schema_fingerprint(), insights: insights.clone() };
+        let cache = InsightsCache { built_at, current_fy: cur, schema: insights_cache_fingerprint(), insights: insights.clone() };
         if let Err(e) = serde_json::to_string(&cache).map_err(anyhow::Error::from).and_then(|blob| store.set_meta(INSIGHTS_CACHE_KEY, &blob)) {
             tracing::warn!("insights cache persist failed: {e}");
         }
@@ -3472,6 +3900,13 @@ fn compute_views(
         Vec::new()
     };
     let year1 = year1_indexed(&household_years, &index, cur);
+    // Financials read the raw billing amounts (not the mart), so gate on the same billing
+    // source Renewal uses and never fail insights if the read degrades.
+    let financials_view = if cap_available(&capabilities, "renewal") {
+        financials(store, &hh, cur).ok().flatten()
+    } else {
+        None
+    };
     Ok(Insights {
         built_at,
         newest_source_sync_at,
@@ -3481,6 +3916,7 @@ fn compute_views(
         kpis: kpis_from_household_years(&household_years, &year1, cur, at_risk),
         trend: trend_from_household_years(&household_years, cur),
         cohort_matrix: cohort_matrix_indexed(&household_years, &index, cur),
+        cohort_makeup: cohort_makeup(&hh),
         channels: channels_indexed(&household_years, &index, cur),
         year1,
         school: school(&hh, cur),
@@ -3492,6 +3928,7 @@ fn compute_views(
         dues: dues_view,
         anchor_type: anchor_type(&household_years, cur, &capabilities),
         anchor_count: anchor_count_view,
+        financials: financials_view,
         // Default panel view, off the risk-blocked lock path. Never fails insights: a geography
         // error degrades to None and the panel falls back to fetching on its own.
         geography: zip_geography_view(store, cur - 1, GeoMode::Density, None).ok(),
@@ -3629,6 +4066,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_from_an_earlier_read_model_is_rejected_and_recomputed() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        // Warm the cache and confirm the read model actually produces makeup rows.
+        assert!(!views(&s, 2027).unwrap().cohort_makeup.is_empty());
+
+        // Simulate a cache written by an older binary: the pre-revision schema (the bare mart
+        // fingerprint) and a payload missing the newer views. Keyed on the mart schema alone,
+        // `views` would serve this stale blob (an added `Option` field deserializes as `None`);
+        // the read-model revision must reject it and recompute.
+        let blob = s.get_meta(INSIGHTS_CACHE_KEY).unwrap().unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        v["schema"] = serde_json::Value::String(mart_schema_fingerprint());
+        v["insights"]["cohort_makeup"] = serde_json::json!([]);
+        v["insights"]["financials"] = serde_json::Value::Null;
+        s.set_meta(INSIGHTS_CACHE_KEY, &serde_json::to_string(&v).unwrap()).unwrap();
+
+        assert!(!views(&s, 2027).unwrap().cohort_makeup.is_empty());
+    }
+
+    #[test]
     fn cached_insights_still_report_a_newer_sync_as_stale() {
         let (_d, mut s) = mem();
         seed_account(&mut s, &fixture(), &ACCT_COLS);
@@ -3675,6 +4134,40 @@ mod tests {
         let fallback = Hh { zip: Some("07030".into()), ..Default::default() };
         assert_eq!(zip_as_of(&fallback, 2025), Some("07030")); // no series → Account fallback
         assert_eq!(zip_as_of(&Hh::default(), 2025), None);
+    }
+
+    #[test]
+    fn neighborhood_retention_rolls_zips_up_by_crosswalk_suppresses_and_counts_out_of_area() {
+        // 10024 → NTA 124, 10002 → NTA 77 (distinct neighborhoods); 07030 (NJ) has no NYC
+        // neighborhood, so it is out-of-area, not misplaced.
+        let mut hh: Vec<Hh> = Vec::new();
+        for i in 0..12 {
+            let mut h = geo_hh(&format!("a{i}"), "10024", Some(2024), None);
+            h.is_current = i < 8; // 8 of 12 still members
+            hh.push(h);
+        }
+        for i in 0..5 {
+            hh.push(geo_hh(&format!("b{i}"), "10002", Some(2024), None)); // under the 10-hh floor
+        }
+        for i in 0..3 {
+            hh.push(geo_hh(&format!("o{i}"), "07030", Some(2024), None)); // out of area
+        }
+        for i in 0..2 {
+            let mut h = geo_hh(&format!("w{i}"), "10024", Some(2023), None); // a different cohort
+            h.is_current = true;
+            hh.push(h);
+        }
+
+        let geo = neighborhood_retention_inner(&hh, 2024, None, &[], &[], SegmentOptions::default());
+
+        assert_eq!(geo.out_of_area, 3, "NJ households have no NYC neighborhood");
+        assert_eq!(geo.suppressed_neighborhoods, 1, "the 5-household neighborhood is suppressed");
+        assert_eq!(geo.cells.len(), 1, "only the 12-household neighborhood survives");
+        let cell = &geo.cells[0];
+        assert_eq!(cell.nta, 124);
+        assert_eq!(cell.n, 12);
+        assert_eq!(cell.retained, 8);
+        assert!((cell.measure - pct(8, 12)).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -5064,6 +5557,98 @@ mod tests {
                 "",
             ]),
         ]
+    }
+
+    #[test]
+    fn financials_rank_by_received_split_the_mix_and_close_the_pareto() {
+        let (_d, mut s) = mem();
+        // Ten current member households, each billed in FY2025 (statement dated Sep 2024).
+        let ids = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+        let statements: Vec<Row> = ids
+            .iter()
+            .map(|id| {
+                row(&[
+                    ("Id", format!("st{id}").as_str()),
+                    ("Account__c", format!("acc{id}").as_str()),
+                    ("Date__c", "2024-09-01"),
+                ])
+            })
+            .collect();
+        let mut lines: Vec<Row> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let (billed, received): (i64, i64) = match i {
+                    0 => (1000, 1000),
+                    1 => (1000, 500),
+                    _ => (250, 250),
+                };
+                row(&[
+                    ("Id", format!("dl{id}").as_str()),
+                    ("BillingStatement__c", format!("st{id}").as_str()),
+                    ("Billing_PrimaryProductFamily__c", "Dues"),
+                    ("Billing_PrimaryProductName__c", "Membership Dues"),
+                    ("Charges__c", billed.to_string().as_str()),
+                    ("Billing_ReceivedAmount__c", received.to_string().as_str()),
+                    ("Billing_Balance__c", (billed - received).to_string().as_str()),
+                ])
+            })
+            .collect();
+        // One tuition line on accA, so the revenue mix has a second class and accA is the
+        // single biggest total payer.
+        lines.push(row(&[
+            ("Id", "tlA"),
+            ("BillingStatement__c", "stA"),
+            ("Billing_PrimaryProductFamily__c", "Tuition"),
+            ("Billing_PrimaryProductName__c", "Religious School Tuition"),
+            ("Charges__c", "2000"),
+            ("Billing_ReceivedAmount__c", "2000"),
+            ("Billing_Balance__c", "0"),
+        ]));
+        seed_object(&mut s, "BillingStatement__c", &["Id", "Account__c", "Date__c"], &statements);
+        seed_object(
+            &mut s,
+            "BillingStatementLine__c",
+            &[
+                "Id",
+                "BillingStatement__c",
+                "Billing_PrimaryProductFamily__c",
+                "Billing_PrimaryProductName__c",
+                "Charges__c",
+                "Billing_ReceivedAmount__c",
+                "Billing_Balance__c",
+            ],
+            &lines,
+        );
+        let hh: Vec<Hh> = ids
+            .iter()
+            .map(|id| Hh { account_id: format!("acc{id}"), is_current: true, ..Default::default() })
+            .collect();
+
+        let fin = financials(&s, &hh, 2026).unwrap().expect("financials present");
+        assert_eq!(fin.fiscal_year, 2025);
+        assert_eq!(fin.households, 10);
+        assert_eq!(fin.paying_households, 10);
+        assert_eq!(fin.total_billed, 6000.0);
+        assert_eq!(fin.total_received, 5500.0);
+        // Revenue mix: dues first, then tuition; collection gap lives in billed vs received.
+        assert_eq!(fin.by_class.len(), 2);
+        assert_eq!(fin.by_class[0].key, "membership");
+        assert_eq!(fin.by_class[0].billed, 4000.0);
+        assert_eq!(fin.by_class[0].received, 3500.0);
+        assert_eq!(fin.by_class[1].key, "tuition");
+        assert_eq!(fin.by_class[1].received, 2000.0);
+        // Top decile is the single biggest payer (accA: 3000 received of 5500, 3000 billed of 6000).
+        let top = &fin.concentration[0];
+        assert_eq!(top.households, 1);
+        assert_eq!(top.received_share, 54.5);
+        assert_eq!(top.billed_share, 50.0);
+        // The Pareto curve closes at 100%.
+        let last = fin.concentration.last().unwrap();
+        assert_eq!(last.cumulative_received_share, 100.0);
+        assert_eq!(last.cumulative_billed_share, 100.0);
+        // No complete fiscal year before the in-progress one -> nothing to report.
+        assert!(financials(&s, &hh, 2025).unwrap().is_none());
     }
 
     #[test]

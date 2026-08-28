@@ -10,12 +10,13 @@ const base: Insights = {
   trend: [{ fy: 2025, joins: 321, resigns: 328, active_end_of_fy: 2552 }, { fy: 2026, joins: 244, resigns: 306, active_end_of_fy: 2490 }],
   year1: [{ cohort: 2024, n: 374, pct_retained: 69 }, { cohort: 2025, n: 321, pct_retained: 66.7 }],
   cohort_matrix: [{ cohort: 2015, n: 185, k: 5, pct_retained: 69.7 }, { cohort: 2019, n: 188, k: 5, pct_retained: 48.9 }],
+  cohort_makeup: [{ cohort: 2015, current: 120, pct_of_base: 4.8 }, { cohort: 2025, current: 214, pct_of_base: 8.6 }, { cohort: 2026, current: 217, pct_of_base: 8.7 }],
   channels: [{ key: "clergy", label: "Clergy", n: 76, still_members: 49, pct: 64.5, avg_tenure: 4.7, left_within_2y: 11 },
              { key: "nursery_school", label: "Nursery school", n: 122, still_members: 32, pct: 26.2, avg_tenure: 4.6, left_within_2y: 34 }],
   school: [{ group: "Both nursery and religious school", n: 98, still_members: 67, pct: 68.4 }, { group: "No school history", n: 1115, still_members: 443, pct: 39.7 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 90 }, { fy: 2026, reason: "Moved", n: 51 }],
   multi_job: [], outcome_by_tenure: [], school_progression: [], school_gap: [],
-  dues: [], anchor_type: [], anchor_count: [], geography: null,
+  dues: [], anchor_type: [], anchor_count: [], geography: null, financials: null,
 };
 
 describe("insights formatting", () => {
@@ -41,6 +42,10 @@ describe("insights formatting", () => {
     expect(s.school).toContain("68.4%");
     expect(s.reasons).toContain("Non-payment");
     expect(s.cohort).toContain("FY2015");
+    // Makeup: FY2025+FY2026 are within the last five cohorts (current_fy 2026); FY2026 is
+    // the single largest contributor (217 households).
+    expect(s.makeup).toContain("17.3%");
+    expect(s.makeup).toContain("FY2026 cohort alone contributes 217");
   });
 
   it("has a label for every at-risk rule", () => {

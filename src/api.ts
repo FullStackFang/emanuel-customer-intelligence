@@ -34,6 +34,7 @@ export interface Kpis {
 export interface TrendRow { fy: number; joins: number; resigns: number; active_end_of_fy: number }
 export interface CohortYear1 { cohort: number; n: number; pct_retained: number }
 export interface CohortCell { cohort: number; n: number; k: number; pct_retained: number }
+export interface CohortMakeupRow { cohort: number; current: number; pct_of_base: number }
 export interface ChannelRow { key: string; label: string; n: number; still_members: number; pct: number; avg_tenure: number; left_within_2y: number }
 export interface SchoolRow { group: string; n: number; still_members: number; pct: number }
 export interface ReasonCell { fy: number; reason: string; n: number }
@@ -43,6 +44,13 @@ export interface SchoolGapRow { bucket: string; n: number; still_members: number
 export interface DuesRow { fy: number; active: number; billed: number; coverage_missing: number; settled: number; partially_settled: number; unsettled: number }
 export interface AnchorTypeRow { key: string; label: string; n: number; still_members: number; pct: number }
 export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
+export interface FinancialClassRow { key: string; label: string; billed: number; received: number }
+export interface ConcentrationRow { decile: number; households: number; billed_share: number; received_share: number; cumulative_billed_share: number; cumulative_received_share: number }
+export interface Financials {
+  fiscal_year: number; households: number; paying_households: number;
+  total_billed: number; total_received: number;
+  by_class: FinancialClassRow[]; concentration: ConcentrationRow[];
+}
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
 
 // ── mode-driven ZIP geography (on-demand, its own command) ────────────────────
@@ -66,6 +74,12 @@ export interface ZipGeography {
   fiscal_year: number; mode: GeoMode; segment: Segment | null; available: boolean;
   cells: ZipGeoCell[]; out_of_area: number; suppressed_zips: number; options: SegmentOptions;
 }
+/** One NYC neighborhood's cohort retention. `nta` indexes the packaged `nta-meta.json`. */
+export interface NeighborhoodCell { nta: number; measure: number; n: number; retained: number }
+export interface NeighborhoodRetention {
+  cohort_fy: number; segment: Segment | null; available: boolean;
+  cells: NeighborhoodCell[]; out_of_area: number; suppressed_neighborhoods: number; options: SegmentOptions;
+}
 export interface SourceCapability {
   key: string; available: boolean; required_objects: string[];
   mirrored_columns: string[];
@@ -74,11 +88,12 @@ export interface SourceCapability {
 export interface Insights {
   built_at: string | null; newest_source_sync_at: string | null; stale: boolean;
   capabilities: SourceCapability[]; current_fy: number; unavailable: string[]; kpis: Kpis;
-  trend: TrendRow[]; year1: CohortYear1[]; cohort_matrix: CohortCell[];
+  trend: TrendRow[]; year1: CohortYear1[]; cohort_matrix: CohortCell[]; cohort_makeup: CohortMakeupRow[];
   channels: ChannelRow[]; school: SchoolRow[]; reasons: ReasonCell[];
   multi_job: MultiJobRow[]; outcome_by_tenure: OutcomeByTenureRow[];
   school_progression: SchoolRow[]; school_gap: SchoolGapRow[];
   dues: DuesRow[]; anchor_type: AnchorTypeRow[]; anchor_count: AnchorCountRow[];
+  financials: Financials | null;
   /** Default Geography view (density · last completed FY · all members), resolved on the
    *  get_insights path so the panel paints immediately instead of a standalone zip_geography
    *  call queuing behind the risk analysis for the store lock. */
@@ -117,6 +132,10 @@ export const zipGeography = (fiscalYear: number, mode: GeoMode, segment: Segment
  *  views come back in request order. */
 export const zipGeographyYears = (mode: GeoMode, segment: Segment | null, fiscalYears: number[]) =>
   invoke<ZipGeography[]>("zip_geography_years", { mode, segment, fiscalYears });
+/** Cohort retention rolled up to NYC neighborhoods, many cohort years in one call (one store
+ *  lock, one household load) — the neighborhood map opens every shown cohort at once. */
+export const neighborhoodRetentionYears = (segment: Segment | null, cohortFys: number[]) =>
+  invoke<NeighborhoodRetention[]>("neighborhood_retention_years", { segment, cohortFys });
 export const getAtRisk = () => invoke<AtRiskRow[]>("get_at_risk");
 export const exportInsightsCsv = (view: InsightView) => invoke<string>("export_insights_csv", { view });
 export const revealExport = (path: string) => invoke<void>("reveal_export", { path });
