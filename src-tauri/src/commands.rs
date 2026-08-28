@@ -647,6 +647,48 @@ pub async fn neighborhood_retention_years(
     .map_err(err)?
 }
 
+/// Mode-driven geography rolled up to New York City neighborhoods for one fiscal year, mode, and
+/// optional segment — the neighborhood counterpart of `zip_geography` for the density, growth,
+/// and attrition views. Loaded on demand when the map view opens, off the `get_insights` critical
+/// path. Returns only suppressed per-neighborhood aggregates (labeled with the public neighborhood
+/// name) plus an out-of-area count — never a raw postal code, coordinate, or bill-to-other id.
+#[tauri::command]
+pub async fn neighborhood_geography(
+    app: AppHandle,
+    fiscal_year: i32,
+    mode: insights::GeoMode,
+    segment: Option<insights::Segment>,
+    state: State<'_, AppState>,
+) -> CmdResult<insights::ZipGeography> {
+    let w = who(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let state = state.inner();
+        let mut sink = progress_sink(&app, state);
+        let mut progress = Reporter::new("rebuild", insights::REBUILD_STEPS, &mut sink);
+        let out = with_store(state, |s| {
+            ensure_fresh_with(s, &w, false, &mut progress)?;
+            let view = insights::neighborhood_geography_view(s, fiscal_year, mode, segment)?;
+            s.audit(
+                &w,
+                "insights.neighborhood_geography",
+                None,
+                Some(serde_json::json!({
+                    "fy": fiscal_year,
+                    "cells": view.cells.len(),
+                    "out_of_area": view.out_of_area,
+                    "available": view.available,
+                })),
+            )?;
+            Ok(view)
+        });
+        clear_job(state);
+        out
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>> {
     let w = who(state.inner());

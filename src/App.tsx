@@ -6,18 +6,16 @@ import logoUrl from "./assets/emanuel_logo.png";
 import * as api from "./api";
 import OverviewPage from "./pages/OverviewPage";
 import DataPage from "./pages/DataPage";
-import SegmentsPage from "./pages/SegmentsPage";
 import InsightsPage from "./pages/InsightsPage";
 import AuditPage from "./pages/AuditPage";
 import SettingsPage from "./pages/SettingsPage";
 
-export type PageKey = "overview" | "data" | "segments" | "insights" | "audit" | "settings";
+export type PageKey = "overview" | "data" | "insights" | "audit" | "settings";
 export interface PageProps { status: api.StatusView; refresh: () => Promise<void> }
 
 const NAV = [
   { key: "overview", icon: "layout-dashboard", label: "Overview" },
   { key: "data", icon: "database", label: "Data" },
-  { key: "segments", icon: "chart-pie", label: "Segments" },
   { key: "insights", icon: "chart-line", label: "Insights" },
   { key: "audit", icon: "scroll-text", label: "Audit" },
   { key: "settings", icon: "settings", label: "Settings" },
@@ -107,7 +105,6 @@ export default function App() {
     <AppFrame nav={NAV} active={page} onNav={(k: string) => setPage(k as PageKey)} user={user}>
       {page === "overview" && <OverviewPage {...props} />}
       {page === "data" && <DataPage {...props} />}
-      {page === "segments" && <SegmentsPage {...props} />}
       {page === "insights" && <InsightsPage {...props} />}
       {page === "audit" && <AuditPage {...props} />}
       {page === "settings" && <SettingsPage {...props} />}

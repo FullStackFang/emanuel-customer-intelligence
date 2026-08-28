@@ -28,9 +28,9 @@ vi.mock("./insights/charts", () => {
   const N = () => <div className="recharts-responsive-container" data-insights-chart />;
   type Col = { key: string; render: (r: unknown) => React.ReactNode };
   return {
-    TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N, CohortMakeupChart: N,
-    HBarChart: N, ReasonsHeatmap: N, OutcomeByTenureChart: N, DuesChart: N,
-    ConcentrationChart: N, MoneyOverTimeChart: N, ClassOverTimeChart: N, CohortValueChart: N,
+    TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N, MembershipAgeChart: N, MembershipAgeOverTimeChart: N,
+    JoinedVsStillHereChart: N, HBarChart: N, ReasonsHeatmap: N, OutcomeByTenureChart: N, DuesChart: N,
+    ConcentrationChart: N, MoneyOverTimeChart: N, ClassOverTimeChart: N, ValueByAgeChart: N, GrowthVsRecurringChart: N,
     TableView: ({ rows, columns, getRowKey }: { rows: unknown[]; columns: Col[]; getRowKey: (r: unknown) => string }) => (
       <div data-testid="table">
         {rows.map((r) => (
@@ -60,10 +60,27 @@ const fakeInsights: api.Insights = {
   capabilities: [cap("membership", true), cap("renewal", false), cap("school", false), cap("committee", false)],
   current_fy: 2027, unavailable: [],
   kpis: { members_now: 100, net_vs_prior_fy: -2, joins_this_fy: 5, resigns_this_fy: 7, year1_cohort: 2025, year1_pct: 70, year1_baseline_pct: 80, at_risk_count: 3 },
-  trend: [{ fy: 2025, joins: 5, resigns: 4, active_end_of_fy: 100 }],
+  trend: [{ fy: 2019, joins: 20, resigns: 5, active_end_of_fy: 90 }, { fy: 2025, joins: 5, resigns: 4, active_end_of_fy: 100 }],
   year1: [{ cohort: 2024, n: 10, pct_retained: 70 }],
   cohort_matrix: [{ cohort: 2020, n: 10, k: 5, pct_retained: 60 }],
-  cohort_makeup: [{ cohort: 2020, current: 6, pct_of_base: 6 }, { cohort: 2026, current: 4, pct_of_base: 4 }],
+  // A pre-FY2010 cohort (survivors only) and a FY2010+ cohort (joined beside still here).
+  cohort_makeup: [{ cohort: 2005, current: 8, pct_of_base: 8 }, { cohort: 2019, current: 12, pct_of_base: 12 }],
+  // Bands sum to 97 of members_now (100), leaving a 3-household undated remainder for the note.
+  membership_age: [
+    { band: "New", households: 10, pct_of_base: 10.3 },
+    { band: "Establishing", households: 20, pct_of_base: 20.6 },
+    { band: "Settled", households: 30, pct_of_base: 30.9 },
+    { band: "Long-standing", households: 30, pct_of_base: 30.9 },
+    { band: "Legacy", households: 7, pct_of_base: 7.2 },
+  ],
+  membership_age_over_time: [
+    { fy: 2024, band: "New", households: 12, pct_of_base: 12 }, { fy: 2024, band: "Establishing", households: 22, pct_of_base: 22 },
+    { fy: 2024, band: "Settled", households: 30, pct_of_base: 30 }, { fy: 2024, band: "Long-standing", households: 28, pct_of_base: 28 },
+    { fy: 2024, band: "Legacy", households: 8, pct_of_base: 8 },
+    { fy: 2026, band: "New", households: 10, pct_of_base: 10.3 }, { fy: 2026, band: "Establishing", households: 20, pct_of_base: 20.6 },
+    { fy: 2026, band: "Settled", households: 30, pct_of_base: 30.9 }, { fy: 2026, band: "Long-standing", households: 30, pct_of_base: 30.9 },
+    { fy: 2026, band: "Legacy", households: 7, pct_of_base: 7.2 },
+  ],
   channels: [{ key: "clergy", label: "Clergy", n: 20, still_members: 14, pct: 70, avg_tenure: 5, left_within_2y: 2 }],
   school: [{ group: "No school history", n: 50, still_members: 20, pct: 40 }],
   reasons: [{ fy: 2026, reason: "Non-payment", n: 10 }],
@@ -133,10 +150,10 @@ describe("InsightsPage", () => {
     render(<InsightsPage {...props} />);
     await screen.findByText("Membership over time");
     // Every section is in the DOM; the inactive ones carry the hidden class.
-    const jobs = screen.getByText("Stickiness by Entry Job").closest(".insights-section")!;
-    expect(jobs.className).toContain("insights-section-hidden");
-    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
-    expect(jobs.className).not.toContain("insights-section-hidden");
+    const joinReasons = screen.getByText("Stickiness by join reason").closest(".insights-section")!;
+    expect(joinReasons.className).toContain("insights-section-hidden");
+    fireEvent.click(screen.getByRole("button", { name: "Join reasons" }));
+    expect(joinReasons.className).not.toContain("insights-section-hidden");
   });
 
   it("heads each tab with its own aggregate tiles that swap with the section", async () => {
@@ -146,12 +163,12 @@ describe("InsightsPage", () => {
     const overview = screen.getByText("Member households").closest(".insights-overview");
     expect(overview).not.toBeNull();
     expect(screen.getByText("Member households").closest("[role=tablist]")).toBeNull();
-    // The Jobs tab carries its own derived tiles inside the (currently hidden) jobs section.
-    const jobsTile = screen.getByText("Households analyzed").closest(".insights-section")!;
-    expect(jobsTile.className).toContain("insights-section-hidden");
-    expect(screen.getByText("Top entry job")).toBeTruthy(); // best-retained entry job, derived
-    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
-    expect(jobsTile.className).not.toContain("insights-section-hidden");
+    // The Join reasons tab carries its own derived tiles inside the (currently hidden) section.
+    const joinTile = screen.getByText("Households analyzed").closest(".insights-section")!;
+    expect(joinTile.className).toContain("insights-section-hidden");
+    expect(screen.getByText("Top join reason")).toBeTruthy(); // best-retained join reason, derived
+    fireEvent.click(screen.getByRole("button", { name: "Join reasons" }));
+    expect(joinTile.className).not.toContain("insights-section-hidden");
   });
 
   it("renders the financials tab from aggregate figures when billing is available", async () => {
@@ -167,9 +184,17 @@ describe("InsightsPage", () => {
         { fy: 2025, key: "membership", label: "Dues", received: 120000 },
         { fy: 2026, key: "membership", label: "Dues", received: 150000 },
       ],
-      by_cohort: [
-        { cohort: 2020, households: 60, received: 108000, received_per_household: 1800 },
-        { cohort: 2024, households: 40, received: 72000, received_per_household: 1800 },
+      by_membership_age: [
+        { band: "New", households: 5, received: 4000, share_of_households: 5, share_of_received: 2.2, received_per_household: null },
+        { band: "Establishing", households: 0, received: 0, share_of_households: 0, share_of_received: 0, received_per_household: null },
+        { band: "Settled", households: 35, received: 70000, share_of_households: 35, share_of_received: 38.9, received_per_household: 2000 },
+        { band: "Long-standing", households: 40, received: 66000, share_of_households: 40, share_of_received: 36.7, received_per_household: 1650 },
+        { band: "Legacy", households: 20, received: 40000, share_of_households: 20, share_of_received: 22.2, received_per_household: 2000 },
+      ],
+      by_growth: [
+        { fy: 2025, complete: true, new_received: 20000, recurring_received: 120000 },
+        { fy: 2026, complete: true, new_received: 15000, recurring_received: 165000 },
+        { fy: 2027, complete: false, new_received: 2000, recurring_received: 8000 },
       ],
       concentration: Array.from({ length: 10 }, (_, i) => ({
         decile: i + 1, households: 10, billed_share: 10, received_share: 10,
@@ -180,12 +205,58 @@ describe("InsightsPage", () => {
     render(<InsightsPage {...props} />);
     await screen.findByText("Membership over time");
     fireEvent.click(screen.getByRole("button", { name: "Financials" }));
-    // All four panels render, and figures read off the aggregates.
+    // All five panels render, and figures read off the aggregates.
     expect(screen.getByText("Money in over time")).toBeTruthy();
+    expect(screen.getByText("Growth vs. recurring revenue")).toBeTruthy();
     expect(screen.getByText("Where the money comes in over time")).toBeTruthy();
     expect(screen.getByText("Who carries the base")).toBeTruthy();
-    expect(screen.getByText("Cohort value")).toBeTruthy();
+    expect(screen.getByText("Value by membership age")).toBeTruthy();
+    expect(screen.queryByText("Cohort value")).toBeNull();
     expect(screen.getAllByText("$180,000").length).toBeGreaterThan(0); // latest complete year received
+    // A band under ten households withholds its per-household average as "—", with the note.
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("renders the membership-age views and retires the per-join-year cohort cards", async () => {
+    const financials: api.Financials = {
+      fiscal_year: 2026, households: 100, paying_households: 90,
+      total_billed: 200000, total_received: 180000,
+      by_year: [{ fy: 2026, complete: true, billed: 200000, received: 180000 }],
+      by_year_class: [{ fy: 2026, key: "membership", label: "Dues", received: 150000 }],
+      by_membership_age: [
+        { band: "New", households: 5, received: 4000, share_of_households: 5, share_of_received: 2.2, received_per_household: null },
+        { band: "Establishing", households: 0, received: 0, share_of_households: 0, share_of_received: 0, received_per_household: null },
+        { band: "Settled", households: 35, received: 70000, share_of_households: 35, share_of_received: 38.9, received_per_household: 2000 },
+        { band: "Long-standing", households: 40, received: 66000, share_of_households: 40, share_of_received: 36.7, received_per_household: 1650 },
+        { band: "Legacy", households: 20, received: 40000, share_of_households: 20, share_of_received: 22.2, received_per_household: 2000 },
+      ],
+      by_growth: [{ fy: 2026, complete: true, new_received: 15000, recurring_received: 165000 }],
+      concentration: Array.from({ length: 10 }, (_, i) => ({
+        decile: i + 1, households: 10, billed_share: 10, received_share: 10,
+        cumulative_billed_share: (i + 1) * 10, cumulative_received_share: (i + 1) * 10,
+      })),
+    };
+    mockInvoke({ get_insights: { ...fakeInsights, capabilities: [cap("membership", true), cap("renewal", true), cap("school", false), cap("committee", false)], financials } });
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+
+    // The three new cards render; the two per-join-year cards are gone.
+    expect(screen.getByText("Makeup of today's members by membership age")).toBeTruthy();
+    expect(screen.getByText("Joined vs. still here")).toBeTruthy();
+    expect(screen.getByText("Value by membership age")).toBeTruthy();
+    expect(screen.queryByText("Cohort makeup of current members")).toBeNull();
+    expect(screen.queryByText("Cohort value")).toBeNull();
+
+    // The pre-FY2010 cohort shows survivors (8) but no joined figure, with its caption.
+    expect(screen.getByText("Before FY2010")).toBeTruthy();
+    expect(screen.getByText(/departures before then aren't reliably recorded/)).toBeTruthy();
+
+    // A suppressed band renders "—" and the fewer-than-ten note beside the table.
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Bands with fewer than 10 households show no per-household average/)).toBeTruthy();
+
+    // The undated-join remainder (100 members − 97 banded = 3) surfaces as the note.
+    expect(screen.getAllByText(/no usable join date and are not shown above/).length).toBeGreaterThan(0);
   });
 
   it("shows an unavailable state when an optional source is not synced", async () => {
@@ -276,7 +347,7 @@ describe("InsightsPage", () => {
     mockInvoke({ get_risk_summary: () => new Promise<api.RiskSummary>((res) => { resolveRisk = res; }) });
     render(<InsightsPage {...props} />);
     await screen.findByText("Membership over time");
-    fireEvent.click(screen.getByRole("button", { name: "Risk" }));
+    fireEvent.click(screen.getByRole("button", { name: "Attrition & Risk" }));
     expect(screen.getByText(/Analyzing churn risk/)).toBeTruthy();
     emit("insights:progress", { job: "risk", phase: "Rolling validation", step: 2, steps: 4, done: 3, total: 14, elapsed_ms: 5000 });
     expect(screen.getByText(/Risk analysis: step 2 of 4/)).toBeTruthy();
@@ -314,7 +385,7 @@ describe("InsightsPage", () => {
     };
     mockInvoke({
       get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
-      zip_geography: echoGeo,
+      neighborhood_geography: echoGeo,
       zip_geography_years: echoGeoYears,
     });
     render(<InsightsPage {...props} />);
@@ -323,17 +394,17 @@ describe("InsightsPage", () => {
     // (currentFy 2027 is only weeks in, so the default is FY2026).
     expect(await screen.findByRole("region", { name: "Where members are — FY2026" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Where members are" }).getAttribute("aria-pressed")).toBe("true");
-    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026)).toBe(true));
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026)).toBe(true));
 
-    // Headline stats: total mapped households, the top ZIP, and its concentration share.
-    // geo(): 10024 n=42, 10025 n=18 → 60 total, top ZIP 10024 at 70%.
+    // Headline stats: total mapped households, the top area, and its concentration share.
+    // geo(): 10024 n=42, 10025 n=18 → 60 total, top area 10024 at 70%.
     expect(await screen.findByText("Mapped households")).toBeTruthy();
     expect(screen.getAllByText("60").length).toBeGreaterThan(0);
     expect(screen.getByText(/70% of total/)).toBeTruthy();
     // Out-of-area members surface in the summary, never silently dropped.
     expect(screen.getByText(/7 outside NY/)).toBeTruthy();
     // Suppression is stated (count floor 5).
-    expect(screen.getByText(/2 smaller ZIPs are hidden.*fewer than 5 in this view/)).toBeTruthy();
+    expect(screen.getByText(/2 smaller areas are hidden.*fewer than 5 in this view/)).toBeTruthy();
     expect(screen.getByTestId("zip-geography-table")).toBeTruthy();
 
     // Retention by area: a cohort × area heatmap across eight join-year cohorts, fetched in
@@ -351,20 +422,15 @@ describe("InsightsPage", () => {
     // Growth & decline splits gainers from losers.
     fireEvent.click(screen.getByRole("button", { name: "Growth & decline" }));
     expect(await screen.findByRole("region", { name: "Growth & decline — FY2026" })).toBeTruthy();
-    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "net_change")).toBe(true));
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "net_change")).toBe(true));
     expect(await screen.findByText("Losing ground")).toBeTruthy();
     expect(screen.getByText("Gaining members")).toBeTruthy();
 
     // Attrition tightens the suppression floor to 10.
     fireEvent.click(screen.getByRole("button", { name: "Attrition" }));
     expect(await screen.findByRole("region", { name: "Attrition — FY2026" })).toBeTruthy();
-    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "attrition")).toBe(true));
+    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "attrition")).toBe(true));
     expect(await screen.findByText(/fewer than 10 in this view/)).toBeTruthy();
-
-    // The fiscal-year selector drives the time-varying views.
-    fireEvent.change(screen.getByRole("combobox", { name: "Fiscal year" }), { target: { value: "2025" } });
-    expect(await screen.findByRole("region", { name: "Attrition — FY2025" })).toBeTruthy();
-    await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "zip_geography" && (a as { mode: string })?.mode === "attrition" && (a as { fiscalYear: number })?.fiscalYear === 2025)).toBe(true));
   });
 
   it("serves a revisited geography view from the session cache instead of refetching", async () => {
@@ -374,12 +440,12 @@ describe("InsightsPage", () => {
     };
     mockInvoke({
       get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
-      zip_geography: echoGeo,
+      neighborhood_geography: echoGeo,
     });
     render(<InsightsPage {...props} />);
     await screen.findByRole("region", { name: "Where members are — FY2026" });
     const densityCalls = () => invoke.mock.calls.filter(([c, a]) =>
-      c === "zip_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026).length;
+      c === "neighborhood_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026).length;
     await waitFor(() => expect(densityCalls()).toBe(1));
 
     // Leave the default view, then come back to the exact same selection.
@@ -402,53 +468,51 @@ describe("InsightsPage", () => {
     };
     mockInvoke({
       get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
-      zip_geography: echoGeo,
+      neighborhood_geography: echoGeo,
     });
     render(<StrictMode><InsightsPage {...props} /></StrictMode>);
     await screen.findByRole("region", { name: "Where members are — FY2026" });
     await screen.findByText("Mapped households");
     expect(invoke.mock.calls.filter(([c]) => c === "get_insights").length).toBe(1);
-    expect(invoke.mock.calls.filter(([c]) => c === "zip_geography").length).toBe(1);
+    expect(invoke.mock.calls.filter(([c]) => c === "neighborhood_geography").length).toBe(1);
   });
 
   it("says what it is loading instead of a bare Loading…", async () => {
     mockInvoke({
       get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)] },
-      zip_geography: pending,
+      neighborhood_geography: pending,
       zip_geography_years: pending,
     });
     render(<InsightsPage {...props} />);
     await screen.findByRole("region", { name: "Where members are — FY2026" });
-    expect(screen.getByText("Loading member households by ZIP for FY2026…")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "New members" }));
-    expect(await screen.findByText("Loading new members by ZIP for FY2026…")).toBeTruthy();
+    expect(screen.getByText("Loading member households by area for FY2026…")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Retention by area" }));
     expect(await screen.findByText("Computing retention by ZIP for the FY2019–FY2026 cohorts…")).toBeTruthy();
     expect(screen.queryByText("Loading…")).toBeNull();
   });
 
   it("paints the default geography view from the insights payload without a standalone request", async () => {
-    // zip_geography never settles here: if the panel fetched the default itself, it would
+    // neighborhood_geography never settles here: if the panel fetched the default itself, it would
     // hang at "Loading…" (the real-world symptom of queuing behind the risk analysis).
     mockInvoke({
       get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", true)], geography: geo() },
-      zip_geography: pending,
+      neighborhood_geography: pending,
     });
     render(<InsightsPage {...props} />);
-    // The default view is on screen straight from the payload — no separate zip_geography call.
+    // The default view is on screen straight from the payload — no separate geography call.
     expect(await screen.findByRole("region", { name: "Where members are — FY2026" })).toBeTruthy();
     expect(screen.getAllByText("60").length).toBeGreaterThan(0); // 42 + 18 mapped households
-    expect(invoke.mock.calls.some(([c]) => c === "zip_geography")).toBe(false);
+    expect(invoke.mock.calls.some(([c]) => c === "neighborhood_geography")).toBe(false);
   });
 
   it("shows the geographic-unavailable state and fetches no geography when no postal source is mirrored", async () => {
     mockInvoke({ get_insights: { ...fakeInsights, capabilities: [...fakeInsights.capabilities, cap("geography", false)] } });
     render(<InsightsPage {...props} />);
     expect(await screen.findByText(/Geographic membership insights are unavailable/)).toBeTruthy();
-    expect(invoke.mock.calls.some(([c]) => c === "zip_geography")).toBe(false);
+    expect(invoke.mock.calls.some(([c]) => c === "neighborhood_geography")).toBe(false);
   });
 
-  it.each(["Overview", "Jobs", "Renewal & Engagement", "Risk"])("lays out the aggregate report before exporting from %s", async (tab) => {
+  it.each(["Overview", "Join reasons", "Engagement & Renewal", "Attrition & Risk"])("lays out the aggregate report before exporting from %s", async (tab) => {
     const rect = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width: 800, height: 280 } as DOMRect);
     mockInvoke({ export_insights_pdf: pending });
     render(<InsightsPage {...props} />);

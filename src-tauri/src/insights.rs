@@ -1652,6 +1652,28 @@ pub struct CohortMakeupRow {
     pub current: i64,
     pub pct_of_base: f64,
 }
+/// Today's Membership Households grouped by membership age — fiscal years since the current
+/// Membership Spell began — into five fixed lifecycle bands (see `MEMBERSHIP_AGE_BANDS`).
+/// Every band is emitted in order even when empty, so the chart and table have a stable shape.
+/// `pct_of_base` is the band's share of *dated* current households; households with no usable
+/// join date are excluded and reported separately (never silently dropped).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MembershipAgeRow {
+    pub band: String,
+    pub households: i64,
+    pub pct_of_base: f64,
+}
+/// One membership-age band's household count and share of the member base in one fiscal year.
+/// Emitted for every (year, band) from FIRST_COHORT_FY to the current year, so a stacked view
+/// shows how the base's age mix shifts over time — a growing Legacy share, a thinning New share.
+/// See `membership_age_over_time`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MembershipAgeYearRow {
+    pub fy: i32,
+    pub band: String,
+    pub households: i64,
+    pub pct_of_base: f64,
+}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChannelRow {
     pub key: String,
@@ -1731,15 +1753,34 @@ pub struct FinancialYearClassRow {
     pub label: String,
     pub received: f64,
 }
-/// One join-year cohort's money in the latest complete fiscal year, across today's members
-/// from that cohort: the total they bring and the per-household average (size-adjusted, so
-/// cohorts of different sizes compare). Aggregate — the household count is the smallest unit.
+/// One membership-age band's money in the latest complete fiscal year, across today's members
+/// in that band: the household count, the cash they brought, and the band's share of each. The
+/// gap between `share_of_households` and `share_of_received` is the executive headline (e.g.
+/// "Legacy is 22% of households and 35% of the money"). `received_per_household` is the
+/// size-adjusted average, withheld (`None`) for a band under ten households so no household's
+/// dues can be inferred — the aggregate-only rule enforced *before* data crosses to the webview.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FinancialCohortRow {
-    pub cohort: i32,
+pub struct FinancialAgeRow {
+    pub band: String,
     pub households: i64,
     pub received: f64,
-    pub received_per_household: f64,
+    pub share_of_households: f64,
+    pub share_of_received: f64,
+    pub received_per_household: Option<f64>,
+}
+/// One fiscal year's received cash split by whether the paying household joined *that* year
+/// (`new_received` — growth revenue) or in an earlier year (`recurring_received` — a renewing
+/// member). Computed across every billed household, so the series carries no survivor bias and
+/// lines up year-for-year with `by_year`. Cash from households with no usable join date (or
+/// billed before their recorded join) is in neither total; the shortfall against
+/// `by_year.received` is that undated remainder. Read beside the membership trend, this gauges
+/// whether revenue rides on new members or on renewals, and which way the mix is moving.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FinancialGrowthRow {
+    pub fy: i32,
+    pub complete: bool,
+    pub new_received: f64,
+    pub recurring_received: f64,
 }
 /// One tenth of the member base, ranked by cash received (top decile first). `share` is
 /// this band's own slice of the year's total; `cumulative_*` runs the Pareto curve. The
@@ -1755,10 +1796,10 @@ pub struct ConcentrationRow {
 }
 /// The aggregate financial picture: money in over time (by year and by product class, all
 /// billed households), concentration among today's members for the latest complete year,
-/// and per-cohort value for that year. Every figure is a total, a decile band, or a cohort
-/// — deliberately never a household — so the tab cannot expose one member's finances. The
-/// `fiscal_year`/`total_*`/`households` fields describe the latest complete year's member
-/// snapshot that the concentration and cohort views share.
+/// and value by membership-age band for that year. Every figure is a total, a decile band,
+/// or a membership-age band — deliberately never a household — so the tab cannot expose one
+/// member's finances. The `fiscal_year`/`total_*`/`households` fields describe the latest
+/// complete year's member snapshot that the concentration and band views share.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Financials {
     pub fiscal_year: i32,
@@ -1768,7 +1809,8 @@ pub struct Financials {
     pub total_received: f64,
     pub by_year: Vec<FinancialYearRow>,
     pub by_year_class: Vec<FinancialYearClassRow>,
-    pub by_cohort: Vec<FinancialCohortRow>,
+    pub by_membership_age: Vec<FinancialAgeRow>,
+    pub by_growth: Vec<FinancialGrowthRow>,
     pub concentration: Vec<ConcentrationRow>,
 }
 /// Retention of households that recently held one kind of Relationship Anchor.
@@ -1821,6 +1863,8 @@ pub struct Insights {
     pub year1: Vec<CohortYear1>,
     pub cohort_matrix: Vec<CohortCell>,
     pub cohort_makeup: Vec<CohortMakeupRow>,
+    pub membership_age: Vec<MembershipAgeRow>,
+    pub membership_age_over_time: Vec<MembershipAgeYearRow>,
     pub channels: Vec<ChannelRow>,
     pub school: Vec<SchoolRow>,
     pub reasons: Vec<ReasonCell>,
@@ -1903,6 +1947,32 @@ fn zip_nta() -> &'static std::collections::HashMap<String, u16> {
         serde_json::from_str(include_str!("zip_nta_crosswalk.json"))
             .expect("zip_nta_crosswalk.json is valid {zip: nta_index}")
     })
+}
+
+/// Neighborhood display names, indexed by the same NTA index the crosswalk emits. Sourced from
+/// the packaged webview asset (`src/assets/nta-meta.json`, the index→name table the map already
+/// resolves), so the backend and UI never drift. A neighborhood name is a public place label —
+/// no member data — and emitting one in a ranked list is privacy-equivalent to the ZIP the ZIP
+/// views already emit; the neighborhood MAP still ships index-only (it also carries geometry).
+static NTA_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+fn nta_names() -> &'static Vec<String> {
+    NTA_NAMES.get_or_init(|| {
+        let meta: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../src/assets/nta-meta.json"))
+                .expect("nta-meta.json is a valid array of neighborhood metadata");
+        meta.into_iter()
+            .map(|m| m.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string())
+            .collect()
+    })
+}
+/// The display name for a neighborhood index, falling back to `Area {idx}` if the packaged
+/// metadata has no name at that index (should not happen for a crosswalk-produced index).
+fn nta_name(idx: u16) -> String {
+    nta_names()
+        .get(idx as usize)
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("Area {idx}"))
 }
 
 /// The household's ZIP as of a fiscal year: the ZIP of its latest statement in or before
@@ -2272,6 +2342,116 @@ fn zip_geography_inner(
         };
         cells.push(ZipGeoCell {
             zip,
+            measure,
+            n: acc.pop,
+            joins: acc.joins,
+            exits: acc.exits,
+            retained: acc.retained,
+        });
+    }
+
+    ZipGeography {
+        fiscal_year: fy,
+        mode,
+        segment,
+        available: true,
+        cells,
+        out_of_area,
+        suppressed_zips,
+        options,
+    }
+}
+
+/// Aggregate the mart into per-neighborhood cells for one mode, fiscal year, and segment — the
+/// neighborhood counterpart of `zip_geography` for the density, growth, and attrition views.
+/// Same population and measure logic as `zip_geography`, but each household's as-of ZIP is rolled
+/// up to its NYC neighborhood via the crosswalk (households with no NYC neighborhood counted
+/// out-of-area, never misplaced), and the neighborhood name is written into the cell's `zip` slot
+/// so the ranked-list UI reuses the ZIP view components unchanged. Reuses the `ZipGeography`
+/// shape; `suppressed_zips` counts suppressed neighborhoods.
+pub fn neighborhood_geography(
+    households: &[Hh],
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+) -> ZipGeography {
+    let top_tiers = top_values(households, |h| h.tier.as_deref(), 6);
+    let top_cats = top_values(households, |h| h.category.as_deref(), 6);
+    let options = build_segment_options(households, &top_tiers, &top_cats);
+    neighborhood_geography_inner(households, fy, mode, segment, &top_tiers, &top_cats, options)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn neighborhood_geography_inner(
+    households: &[Hh],
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+    top_tiers: &[String],
+    top_cats: &[String],
+    options: SegmentOptions,
+) -> ZipGeography {
+    let asof = mode.as_of(fy);
+    let mut by_nta: std::collections::BTreeMap<u16, GeoAcc> = Default::default();
+    let mut out_of_area: i64 = 0;
+
+    for h in households {
+        if let Some(seg) = &segment {
+            if !in_segment(h, seg, top_tiers, top_cats) {
+                continue;
+            }
+        }
+        let active_end = member_in(h, fy);
+        let started = member_in(h, fy - 1);
+        let is_join = h.join_fy == Some(fy);
+        let is_exit = h.resign_fy == Some(fy);
+        let is_cohort = h.cohort_fy == Some(fy);
+        let in_pop = match mode {
+            GeoMode::Density => active_end,
+            GeoMode::Provenance => is_join,
+            GeoMode::NetChange => started || is_join || is_exit,
+            GeoMode::Attrition => started,
+            GeoMode::Retention => is_cohort,
+        };
+        if !in_pop {
+            continue;
+        }
+        let Some(zip) = zip_as_of(h, asof) else {
+            continue;
+        };
+        match zip_nta().get(zip) {
+            Some(&nta) => {
+                let acc = by_nta.entry(nta).or_default();
+                acc.pop += 1;
+                if is_join {
+                    acc.joins += 1;
+                }
+                if is_exit {
+                    acc.exits += 1;
+                }
+                if h.is_current {
+                    acc.retained += 1;
+                }
+            }
+            None => out_of_area += 1,
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut suppressed_zips = 0i64;
+    for (nta, acc) in by_nta {
+        if acc.pop < mode.min_n() {
+            suppressed_zips += 1;
+            continue;
+        }
+        let measure = match mode {
+            GeoMode::Density | GeoMode::Provenance => acc.pop as f64,
+            GeoMode::NetChange => (acc.joins - acc.exits) as f64,
+            GeoMode::Attrition => pct(acc.exits, acc.pop),
+            GeoMode::Retention => pct(acc.retained, acc.pop),
+        };
+        cells.push(ZipGeoCell {
+            zip: nta_name(nta),
             measure,
             n: acc.pop,
             joins: acc.joins,
@@ -2664,6 +2844,33 @@ pub fn neighborhood_retention_views(
         .collect())
 }
 
+/// Store-backed single neighborhood geography view (density, growth, or attrition, rolled up to
+/// NYC neighborhoods). Gates on the `geography` capability like the ZIP views. Computed on demand
+/// — the household load is the cost, and the webview caches each view for the session — so no
+/// persisted cache is kept, mirroring `neighborhood_retention_views`.
+pub fn neighborhood_geography_view(
+    store: &Store,
+    fy: i32,
+    mode: GeoMode,
+    segment: Option<Segment>,
+) -> Result<ZipGeography> {
+    let caps = source_capabilities(store)?;
+    if !cap_available(&caps, "geography") {
+        return Ok(ZipGeography {
+            fiscal_year: fy,
+            mode,
+            segment,
+            available: false,
+            cells: Vec::new(),
+            out_of_area: 0,
+            suppressed_zips: 0,
+            options: SegmentOptions::default(),
+        });
+    }
+    let households = load_geo_households(store)?;
+    Ok(neighborhood_geography(&households, fy, mode, segment))
+}
+
 pub fn trend(hh: &[Hh], cur: i32) -> Vec<TrendRow> {
     (FIRST_TREND_FY..=cur)
         .map(|fy| TrendRow {
@@ -2856,6 +3063,84 @@ pub fn cohort_makeup(hh: &[Hh]) -> Vec<CohortMakeupRow> {
             pct_of_base: pct(current, base),
         })
         .collect()
+}
+
+/// The five fixed membership-age lifecycle bands, in display order. `max` is the inclusive
+/// upper edge in years; the last band (Legacy) has no upper bound. The bands are contiguous
+/// starting at age 0, so `band_index` picks the first band whose upper edge covers the age.
+/// This is the one place to change if the product owner wants different edges (decision 1).
+struct MembershipAgeBand {
+    label: &'static str,
+    max: Option<i32>,
+}
+const MEMBERSHIP_AGE_BANDS: [MembershipAgeBand; 5] = [
+    MembershipAgeBand { label: "New", max: Some(1) },           // 0–1
+    MembershipAgeBand { label: "Establishing", max: Some(4) },  // 2–4
+    MembershipAgeBand { label: "Settled", max: Some(9) },       // 5–9
+    MembershipAgeBand { label: "Long-standing", max: Some(24) },// 10–24
+    MembershipAgeBand { label: "Legacy", max: None },           // 25+
+];
+
+/// The band index for a membership age in years. Ages are clamped at 0 (a join in the
+/// in-progress year is age 0, i.e. New); the first band whose inclusive upper edge covers
+/// the age wins, and Legacy (no upper edge) catches everything above.
+fn band_index(age: i32) -> usize {
+    let a = age.max(0);
+    MEMBERSHIP_AGE_BANDS
+        .iter()
+        .position(|b| b.max.map_or(true, |m| a <= m))
+        .unwrap_or(MEMBERSHIP_AGE_BANDS.len() - 1)
+}
+
+/// Composition of today's Membership Households by membership age (`cur - join_fy`), in the
+/// five fixed bands. Every band is emitted in order even when empty. Undated current
+/// households are excluded (their remainder is `members_now` minus the band totals) and
+/// non-current households never count.
+pub fn membership_age(hh: &[Hh], cur: i32) -> Vec<MembershipAgeRow> {
+    let mut counts = [0i64; MEMBERSHIP_AGE_BANDS.len()];
+    for h in hh.iter().filter(|h| h.is_current) {
+        if let Some(join) = h.join_fy {
+            counts[band_index(cur - join)] += 1;
+        }
+    }
+    let dated: i64 = counts.iter().sum();
+    MEMBERSHIP_AGE_BANDS
+        .iter()
+        .enumerate()
+        .map(|(i, b)| MembershipAgeRow {
+            band: b.label.to_string(),
+            households: counts[i],
+            pct_of_base: pct(counts[i], dated),
+        })
+        .collect()
+}
+
+/// The age composition of the member base in every fiscal year from FIRST_COHORT_FY through
+/// `cur`, so the aging (or renewal) of the base reads over time. For each year, households active
+/// at that year end are aged (`fy - join_fy`) into the five fixed bands; undated households are
+/// excluded, so each year's `pct_of_base` sums to ~100% over its dated members. Every (year, band)
+/// is emitted, in order, even when empty. FIRST_COHORT_FY is the floor before which departures
+/// aren't reliably recorded — the same floor the retention views use.
+pub fn membership_age_over_time(hh: &[Hh], cur: i32) -> Vec<MembershipAgeYearRow> {
+    let mut out = Vec::with_capacity(((cur - FIRST_COHORT_FY + 1).max(0) as usize) * MEMBERSHIP_AGE_BANDS.len());
+    for fy in FIRST_COHORT_FY..=cur {
+        let mut counts = [0i64; MEMBERSHIP_AGE_BANDS.len()];
+        for h in hh.iter().filter(|h| member_in(h, fy)) {
+            if let Some(join) = h.join_fy {
+                counts[band_index(fy - join)] += 1;
+            }
+        }
+        let dated: i64 = counts.iter().sum();
+        for (i, b) in MEMBERSHIP_AGE_BANDS.iter().enumerate() {
+            out.push(MembershipAgeYearRow {
+                fy,
+                band: b.label.to_string(),
+                households: counts[i],
+                pct_of_base: pct(counts[i], dated),
+            });
+        }
+    }
+    out
 }
 
 /// Joiners old enough to judge: at least four full membership years, at most twelve.
@@ -3189,10 +3474,10 @@ fn class_label(class: DuesClass) -> (&'static str, &'static str) {
 
 /// The aggregate financial picture: institutional money in over time (by year, and by
 /// product class per year, across every billed household), plus — for the latest complete
-/// year, across today's members — Pareto concentration by decile and per-cohort value.
-/// Every output is a total, a decile band, or a cohort — never a household. Returns None
-/// when the billing source or its money columns are absent, or no complete year carries
-/// member money yet.
+/// year, across today's members — Pareto concentration by decile and value by membership-age
+/// band. Every output is a total, a decile band, or a membership-age band — never a household.
+/// Returns None when the billing source or its money columns are absent, or no complete year
+/// carries member money yet.
 fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> {
     let statement_cols = store.mirror_columns("BillingStatement__c")?;
     let line_cols = store.mirror_columns("BillingStatementLine__c")?;
@@ -3264,6 +3549,13 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
     // member filter, so the trend has no survivor bias.
     let mut year_totals: std::collections::BTreeMap<i32, (f64, f64)> = std::collections::BTreeMap::new();
     let mut year_class: std::collections::HashMap<(i32, &'static str), f64> = std::collections::HashMap::new();
+    // Each billed household's join year (over ALL households, current or not, so the split is
+    // as survivor-bias-free as the totals above). Used to attribute each year's received cash
+    // to new members (joined that year) vs recurring members (joined earlier).
+    let join_by_hh: std::collections::HashMap<&str, Option<i32>> =
+        hh.iter().map(|h| (h.account_id.as_str(), h.join_fy)).collect();
+    // Per year: (new_received, recurring_received). Undated households land in neither.
+    let mut year_growth: std::collections::BTreeMap<i32, (f64, f64)> = std::collections::BTreeMap::new();
 
     for row in &line_rows {
         let Some(parent) = field(row, &l_parent) else {
@@ -3279,6 +3571,12 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         yt.0 += billed;
         yt.1 += received;
         *year_class.entry((fy, key)).or_default() += received;
+        // Growth vs recurring: the paying household joined this year (new) or before it (recurring).
+        match join_by_hh.get(household_id).copied().flatten() {
+            Some(join) if join == fy => year_growth.entry(fy).or_default().0 += received,
+            Some(join) if join < fy => year_growth.entry(fy).or_default().1 += received,
+            _ => {}
+        }
         // Member snapshot for the latest complete year, for concentration and cohort value.
         if fy == fiscal_year {
             if let Some(&i) = index.get(household_id) {
@@ -3301,6 +3599,16 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         .iter()
         .map(|(&fy, &(billed, received))| FinancialYearRow { fy, complete: fy < cur, billed, received })
         .collect();
+    // The same years, each year's received cash split into new (growth) vs recurring. Iterated
+    // over `year_totals` (not `year_growth`) so a year whose cash is entirely undated still
+    // appears as a (0, 0) row aligned with `by_year`.
+    let by_growth: Vec<FinancialGrowthRow> = year_totals
+        .keys()
+        .map(|&fy| {
+            let (new_received, recurring_received) = year_growth.get(&fy).copied().unwrap_or((0.0, 0.0));
+            FinancialGrowthRow { fy, complete: fy < cur, new_received, recurring_received }
+        })
+        .collect();
     let mut by_year_class: Vec<FinancialYearClassRow> = Vec::new();
     for &fy in year_totals.keys() {
         for class in CLASS_ORDER {
@@ -3312,23 +3620,37 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         }
     }
 
-    // Per-cohort value in `fiscal_year`: total and size-adjusted per-household. The whole
-    // cohort (not only its payers) is the denominator, so the average is comparable.
-    let mut cohort_agg: std::collections::BTreeMap<i32, (i64, f64)> = std::collections::BTreeMap::new();
-    for (i, (_, cohort)) in current.iter().enumerate() {
-        if let Some(c) = cohort {
-            let entry = cohort_agg.entry(*c).or_default();
-            entry.0 += 1;
-            entry.1 += per_hh[i].1;
+    // Value by membership-age band in `fiscal_year`: household count, cash received, and each
+    // band's share of the (dated) member base and of its cash. Computed before the decile sort
+    // below, while `per_hh[i]` is still aligned with `current[i]`. The whole band (not only its
+    // payers) is the per-household denominator, so the average is comparable across bands; it is
+    // withheld under ten households so no member's dues can be inferred from the payload.
+    let mut band_hh = [0i64; MEMBERSHIP_AGE_BANDS.len()];
+    let mut band_received = [0f64; MEMBERSHIP_AGE_BANDS.len()];
+    for (i, (_, join)) in current.iter().enumerate() {
+        if let Some(j) = join {
+            let bi = band_index(cur - j);
+            band_hh[bi] += 1;
+            band_received[bi] += per_hh[i].1;
         }
     }
-    let by_cohort: Vec<FinancialCohortRow> = cohort_agg
-        .into_iter()
-        .map(|(cohort, (households, received))| FinancialCohortRow {
-            cohort,
-            households,
-            received,
-            received_per_household: if households > 0 { (received / households as f64 * 100.0).round() / 100.0 } else { 0.0 },
+    let dated_hh: i64 = band_hh.iter().sum();
+    let dated_received: f64 = band_received.iter().sum();
+    let by_membership_age: Vec<FinancialAgeRow> = MEMBERSHIP_AGE_BANDS
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let households = band_hh[i];
+            let received = band_received[i];
+            FinancialAgeRow {
+                band: b.label.to_string(),
+                households,
+                received,
+                share_of_households: pct(households, dated_hh),
+                share_of_received: share(received, dated_received),
+                received_per_household: (households >= 10)
+                    .then(|| (received / households as f64 * 100.0).round() / 100.0),
+            }
         })
         .collect();
 
@@ -3370,7 +3692,8 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         total_received,
         by_year,
         by_year_class,
-        by_cohort,
+        by_membership_age,
+        by_growth,
         concentration,
     }))
 }
@@ -3873,7 +4196,7 @@ const INSIGHTS_CACHE_KEY: &str = "insights_cache";
 /// everything the read model reads, only the cached read model is stale. Serde treats a
 /// missing `Option` field as `None`, so without this an added optional field (e.g.
 /// `financials`) would deserialize from an older cache as absent and never recompute.
-const READ_MODEL_REVISION: u32 = 3;
+const READ_MODEL_REVISION: u32 = 6;
 
 /// Cache-validity fingerprint: the mart schema plus the read-model revision. A change to
 /// either invalidates the persisted insights cache.
@@ -3970,6 +4293,8 @@ fn compute_views(
         trend: trend_from_household_years(&household_years, cur),
         cohort_matrix: cohort_matrix_indexed(&household_years, &index, cur),
         cohort_makeup: cohort_makeup(&hh),
+        membership_age: membership_age(&hh, cur),
+        membership_age_over_time: membership_age_over_time(&hh, cur),
         channels: channels_indexed(&household_years, &index, cur),
         year1,
         school: school(&hh, cur),
@@ -3982,9 +4307,10 @@ fn compute_views(
         anchor_type: anchor_type(&household_years, cur, &capabilities),
         anchor_count: anchor_count_view,
         financials: financials_view,
-        // Default panel view, off the risk-blocked lock path. Never fails insights: a geography
-        // error degrades to None and the panel falls back to fetching on its own.
-        geography: zip_geography_view(store, cur - 1, GeoMode::Density, None).ok(),
+        // Default panel view (Where members are, rolled up to neighborhoods), off the risk-blocked
+        // lock path. Never fails insights: a geography error degrades to None and the panel falls
+        // back to fetching on its own.
+        geography: neighborhood_geography_view(store, cur - 1, GeoMode::Density, None).ok(),
         capabilities,
     })
 }
@@ -4141,6 +4467,28 @@ mod tests {
     }
 
     #[test]
+    fn views_rebuild_when_cached_read_model_predates_membership_age() {
+        let (_d, mut s) = mem();
+        seed_account(&mut s, &fixture(), &ACCT_COLS);
+        rebuild(&mut s).unwrap();
+        // `membership_age` always returns five bands, so emptiness can't flag a stale cache;
+        // a populated read model puts households in at least one band.
+        let populated = |ins: &Insights| ins.membership_age.iter().map(|r| r.households).sum::<i64>() > 0;
+        assert!(populated(&views(&s, 2027).unwrap()));
+
+        // Simulate a cache from before this change: the bare mart fingerprint (no read-model
+        // revision) and the new band rows emptied. Keyed on the mart schema alone `views` would
+        // serve this blob; the revision bump must reject it and recompute the bands.
+        let blob = s.get_meta(INSIGHTS_CACHE_KEY).unwrap().unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        v["schema"] = serde_json::Value::String(mart_schema_fingerprint());
+        v["insights"]["membership_age"] = serde_json::json!([]);
+        s.set_meta(INSIGHTS_CACHE_KEY, &serde_json::to_string(&v).unwrap()).unwrap();
+
+        assert!(populated(&views(&s, 2027).unwrap()));
+    }
+
+    #[test]
     fn cached_insights_still_report_a_newer_sync_as_stale() {
         let (_d, mut s) = mem();
         seed_account(&mut s, &fixture(), &ACCT_COLS);
@@ -4221,6 +4569,30 @@ mod tests {
         assert_eq!(cell.n, 12);
         assert_eq!(cell.retained, 8);
         assert!((cell.measure - pct(8, 12)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn neighborhood_geography_rolls_density_up_to_neighborhoods_names_them_and_counts_out_of_area() {
+        // 10024 → NTA 124, 10002 → NTA 77 (per the crosswalk); 07030 (NJ) has no NYC neighborhood,
+        // so it is counted out-of-area rather than misplaced. The density floor is 5 households.
+        let mut hh: Vec<Hh> = (0..12)
+            .map(|i| geo_hh(&format!("a{i}"), "10024", Some(2024), None))
+            .collect();
+        hh.extend((0..3).map(|i| geo_hh(&format!("b{i}"), "10002", Some(2024), None))); // under the 5-hh floor
+        hh.extend((0..2).map(|i| geo_hh(&format!("o{i}"), "07030", Some(2024), None))); // out of area
+
+        let geo = neighborhood_geography(&hh, 2025, GeoMode::Density, None);
+
+        assert_eq!(geo.out_of_area, 2, "NJ households have no NYC neighborhood");
+        assert_eq!(geo.suppressed_zips, 1, "the 3-household neighborhood is suppressed");
+        assert_eq!(geo.cells.len(), 1, "only the 12-household neighborhood survives");
+        let cell = &geo.cells[0];
+        assert_eq!(cell.n, 12);
+        assert_eq!(cell.measure, 12.0);
+        // The cell is labeled with the neighborhood NAME (resolved from nta-meta), never a raw ZIP.
+        assert_eq!(cell.zip, nta_name(124));
+        assert_ne!(cell.zip, "10024");
+        assert!(!cell.zip.is_empty() && !cell.zip.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
@@ -5613,6 +5985,100 @@ mod tests {
     }
 
     #[test]
+    fn membership_age_bands_assign_by_years_since_join_with_inclusive_edges() {
+        let cur = 2026;
+        // Two households at each stated edge of the five bands: ages 0,1 (New), 2,4
+        // (Establishing), 5,9 (Settled), 10,24 (Long-standing), 25 (Legacy — plus a second at
+        // 25). Ten households total, so each band is exactly 20% and the shares sum to 100.
+        let ages = [0, 1, 2, 4, 5, 9, 10, 24, 25, 25];
+        let hh: Vec<Hh> = ages
+            .iter()
+            .enumerate()
+            .map(|(i, age)| Hh {
+                account_id: format!("a{i}"),
+                is_current: true,
+                join_fy: Some(cur - age),
+                ..Default::default()
+            })
+            .collect();
+        let rows = membership_age(&hh, cur);
+
+        // All five bands, always in this fixed order.
+        assert_eq!(
+            rows.iter().map(|r| r.band.as_str()).collect::<Vec<_>>(),
+            vec!["New", "Establishing", "Settled", "Long-standing", "Legacy"]
+        );
+        let band = |name: &str| rows.iter().find(|r| r.band == name).unwrap();
+        assert_eq!(band("New").households, 2); // ages 0, 1
+        assert_eq!(band("Establishing").households, 2); // ages 2, 4
+        assert_eq!(band("Settled").households, 2); // ages 5, 9
+        assert_eq!(band("Long-standing").households, 2); // ages 10, 24
+        assert_eq!(band("Legacy").households, 2); // ages 25, 25
+        // Shares are over dated households and sum to 100.
+        assert!(rows.iter().all(|r| r.pct_of_base == 20.0));
+        let total: f64 = rows.iter().map(|r| r.pct_of_base).sum();
+        assert_eq!(total, 100.0);
+
+        // Every band is still emitted, in order, even when there are no households at all.
+        let empty = membership_age(&[], cur);
+        assert_eq!(
+            empty.iter().map(|r| r.band.as_str()).collect::<Vec<_>>(),
+            vec!["New", "Establishing", "Settled", "Long-standing", "Legacy"]
+        );
+        assert!(empty.iter().all(|r| r.households == 0 && r.pct_of_base == 0.0));
+    }
+
+    #[test]
+    fn membership_age_excludes_undated_joins_and_counts_only_current_households() {
+        let cur = 2026;
+        let hh = vec![
+            // A dated current household → Establishing (age 2).
+            Hh { account_id: "cur_dated".into(), is_current: true, join_fy: Some(2024), ..Default::default() },
+            // A current household with no usable join date → excluded from every band.
+            Hh { account_id: "cur_undated".into(), is_current: true, join_fy: None, ..Default::default() },
+            // A non-current household → never counted, dated or not.
+            Hh { account_id: "past".into(), is_current: false, join_fy: Some(2024), ..Default::default() },
+        ];
+        let rows = membership_age(&hh, cur);
+        // Only the one dated current household lands in a band; the total is one, not three.
+        assert_eq!(rows.iter().map(|r| r.households).sum::<i64>(), 1);
+        let est = rows.iter().find(|r| r.band == "Establishing").unwrap();
+        assert_eq!(est.households, 1);
+        // Shares are over dated current households only → that one household is 100%.
+        assert_eq!(est.pct_of_base, 100.0);
+    }
+
+    #[test]
+    fn membership_age_over_time_bands_each_year_by_age_then() {
+        // One long-tenured household (joined 2015) and one newer one (joined 2022), both current.
+        let hh = vec![
+            Hh { account_id: "a".into(), is_current: true, join_fy: Some(2015), ..Default::default() },
+            Hh { account_id: "b".into(), is_current: true, join_fy: Some(2022), ..Default::default() },
+        ];
+        let rows = membership_age_over_time(&hh, 2024);
+        let at = |fy: i32, band: &str| rows.iter().find(|r| r.fy == fy && r.band == band).unwrap().households;
+
+        // 2016: only A is a member yet (age 1 → New); B hasn't joined.
+        assert_eq!(at(2016, "New"), 1);
+        assert_eq!(at(2016, "Establishing"), 0);
+        // 2023: A is age 8 (Settled), B is age 1 (New).
+        assert_eq!(at(2023, "Settled"), 1);
+        assert_eq!(at(2023, "New"), 1);
+        // 2024 (the current year): A is age 9 (Settled), B is age 2 (Establishing).
+        assert_eq!(at(2024, "Settled"), 1);
+        assert_eq!(at(2024, "Establishing"), 1);
+
+        // Every year from the FIRST_COHORT_FY floor through 2024 is emitted, five bands each.
+        let years: std::collections::BTreeSet<i32> = rows.iter().map(|r| r.fy).collect();
+        assert_eq!(*years.iter().next().unwrap(), FIRST_COHORT_FY);
+        assert_eq!(*years.iter().last().unwrap(), 2024);
+        assert_eq!(rows.len(), years.len() * MEMBERSHIP_AGE_BANDS.len());
+        // A year with members has shares summing to ~100.
+        let y2024: f64 = rows.iter().filter(|r| r.fy == 2024).map(|r| r.pct_of_base).sum();
+        assert!((y2024 - 100.0).abs() < 0.5);
+    }
+
+    #[test]
     fn financials_trend_cohorts_and_concentration() {
         let (_d, mut s) = mem();
         let stmt = |id: &str, acc: &str, date: &str| {
@@ -5667,22 +6133,28 @@ mod tests {
             ],
             &lines,
         );
-        // Ten current members split across two join cohorts, plus one non-member.
+        // The ten billed members all joined FY2020 (membership age 7 at cur 2027 → Settled), so
+        // that band clears the ten-household floor and reports a per-household average. Four more
+        // current members joined FY2024 (age 3 → Establishing) with no billing — a real band
+        // under ten households, which must withhold its average. Plus one non-member.
         let mut hh: Vec<Hh> = (0..10)
             .map(|i| Hh {
                 account_id: format!("acc{i}"),
                 is_current: true,
-                join_fy: Some(if i < 5 { 2020 } else { 2024 }),
+                join_fy: Some(2020),
                 ..Default::default()
             })
             .collect();
+        for i in 10..14 {
+            hh.push(Hh { account_id: format!("acc{i}"), is_current: true, join_fy: Some(2024), ..Default::default() });
+        }
         hh.push(Hh { account_id: "accX".into(), is_current: false, join_fy: Some(2018), ..Default::default() });
 
         let fin = financials(&s, &hh, 2027).unwrap().expect("financials present");
 
-        // Latest-complete member snapshot.
+        // Latest-complete member snapshot: fourteen current members (ten billed + four unbilled).
         assert_eq!(fin.fiscal_year, 2026);
-        assert_eq!(fin.households, 10);
+        assert_eq!(fin.households, 14);
         assert_eq!(fin.paying_households, 10);
         assert_eq!(fin.total_billed, 4000.0);
         assert_eq!(fin.total_received, 3500.0);
@@ -5700,13 +6172,26 @@ mod tests {
         assert_eq!(cell(2025, "gift"), 4000.0);
         assert_eq!(cell(2025, "membership"), 900.0);
 
-        // Per-cohort value in FY2026: the newer 2024 cohort is worth less per household here.
-        let cohort = |c: i32| fin.by_cohort.iter().find(|r| r.cohort == c).unwrap();
-        assert_eq!(cohort(2020).households, 5);
-        assert_eq!(cohort(2020).received, 2250.0);
-        assert_eq!(cohort(2020).received_per_household, 450.0);
-        assert_eq!(cohort(2024).households, 5);
-        assert_eq!(cohort(2024).received_per_household, 250.0);
+        // Value by membership-age band in FY2026 replaces the per-join-year cohort rows. All
+        // five bands are emitted in order; Settled (the ten FY2020 members) clears the floor
+        // and reports its average, while Establishing (four FY2024 members) is under ten and
+        // withholds it. Shares are over the fourteen dated members / the $3,500 they received.
+        assert_eq!(
+            fin.by_membership_age.iter().map(|r| r.band.as_str()).collect::<Vec<_>>(),
+            vec!["New", "Establishing", "Settled", "Long-standing", "Legacy"]
+        );
+        let band = |name: &str| fin.by_membership_age.iter().find(|r| r.band == name).unwrap();
+        assert_eq!(band("Settled").households, 10);
+        assert_eq!(band("Settled").received, 3500.0);
+        assert_eq!(band("Settled").received_per_household, Some(350.0));
+        assert_eq!(band("Settled").share_of_households, 71.4);
+        assert_eq!(band("Settled").share_of_received, 100.0);
+        assert_eq!(band("Establishing").households, 4);
+        assert_eq!(band("Establishing").received, 0.0);
+        assert_eq!(band("Establishing").received_per_household, None); // fewer than ten households
+        assert_eq!(band("Establishing").share_of_households, 28.6);
+        assert_eq!(band("New").households, 0);
+        assert_eq!(band("New").received_per_household, None);
 
         // Concentration: top decile is the single biggest payer (acc0: 1000 of 3500).
         assert_eq!(fin.concentration[0].households, 1);
@@ -5715,6 +6200,80 @@ mod tests {
 
         // No complete fiscal year before the in-progress one -> nothing to report.
         assert!(financials(&s, &hh, 2025).unwrap().is_none());
+    }
+
+    #[test]
+    fn financials_growth_splits_received_into_new_and_recurring() {
+        let (_d, mut s) = mem();
+        let stmt = |id: &str, acc: &str, date: &str| row(&[("Id", id), ("Account__c", acc), ("Date__c", date)]);
+        let line = |id: &str, parent: &str, received: i64| {
+            row(&[
+                ("Id", id),
+                ("BillingStatement__c", parent),
+                ("Billing_PrimaryProductFamily__c", "Dues"),
+                ("Billing_PrimaryProductName__c", "Membership Dues"),
+                ("Charges__c", &received.to_string()),
+                ("Billing_ReceivedAmount__c", &received.to_string()),
+                ("Billing_Balance__c", "0"),
+            ])
+        };
+        // FY2025 (dated Sep 2024): only the long-tenured member pays -> all recurring.
+        // FY2026 (dated Sep 2025): that member renews (recurring), a household that joined FY2026
+        // pays its first dues (new/growth), and a household with no join date pays too (undated —
+        // in neither bucket, so new + recurring falls short of the year's received total).
+        let statements = vec![
+            stmt("s25_r", "accR", "2024-09-01"),
+            stmt("s26_r", "accR", "2025-09-01"),
+            stmt("s26_n", "accN", "2025-09-01"),
+            stmt("s26_u", "accU", "2025-09-01"),
+        ];
+        let lines = vec![
+            line("l25_r", "s25_r", 1000),
+            line("l26_r", "s26_r", 1000),
+            line("l26_n", "s26_n", 400),
+            line("l26_u", "s26_u", 100),
+        ];
+        seed_object(&mut s, "BillingStatement__c", &["Id", "Account__c", "Date__c"], &statements);
+        seed_object(
+            &mut s,
+            "BillingStatementLine__c",
+            &[
+                "Id",
+                "BillingStatement__c",
+                "Billing_PrimaryProductFamily__c",
+                "Billing_PrimaryProductName__c",
+                "Charges__c",
+                "Billing_ReceivedAmount__c",
+                "Billing_Balance__c",
+            ],
+            &lines,
+        );
+        let hh = vec![
+            Hh { account_id: "accR".into(), is_current: true, join_fy: Some(2015), ..Default::default() },
+            Hh { account_id: "accN".into(), is_current: true, join_fy: Some(2026), ..Default::default() },
+            Hh { account_id: "accU".into(), is_current: true, join_fy: None, ..Default::default() },
+        ];
+
+        let fin = financials(&s, &hh, 2027).unwrap().expect("financials present");
+        let g = |fy: i32| fin.by_growth.iter().find(|r| r.fy == fy).unwrap();
+
+        // FY2025: only the FY2015 member paid -> entirely recurring.
+        assert_eq!(g(2025).new_received, 0.0);
+        assert_eq!(g(2025).recurring_received, 1000.0);
+        assert!(g(2025).complete);
+
+        // FY2026: the FY2026-join household is growth; the FY2015 member is recurring; the undated
+        // household is in neither, so new + recurring is $100 short of the year's received total.
+        assert_eq!(g(2026).new_received, 400.0);
+        assert_eq!(g(2026).recurring_received, 1000.0);
+        let year26 = fin.by_year.iter().find(|r| r.fy == 2026).unwrap().received;
+        assert_eq!(year26 - g(2026).new_received - g(2026).recurring_received, 100.0);
+
+        // by_growth spans exactly the billed years, in order, aligned one-for-one with by_year.
+        assert_eq!(
+            fin.by_growth.iter().map(|r| r.fy).collect::<Vec<_>>(),
+            fin.by_year.iter().map(|r| r.fy).collect::<Vec<_>>()
+        );
     }
 
     #[test]

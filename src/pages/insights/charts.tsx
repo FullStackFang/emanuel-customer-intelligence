@@ -1,12 +1,12 @@
 import type React from "react";
 import { Fragment } from "react";
 import {
-  Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import type { RenderableText } from "recharts";
-import type { CohortCell, CohortMakeupRow, CohortYear1, ConcentrationRow, DuesRow, FinancialCohortRow, FinancialYearClassRow, FinancialYearRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
+import type { CohortCell, CohortYear1, ConcentrationRow, DuesRow, FinancialAgeRow, FinancialGrowthRow, FinancialYearClassRow, FinancialYearRow, MembershipAgeRow, MembershipAgeYearRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
 import { Table } from "../../design-system";
-import { fmt, fmtMoney, fmtMoneyShort, fyLabel, heatInk, heatStep } from "./format";
+import { bandLabel, fmt, fmtMoney, fmtMoneyShort, fyLabel, heatInk, heatStep } from "./format";
 
 /* Palette — validated with dataviz/scripts/validate_palette.js (light, white surface).
    Hex values are the design-system tokens named beside them. Do not reorder. */
@@ -96,24 +96,79 @@ export function Year1Chart({ rows, emphasize }: { rows: CohortYear1[]; emphasize
   );
 }
 
-/** How many of today's members each join-year cohort still contributes — the count
-    complement of the retention grid. Two newest cohorts emphasized, matching Year1Chart. */
-export function CohortMakeupChart({ rows, emphasize }: { rows: CohortMakeupRow[]; emphasize: number[] }) {
-  const data = rows.map((r) => ({
-    fy: fyLabel(r.cohort),
-    main: emphasize.includes(r.cohort) ? r.current : null,
-    rest: emphasize.includes(r.cohort) ? null : r.current,
-    pct: r.pct_of_base,
-  }));
+/** Composition of today's members across the five membership-age bands: one bar per band
+    (households), with the band's share of the base in the tooltip. Fixed left-to-right band
+    order (New → Legacy) reads as a lifecycle distribution. */
+export function MembershipAgeChart({ rows }: { rows: MembershipAgeRow[] }) {
+  const data = rows.map((r) => ({ band: r.band, households: r.households, pct: r.pct_of_base }));
   return (
     <ResponsiveContainer width="100%" height={240}>
-      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="35%">
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="30%">
         <CartesianGrid vertical={false} stroke={PALETTE.grid} />
-        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <XAxis dataKey="band" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={0} />
         <YAxis tick={axisTick} tickLine={false} axisLine={false} tickFormatter={(v: number) => fmt(v)} width={44} />
-        <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: { pct?: number } }) => [`${fmt(Number(v))} households · ${item.payload?.pct ?? 0}% of base`, "Still members"]} />
-        <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
-        <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={24} isAnimationActive={false} />
+        <Tooltip contentStyle={tooltipStyle} labelFormatter={(label) => bandLabel(String(label))} formatter={(v, _name, item: { payload?: { pct?: number } }) => [`${fmt(Number(v))} households · ${item.payload?.pct ?? 0}% of base`, "Member households"]} />
+        <Bar dataKey="households" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={48} isAnimationActive={false} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Fixed band order (youngest → oldest) and a light→dark tenure ramp, so a stacked column reads
+    as a lifecycle: pale New at the bottom, deep Legacy at the top. */
+const AGE_BAND_ORDER = ["New", "Establishing", "Settled", "Long-standing", "Legacy"] as const;
+const AGE_BAND_HUE: Record<string, string> = {
+  New: "#dae6ff", Establishing: "#90baff", Settled: "#3b6eb8", "Long-standing": "#2d5a9e", Legacy: "#1e4785",
+};
+
+/** How the age mix of the member base has shifted over time: one 100%-stacked column per fiscal
+    year, each band its share of that year's members. A widening dark top means the base is aging
+    (Legacy growing); a thinning pale bottom means fewer new members. Pivots the flat (fy, band)
+    rows and stacks the shares, which sum to ~100% each year. */
+export function MembershipAgeOverTimeChart({ rows }: { rows: MembershipAgeYearRow[] }) {
+  const fys = [...new Set(rows.map((r) => r.fy))].sort((a, b) => a - b);
+  const data = fys.map((fy) => {
+    const o: Record<string, number | string> = { fy: fyLabel(fy) };
+    for (const b of AGE_BAND_ORDER) o[b] = rows.find((r) => r.fy === fy && r.band === b)?.pct_of_base ?? 0;
+    return o;
+  });
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barCategoryGap="20%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={2} minTickGap={12} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(v: number) => `${v}%`} width={44} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [`${v}% of members`, bandLabel(String(name))]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        {AGE_BAND_ORDER.map((b, i) => (
+          <Bar key={b} dataKey={b} stackId="a" fill={AGE_BAND_HUE[b]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1}
+            radius={i === AGE_BAND_ORDER.length - 1 ? [4, 4, 0, 0] : undefined} />
+        ))}
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** One row of the joined-versus-survivors view: a join cohort's original joins beside the
+    households from it still current. `joined` is null for the collapsed "Before FY2010" group,
+    where join counts aren't reliably recorded, so only the survivors bar draws. */
+export interface JoinedVsStillHereRow { label: string; joined: number | null; stillHere: number }
+
+/** Joined vs. still here, per join cohort from FY2010 to the in-progress year, plus one
+    survivors-only "Before FY2010" bar. Survivors are a subset of joiners by construction, so
+    the still-here bar never exceeds the joined bar. */
+export function JoinedVsStillHereChart({ rows }: { rows: JoinedVsStillHereRow[] }) {
+  const data = rows.map((r) => ({ label: r.label, Joined: r.joined, "Still here": r.stillHere }));
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barGap={2} barCategoryGap="30%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="label" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval="preserveStartEnd" />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} tickFormatter={(v: number) => fmt(v)} width={44} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [v === null ? "—" : fmt(Number(v)), name]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Bar dataKey="Joined" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={20} isAnimationActive={false} />
+        <Bar dataKey="Still here" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={20} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   );
@@ -255,26 +310,64 @@ export function ClassOverTimeChart({ rows }: { rows: FinancialYearClassRow[] }) 
   );
 }
 
-/** Per-cohort value: average money received per household by join cohort in the latest
-    complete year, so cohorts of different sizes compare directly. Two newest emphasized. */
-export function CohortValueChart({ rows, emphasize }: { rows: FinancialCohortRow[]; emphasize: number[] }) {
+/** Value by membership-age band: two bars per band — the band's share of member households
+    and its share of the latest complete year's cash — on one 0–100% axis. The gap between them
+    is the headline. The per-household average (or "—" for a band under ten households) rides in
+    the tooltip, never as a bar, so no household's dues can be read off the chart. */
+export function ValueByAgeChart({ rows }: { rows: FinancialAgeRow[] }) {
   const data = rows.map((r) => ({
-    fy: fyLabel(r.cohort),
-    main: emphasize.includes(r.cohort) ? r.received_per_household : null,
-    rest: emphasize.includes(r.cohort) ? null : r.received_per_household,
-    total: r.received,
-    households: r.households,
+    band: r.band,
+    "Share of households": r.share_of_households,
+    "Share of money": r.share_of_received,
+    perHousehold: r.received_per_household,
   }));
+  const perHh = (v: number | null | undefined) => (v === null || v === undefined ? "— (fewer than 10 households)" : `${fmtMoney(v)} per household`);
   return (
     <ResponsiveContainer width="100%" height={240}>
-      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 8 }} barCategoryGap="35%">
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }} barGap={2} barCategoryGap="30%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="band" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} interval={0} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(v: number) => `${v}%`} width={44} />
+        <Tooltip contentStyle={tooltipStyle} labelFormatter={(label) => bandLabel(String(label))} formatter={(v, name, item: { payload?: { perHousehold?: number | null } }) => [`${v}% · ${perHh(item.payload?.perHousehold)}`, name]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Bar dataKey="Share of households" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={20} isAnimationActive={false} />
+        <Bar dataKey="Share of money" fill={PALETTE.series[4]} radius={[4, 4, 0, 0]} maxBarSize={20} isAnimationActive={false} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Growth vs. recurring revenue over time: each complete year's received cash split into money
+    from members who joined that year (new/growth) stacked under money from members who joined
+    earlier (recurring), with the growth share of the two riding a right-hand % axis so its
+    direction — is the base leaning more on new members or on renewals — reads at a glance. The
+    in-progress year is dropped (its partial total would understate every band). Undated cash is
+    excluded from both, so the bars can sit just below the institutional total in Money over time. */
+export function GrowthVsRecurringChart({ rows }: { rows: FinancialGrowthRow[] }) {
+  const data = rows
+    .filter((r) => r.complete)
+    .map((r) => {
+      const total = r.new_received + r.recurring_received;
+      return {
+        fy: fyLabel(r.fy),
+        "New members": r.new_received,
+        Recurring: r.recurring_received,
+        growthPct: total > 0 ? Math.round((1000 * r.new_received) / total) / 10 : 0,
+      };
+    });
+  return (
+    <ResponsiveContainer width="100%" height={260}>
+      <ComposedChart data={data} margin={{ top: 8, right: 12, bottom: 0, left: 8 }} barCategoryGap="30%">
         <CartesianGrid vertical={false} stroke={PALETTE.grid} />
         <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
-        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={56} tickFormatter={(v: number) => fmtMoneyShort(v)} />
-        <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: { total?: number; households?: number } }) => [`${fmtMoney(Number(v))} per household · ${fmtMoney(item.payload?.total ?? 0)} from ${fmt(item.payload?.households ?? 0)}`, "Received"]} />
-        <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
-        <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
-      </BarChart>
+        <YAxis yAxisId="money" tick={axisTick} tickLine={false} axisLine={false} width={56} tickFormatter={(v: number) => fmtMoneyShort(v)} />
+        <YAxis yAxisId="pct" orientation="right" tick={axisTick} tickLine={false} axisLine={false} width={44} domain={[0, "auto"]} tickFormatter={(v: number) => `${v}%`} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => (name === "Growth share" ? [`${v}%`, name] : [fmtMoney(Number(v)), name])} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        <Bar yAxisId="money" dataKey="New members" stackId="a" fill={PALETTE.series[1]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
+        <Bar yAxisId="money" dataKey="Recurring" stackId="a" fill={PALETTE.series[4]} radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} stroke="#fff" strokeWidth={1} />
+        <Line yAxisId="pct" type="monotone" dataKey="growthPct" name="Growth share" stroke={PALETTE.emphasis} strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false} />
+      </ComposedChart>
     </ResponsiveContainer>
   );
 }

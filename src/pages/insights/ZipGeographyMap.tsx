@@ -1,16 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { zipGeography, zipGeographyYears, type GeoMode, type Segment, type SourceCapability, type ZipGeoCell, type ZipGeography } from "../../api";
+import { neighborhoodGeography, zipGeographyYears, type GeoMode, type Segment, type SourceCapability, type ZipGeoCell, type ZipGeography } from "../../api";
 import { Stat } from "../../design-system/ui-kits/grant-management/chrome.jsx";
 import { NeighborhoodRetentionMap } from "./NeighborhoodRetentionMap";
 import { fmt, fyLabel } from "./format";
 
-// Executive framing of ZIP geography: lead with the headline (where members are, where
-// we're gaining or losing), then the ranked detail. The four modes are the questions a
-// C-suite reader actually asks; each opens with KPI tiles + a plain-language takeaway.
+// Executive framing of ZIP geography: a standing header (where members are, at a glance) sits
+// above the mode toggle and stays constant across modes; each mode then opens with a plain-
+// language takeaway and the ranked detail. "Where members are" carries the new-member ratio per
+// ZIP, so a separate provenance mode is not offered.
 
 const POS = "#1e4785";
 const NEG = "#b91c1c";
 const GAIN = "#047857";
+// Gold: the slice of a "Where members are" bar that joined this fiscal year. Its width within a
+// bar is that area's new-member share; across bars its absolute width tracks new-member volume.
+const NEW = "#d4a017";
 
 type ModeConfig = { tab: string; measureLabel: string };
 const MODES: Record<GeoMode, ModeConfig> = {
@@ -20,7 +24,9 @@ const MODES: Record<GeoMode, ModeConfig> = {
   attrition: { tab: "Attrition", measureLabel: "Attrition rate" },
   retention: { tab: "Retention by area", measureLabel: "Retained to date" },
 };
-const MODE_ORDER: GeoMode[] = ["density", "provenance", "retention", "net_change", "attrition"];
+// provenance is folded into density (the per-ZIP new-member ratio), so it is not offered as a
+// standalone mode; its MODES entry is kept only to satisfy the GeoMode enum the backend defines.
+const MODE_ORDER: GeoMode[] = ["density", "retention", "net_change", "attrition"];
 
 const SEGMENT_ALL = "";
 const encodeSegment = (seg: Segment | null): string => (seg == null ? SEGMENT_ALL : `${seg.kind}:${seg.value}`);
@@ -38,14 +44,15 @@ const geoCache = new Map<string, ZipGeography>();
 const geoInflight = new Map<string, Promise<ZipGeography>>();
 const geoKey = (builtAt: string, fy: number, mode: GeoMode, segment: Segment | null) =>
   `${builtAt}|${mode}|${fy}|${encodeSegment(segment)}`;
-/** Fetch one geography view, served from `geoCache` on a built_at + selection hit. */
+/** Fetch one geography view (density / growth / attrition), rolled up to neighborhoods; served
+ *  from `geoCache` on a built_at + selection hit. Retention keeps its own ZIP-level path. */
 function loadGeo(builtAt: string, fy: number, mode: GeoMode, segment: Segment | null): Promise<ZipGeography> {
   const k = geoKey(builtAt, fy, mode, segment);
   const hit = geoCache.get(k);
   if (hit) return Promise.resolve(hit);
   const pending = geoInflight.get(k);
   if (pending) return pending;
-  const p = zipGeography(fy, mode, segment)
+  const p = neighborhoodGeography(fy, mode, segment)
     .then((d) => { geoCache.set(k, d); return d; })
     .finally(() => { geoInflight.delete(k); });
   geoInflight.set(k, p);
@@ -69,17 +76,27 @@ function loadGeoYears(builtAt: string, mode: GeoMode, segment: Segment | null, y
 /** Test hook: clear the session geography cache so each case starts cold. */
 export function _resetGeoCache() { geoCache.clear(); geoInflight.clear(); geoYearsInflight.clear(); }
 
-/** A ranked row with a proportional bar. `frac` is 0..1 of the widest bar in its group. */
-function BarRow({ zip, frac, color, value, sub }: { zip: string; frac: number; color: string; value: string; sub?: string }) {
+/** A ranked row with a proportional bar. `frac` is 0..1 of the widest bar in its group. `sub2`,
+ *  when present, renders on a second line under the value — used for the per-area new-member ratio.
+ *  `newFrac` (0..1), when set, paints a gold segment over the right of the bar sized to that share,
+ *  so the "new" portion is visible at a glance. */
+function BarRow({ zip, frac, color, value, sub, sub2, newFrac }: { zip: string; frac: number; color: string; value: string; sub?: string; sub2?: string; newFrac?: number }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "52px 1fr 120px", alignItems: "center", gap: "var(--space-2)", fontSize: "var(--text-sm)", padding: "var(--space-1) 0" }}>
-      <span style={{ fontVariantNumeric: "tabular-nums", color: "var(--text-secondary)" }}>{zip}</span>
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(56px, 1.7fr) 132px", alignItems: "center", gap: "var(--space-3)", fontSize: "var(--text-sm)", padding: "var(--space-1) 0" }}>
+      <span style={{ justifySelf: "start", maxWidth: "100%", padding: "2px 9px", borderRadius: 999, background: "var(--bg-secondary)", border: "1px solid var(--border-default)", color: "var(--text-primary)", fontWeight: "var(--font-medium)", fontSize: "var(--text-xs)", lineHeight: 1.35 }}>{zip}</span>
       <span style={{ display: "block", height: 18, background: "var(--bg-secondary)", borderRadius: 4, overflow: "hidden" }}>
-        <span style={{ display: "block", height: "100%", width: `${Math.max(2, frac * 100)}%`, background: color, borderRadius: 4 }} />
+        <span style={{ position: "relative", display: "block", height: "100%", width: `${Math.max(2, frac * 100)}%`, background: color, borderRadius: 4 }}>
+          {newFrac != null && newFrac > 0 && (
+            <span title="joined this fiscal year" style={{ position: "absolute", top: 0, bottom: 0, right: 0, width: `${Math.min(100, newFrac * 100)}%`, background: NEW, borderTopRightRadius: 4, borderBottomRightRadius: 4 }} />
+          )}
+        </span>
       </span>
       <span style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-        <span style={{ fontWeight: "var(--font-semibold)", color: "var(--text-primary)" }}>{value}</span>
-        {sub && <span style={{ marginLeft: 6, color: "var(--text-tertiary)", fontSize: "var(--text-xs)" }}>{sub}</span>}
+        <span style={{ display: "block" }}>
+          <span style={{ fontWeight: "var(--font-semibold)", color: "var(--text-primary)" }}>{value}</span>
+          {sub && <span style={{ marginLeft: 6, color: "var(--text-tertiary)", fontSize: "var(--text-xs)" }}>{sub}</span>}
+        </span>
+        {sub2 && <span style={{ display: "block", marginTop: 2, color: "var(--text-tertiary)", fontSize: "var(--text-xs)" }}>{sub2}</span>}
       </span>
     </div>
   );
@@ -103,7 +120,7 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
   // Segment filtering was removed from the UI; every view is all-members. Kept as a null
   // constant so the fetch/cache keys and the child maps' props stay unchanged.
   const segment: Segment | null = null;
-  const [fy, setFy] = useState<number>(lastCompleteFy);
+  const [fy] = useState<number>(lastCompleteFy);
   // Retention has its own multi-cohort trend view (below); the single-fetch model here
   // drives the other four modes.
   const isRetention = mode === "retention";
@@ -119,14 +136,27 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
   const [loaded, setLoaded] = useState<{ key: string; data?: ZipGeography; error?: string } | null>(
     () => (initial ? { key: defaultKey, data: initial } : null),
   );
-
-  const fyOptions = useMemo(() => Array.from({ length: 6 }, (_, i) => currentFy - i), [currentFy]);
+  // The density view (last completed FY, all members) drives the standing header, which stays on
+  // screen in every mode. Held separately from `loaded` so switching to another mode never blanks
+  // it. Served from the payload/cache when available, so it costs no extra backend call.
+  const [densityData, setDensityData] = useState<ZipGeography | undefined>(initial);
 
   // Seed the session cache with the payload-delivered default so this panel — and a later
   // revisit — serves it from memory instead of re-requesting it across the locked path.
   useEffect(() => {
     if (initial) geoCache.set(geoKey(builtAt, lastCompleteFy, "density", null), initial);
   }, [initial, builtAt, lastCompleteFy]);
+
+  // Keep the standing header's density snapshot current. loadGeo coalesces with the main fetch
+  // below and hits the seeded cache, so this adds no second request for the same view.
+  useEffect(() => {
+    if (!available) return;
+    let live = true;
+    loadGeo(builtAt, lastCompleteFy, "density", null)
+      .then((d) => { if (live) setDensityData(d); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [available, builtAt, lastCompleteFy]);
 
   useEffect(() => {
     if (!available || isRetention) return;
@@ -160,23 +190,14 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
 
   return (
     <>
+      {/* Standing header: where the members are, at a glance — constant across every mode. */}
+      {densityData && <GeoHeader density={densityData} />}
       {/* questions, not jargon */}
       <div role="group" aria-label="Map mode" style={{ display: "inline-flex", gap: "var(--space-1)", marginBottom: "var(--space-3)", flexWrap: "wrap" }}>
         {MODE_ORDER.map((m) => (
           <button key={m} type="button" aria-pressed={mode === m} onClick={() => setMode(m)} style={controlBtn(mode === m)}>{MODES[m].tab}</button>
         ))}
       </div>
-      {!isRetention && (
-        <div style={{ display: "flex", gap: "var(--space-4)", flexWrap: "wrap", marginBottom: "var(--space-4)" }}>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", fontSize: "var(--text-sm)" }}>
-            Fiscal year
-            <select aria-label="Fiscal year" value={fy} onChange={(e) => setFy(Number(e.target.value))}>
-              {fyOptions.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
-            </select>
-          </label>
-        </div>
-      )}
-
       {isRetention ? (
         <>
           <NeighborhoodRetentionMap currentFy={currentFy} segment={segment} builtAt={builtAt} />
@@ -191,25 +212,25 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
         <>
           <div data-testid="zip-geography-summary" role="region" aria-label={`${MODES[mode].tab} — ${fyLabel(fy)}`}>
             {!fresh ? (
-              <p style={{ margin: 0, color: "var(--text-tertiary)" }}>{`Loading ${MODES[mode].measureLabel.toLowerCase()} by ZIP for ${fyLabel(fy)}…`}</p>
+              <p style={{ margin: 0, color: "var(--text-tertiary)" }}>{`Loading ${MODES[mode].measureLabel.toLowerCase()} by area for ${fyLabel(fy)}…`}</p>
             ) : freshError ? (
               <p style={{ margin: 0, color: "var(--color-error-600)" }}>The data could not load: {freshError}</p>
             ) : freshData && !freshData.available ? (
-              <p style={{ margin: 0, color: "var(--text-secondary)" }}>No normalizable ZIP data for this view.</p>
+              <p style={{ margin: 0, color: "var(--text-secondary)" }}>No normalizable area data for this view.</p>
             ) : cells.length === 0 ? (
-              <p style={{ margin: 0, color: "var(--text-secondary)" }}>No ZIPs meet the reporting threshold for this view{segment ? " and segment" : ""}.</p>
+              <p style={{ margin: 0, color: "var(--text-secondary)" }}>No areas meet the reporting threshold for this view{segment ? " and segment" : ""}.</p>
             ) : mode === "net_change" ? (
               <NetView cells={cells} fy={fy} outOfArea={freshData?.out_of_area ?? 0} />
             ) : mode === "attrition" ? (
               <AttritionView cells={cells} fy={fy} totalN={totalN} />
             ) : (
-              <ConcentrationView cells={cells} fy={fy} totalN={totalN} outOfArea={freshData?.out_of_area ?? 0} isNew={mode === "provenance"} />
+              <WhereMembersAreView cells={cells} fy={fy} totalN={totalN} />
             )}
           </div>
 
           {fresh && freshData && freshData.suppressed_zips > 0 && (
             <p style={{ margin: "var(--space-3) 0 0", fontSize: "var(--text-xs)", color: "var(--text-tertiary)" }}>
-              {`${freshData.suppressed_zips} smaller ${freshData.suppressed_zips === 1 ? "ZIP is" : "ZIPs are"} hidden to protect households (fewer than ${mode === "attrition" ? 10 : 5} in this view).`}
+              {`${freshData.suppressed_zips} smaller ${freshData.suppressed_zips === 1 ? "area is" : "areas are"} hidden to protect households (fewer than ${mode === "attrition" ? 10 : 5} in this view).`}
             </p>
           )}
 
@@ -224,28 +245,51 @@ const StatRow = ({ children }: { children: React.ReactNode }) => (
   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-3)", marginBottom: "var(--space-3)" }}>{children}</div>
 );
 
-function ConcentrationView({ cells, fy, totalN, outOfArea, isNew }: { cells: ZipGeoCell[]; fy: number; totalN: number; outOfArea: number; isNew: boolean }) {
+/** The standing Geography header: the four density KPIs (where members are, at a glance), shown
+ *  above the mode toggle and unchanged as the reader flips modes. Renders nothing until the
+ *  density snapshot is available or when it holds no mapped areas. */
+function GeoHeader({ density }: { density: ZipGeography }) {
+  const cells = density.available ? density.cells : [];
+  if (cells.length === 0) return null;
+  const ranked = [...cells].sort((a, b) => b.n - a.n);
+  const totalN = ranked.reduce((s, c) => s + c.n, 0);
+  const top = ranked[0];
+  const top5 = ranked.slice(0, 5).reduce((s, c) => s + c.n, 0);
+  const outOfArea = density.out_of_area;
+  return (
+    <StatRow>
+      <Stat label="Mapped households" value={fmt(totalN)} sub={outOfArea > 0 ? `${fmt(outOfArea)} outside NY` : "on the map"} icon="users" tone="primary" />
+      <Stat label="Top area" value={top.zip} sub={`${fmt(top.n)} · ${pctOf(top.n, totalN)}% of total`} icon="map-pin" tone="accent" />
+      <Stat label="Top 5 areas" value={`${pctOf(top5, totalN)}%`} sub="share of the total" icon="target" tone="primary" />
+      <Stat label="Areas shown" value={fmt(ranked.length)} sub="above the threshold" icon="list" tone="neutral" />
+    </StatRow>
+  );
+}
+
+/** "Where members are" detail: the ranked neighborhood list, each row carrying its member
+ *  households and the new members behind them (households that joined in `fy`) as a ratio, so the
+ *  reader sees which areas are refreshing versus aging. The KPI tiles live in the header above. */
+function WhereMembersAreView({ cells, fy, totalN }: { cells: ZipGeoCell[]; fy: number; totalN: number }) {
   const ranked = [...cells].sort((a, b) => b.n - a.n);
   const top = ranked[0];
   const top5 = ranked.slice(0, 5).reduce((s, c) => s + c.n, 0);
-  const noun = isNew ? "new members" : "member households";
+  const topNew = [...cells].sort((a, b) => b.joins - a.joins)[0];
   const maxN = top?.n ?? 1;
   return (
     <>
-      <StatRow>
-        <Stat label={isNew ? `New members ${fyLabel(fy)}` : "Mapped households"} value={fmt(totalN)} sub={outOfArea > 0 ? `${fmt(outOfArea)} outside NY` : "on the map"} icon="users" tone="primary" />
-        <Stat label="Top ZIP" value={top.zip} sub={`${fmt(top.n)} · ${pctOf(top.n, totalN)}% of total`} icon="map-pin" tone="accent" />
-        <Stat label="Top 5 ZIPs" value={`${pctOf(top5, totalN)}%`} sub="share of the total" icon="target" tone="primary" />
-        <Stat label="ZIPs shown" value={fmt(ranked.length)} sub="above the threshold" icon="list" tone="neutral" />
-      </StatRow>
       <Headline>
-        {isNew
-          ? <>New members in {fyLabel(fy)} came mostly from <strong>{top.zip}</strong> ({fmt(top.n)}). The top 5 ZIPs account for <strong>{pctOf(top5, totalN)}%</strong> of all joins.</>
-          : <>Your membership is concentrated in <strong>{top.zip}</strong> ({fmt(top.n)} households, {pctOf(top.n, totalN)}%). The top 5 ZIPs hold <strong>{pctOf(top5, totalN)}%</strong> of {noun}.</>}
+        Your members are clustered in <strong>{top.zip}</strong> ({fmt(top.n)} households, {pctOf(top.n, totalN)}%), and the top 5 areas make up <strong>{pctOf(top5, totalN)}%</strong> of all members.{" "}
+        {topNew && topNew.joins > 0 && <>Most new members in {fyLabel(fy)} {topNew.zip === top.zip ? "also " : ""}came from <strong>{topNew.zip}</strong> ({fmt(topNew.joins)}).</>}
       </Headline>
-      <SectionTitle>Top ZIPs by {noun}</SectionTitle>
+      <SectionTitle>Top areas by member households</SectionTitle>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, margin: "0 0 var(--space-2)", fontSize: "var(--text-xs)", color: "var(--text-tertiary)" }}>
+        <span style={{ display: "inline-block", width: 22, height: 8, borderRadius: 2, background: NEW }} />
+        <span>Gold marks the share who joined in {fyLabel(fy)}</span>
+      </div>
       {ranked.slice(0, 10).map((c) => (
-        <BarRow key={c.zip} zip={c.zip} frac={c.n / maxN} color={POS} value={fmt(c.n)} sub={`${pctOf(c.n, totalN)}%`} />
+        <BarRow key={c.zip} zip={c.zip} frac={c.n / maxN} color={POS} value={fmt(c.n)} sub="members"
+          sub2={c.joins > 0 ? `${fmt(c.joins)} new · ${pctOf(c.joins, c.n)}%` : "no new members"}
+          newFrac={c.n > 0 ? c.joins / c.n : 0} />
       ))}
     </>
   );
@@ -263,23 +307,23 @@ function NetView({ cells, fy, outOfArea }: { cells: ZipGeoCell[]; fy: number; ou
     <>
       <StatRow>
         <Stat label={`Net change ${fyLabel(fy)}`} value={`${net > 0 ? "+" : ""}${fmt(net)}`} sub="joins − exits, mapped" icon={net >= 0 ? "trending-up" : "trending-down"} tone={net >= 0 ? "success" : "neutral"} />
-        <Stat label="ZIPs shrinking" value={fmt(losers.length)} sub={worst ? `worst ${worst.zip} (${worst.measure})` : "none"} icon="trending-down" tone="neutral" />
-        <Stat label="ZIPs growing" value={fmt(gainers.length)} sub={best ? `best ${best.zip} (+${best.measure})` : "none"} icon="trending-up" tone="success" />
+        <Stat label="Areas shrinking" value={fmt(losers.length)} sub={worst ? `worst ${worst.zip} (${worst.measure})` : "none"} icon="trending-down" tone="neutral" />
+        <Stat label="Areas growing" value={fmt(gainers.length)} sub={best ? `best ${best.zip} (+${best.measure})` : "none"} icon="trending-up" tone="success" />
         {outOfArea > 0 && <Stat label="Outside NY" value={fmt(outOfArea)} sub="not mapped" icon="globe" tone="neutral" />}
       </StatRow>
       <Headline>
-        You are net <strong style={{ color: net >= 0 ? GAIN : NEG }}>{net > 0 ? "+" : ""}{fmt(net)}</strong> across mapped ZIPs in {fyLabel(fy)}.{" "}
-        {worst ? <>The steepest decline is <strong>{worst.zip}</strong> ({worst.measure}: {worst.joins} joined, {worst.exits} left).</> : <>No ZIP is in net decline.</>}
+        You are net <strong style={{ color: net >= 0 ? GAIN : NEG }}>{net > 0 ? "+" : ""}{fmt(net)}</strong> across mapped areas in {fyLabel(fy)}.{" "}
+        {worst ? <>The steepest decline is <strong>{worst.zip}</strong> ({worst.measure}: {worst.joins} joined, {worst.exits} left).</> : <>No area is in net decline.</>}
       </Headline>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "var(--space-4)" }}>
         <div>
           <SectionTitle tone={NEG}>Losing ground</SectionTitle>
-          {losers.length === 0 ? <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-tertiary)" }}>No ZIPs in decline.</p>
+          {losers.length === 0 ? <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-tertiary)" }}>No areas in decline.</p>
             : losers.slice(0, 8).map((c) => <BarRow key={c.zip} zip={c.zip} frac={-c.measure / maxLoss} color={NEG} value={`${c.measure}`} sub={`${c.exits} left`} />)}
         </div>
         <div>
           <SectionTitle tone={GAIN}>Gaining members</SectionTitle>
-          {gainers.length === 0 ? <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-tertiary)" }}>No ZIPs growing.</p>
+          {gainers.length === 0 ? <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-tertiary)" }}>No areas growing.</p>
             : gainers.slice(0, 8).map((c) => <BarRow key={c.zip} zip={c.zip} frac={c.measure / maxGain} color={GAIN} value={`+${c.measure}`} sub={`${c.joins} joined`} />)}
         </div>
       </div>
@@ -297,11 +341,11 @@ function AttritionView({ cells, fy, totalN }: { cells: ZipGeoCell[]; fy: number;
     <>
       <StatRow>
         <Stat label={`Avg attrition ${fyLabel(fy)}`} value={`${avg}%`} sub={`${fmt(totalExits)} of ${fmt(totalN)} left`} icon="activity" tone="neutral" />
-        <Stat label="Highest-attrition ZIP" value={worst.zip} sub={`${worst.measure}% · ${worst.exits} of ${worst.n}`} icon="alert-triangle" tone="accent" />
-        <Stat label="ZIPs above average" value={fmt(ranked.filter((c) => c.measure > avg).length)} sub={`worse than ${avg}%`} icon="trending-down" tone="neutral" />
+        <Stat label="Highest-attrition area" value={worst.zip} sub={`${worst.measure}% · ${worst.exits} of ${worst.n}`} icon="alert-triangle" tone="accent" />
+        <Stat label="Areas above average" value={fmt(ranked.filter((c) => c.measure > avg).length)} sub={`worse than ${avg}%`} icon="trending-down" tone="neutral" />
       </StatRow>
       <Headline>
-        Average attrition across mapped ZIPs is <strong>{avg}%</strong> in {fyLabel(fy)}, highest in <strong>{worst.zip}</strong> at <strong style={{ color: NEG }}>{worst.measure}%</strong> ({worst.exits} of {worst.n} households).
+        Average attrition across mapped areas is <strong>{avg}%</strong> in {fyLabel(fy)}, highest in <strong>{worst.zip}</strong> at <strong style={{ color: NEG }}>{worst.measure}%</strong> ({worst.exits} of {worst.n} households).
       </Headline>
       <SectionTitle tone={NEG}>Where attrition is worst</SectionTitle>
       {ranked.slice(0, 10).map((c) => (
@@ -423,12 +467,12 @@ function FullTable({ mode, cells, totalN }: { mode: GeoMode; cells: ZipGeoCell[]
     mode === "attrition" || mode === "retention" ? `${c.measure}%` : mode === "net_change" ? `${c.measure > 0 ? "+" : ""}${c.measure}` : fmt(c.n);
   return (
     <details style={{ marginTop: "var(--space-4)" }}>
-      <summary style={{ cursor: "pointer", fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>All {ranked.length} ZIPs</summary>
+      <summary style={{ cursor: "pointer", fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>All {ranked.length} areas</summary>
       <div style={{ marginTop: "var(--space-2)", overflowX: "auto" }}>
         <table data-testid="zip-geography-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--text-sm)" }}>
           <thead>
             <tr>
-              <th style={{ textAlign: "left" }}>ZIP</th>
+              <th style={{ textAlign: "left" }}>Area</th>
               <th style={{ textAlign: "right" }}>{MODES[mode].measureLabel}</th>
               {mode !== "net_change" && mode !== "attrition" && mode !== "retention" && <th style={{ textAlign: "right" }}>Share</th>}
               {mode === "retention" && <th style={{ textAlign: "right" }}>Still members</th>}

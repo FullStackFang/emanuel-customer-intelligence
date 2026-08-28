@@ -35,6 +35,8 @@ export interface TrendRow { fy: number; joins: number; resigns: number; active_e
 export interface CohortYear1 { cohort: number; n: number; pct_retained: number }
 export interface CohortCell { cohort: number; n: number; k: number; pct_retained: number }
 export interface CohortMakeupRow { cohort: number; current: number; pct_of_base: number }
+export interface MembershipAgeRow { band: string; households: number; pct_of_base: number }
+export interface MembershipAgeYearRow { fy: number; band: string; households: number; pct_of_base: number }
 export interface ChannelRow { key: string; label: string; n: number; still_members: number; pct: number; avg_tenure: number; left_within_2y: number }
 export interface SchoolRow { group: string; n: number; still_members: number; pct: number }
 export interface ReasonCell { fy: number; reason: string; n: number }
@@ -46,13 +48,14 @@ export interface AnchorTypeRow { key: string; label: string; n: number; still_me
 export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
 export interface FinancialYearRow { fy: number; complete: boolean; billed: number; received: number }
 export interface FinancialYearClassRow { fy: number; key: string; label: string; received: number }
-export interface FinancialCohortRow { cohort: number; households: number; received: number; received_per_household: number }
+export interface FinancialAgeRow { band: string; households: number; received: number; share_of_households: number; share_of_received: number; received_per_household: number | null }
+export interface FinancialGrowthRow { fy: number; complete: boolean; new_received: number; recurring_received: number }
 export interface ConcentrationRow { decile: number; households: number; billed_share: number; received_share: number; cumulative_billed_share: number; cumulative_received_share: number }
 export interface Financials {
   fiscal_year: number; households: number; paying_households: number;
   total_billed: number; total_received: number;
   by_year: FinancialYearRow[]; by_year_class: FinancialYearClassRow[];
-  by_cohort: FinancialCohortRow[]; concentration: ConcentrationRow[];
+  by_membership_age: FinancialAgeRow[]; by_growth: FinancialGrowthRow[]; concentration: ConcentrationRow[];
 }
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
 
@@ -92,6 +95,7 @@ export interface Insights {
   built_at: string | null; newest_source_sync_at: string | null; stale: boolean;
   capabilities: SourceCapability[]; current_fy: number; unavailable: string[]; kpis: Kpis;
   trend: TrendRow[]; year1: CohortYear1[]; cohort_matrix: CohortCell[]; cohort_makeup: CohortMakeupRow[];
+  membership_age: MembershipAgeRow[]; membership_age_over_time: MembershipAgeYearRow[];
   channels: ChannelRow[]; school: SchoolRow[]; reasons: ReasonCell[];
   multi_job: MultiJobRow[]; outcome_by_tenure: OutcomeByTenureRow[];
   school_progression: SchoolRow[]; school_gap: SchoolGapRow[];
@@ -131,6 +135,11 @@ export const purgeLocalData = () => invoke<void>("purge_local_data");
 export const getInsights = (forceRebuild = false) => invoke<Insights>("get_insights", { forceRebuild });
 export const zipGeography = (fiscalYear: number, mode: GeoMode, segment: Segment | null = null) =>
   invoke<ZipGeography>("zip_geography", { fiscalYear, mode, segment });
+/** Mode-driven geography rolled up to NYC neighborhoods — the density, growth, and attrition
+ *  views. Same `ZipGeography` shape as the ZIP views, but each cell's `zip` slot carries the
+ *  public neighborhood name and `suppressed_zips` counts suppressed neighborhoods. */
+export const neighborhoodGeography = (fiscalYear: number, mode: GeoMode, segment: Segment | null = null) =>
+  invoke<ZipGeography>("neighborhood_geography", { fiscalYear, mode, segment });
 /** Many fiscal years of one mode and segment in a single backend call (one store-lock hold);
  *  views come back in request order. */
 export const zipGeographyYears = (mode: GeoMode, segment: Segment | null, fiscalYears: number[]) =>
