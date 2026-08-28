@@ -44,12 +44,15 @@ export interface SchoolGapRow { bucket: string; n: number; still_members: number
 export interface DuesRow { fy: number; active: number; billed: number; coverage_missing: number; settled: number; partially_settled: number; unsettled: number }
 export interface AnchorTypeRow { key: string; label: string; n: number; still_members: number; pct: number }
 export interface AnchorCountRow { anchors: number; label: string; n: number; still_members: number; pct: number }
-export interface FinancialClassRow { key: string; label: string; billed: number; received: number }
+export interface FinancialYearRow { fy: number; complete: boolean; billed: number; received: number }
+export interface FinancialYearClassRow { fy: number; key: string; label: string; received: number }
+export interface FinancialCohortRow { cohort: number; households: number; received: number; received_per_household: number }
 export interface ConcentrationRow { decile: number; households: number; billed_share: number; received_share: number; cumulative_billed_share: number; cumulative_received_share: number }
 export interface Financials {
   fiscal_year: number; households: number; paying_households: number;
   total_billed: number; total_received: number;
-  by_class: FinancialClassRow[]; concentration: ConcentrationRow[];
+  by_year: FinancialYearRow[]; by_year_class: FinancialYearClassRow[];
+  by_cohort: FinancialCohortRow[]; concentration: ConcentrationRow[];
 }
 export interface AtRiskRow { account_id: string; name: string; tier: string | null; join_fy: number | null; rules: string[] }
 

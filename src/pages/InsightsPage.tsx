@@ -4,7 +4,7 @@ import * as api from "../api";
 import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
-import { CohortHeatmap, CohortMakeupChart, ConcentrationChart, DuesChart, FlowsChart, HBarChart, OutcomeByTenureChart, ReasonsHeatmap, RevenueMixChart, TableView, TrendChart, Year1Chart } from "./insights/charts";
+import { ClassOverTimeChart, CohortHeatmap, CohortMakeupChart, CohortValueChart, ConcentrationChart, DuesChart, FlowsChart, HBarChart, MoneyOverTimeChart, OutcomeByTenureChart, ReasonsHeatmap, TableView, TrendChart, Year1Chart } from "./insights/charts";
 import { ZipGeographyMap } from "./insights/ZipGeographyMap";
 import { EVIDENCE_LABELS, fmt, fmtMoney, fyLabel, soWhat } from "./insights/format";
 
@@ -269,6 +269,13 @@ export default function InsightsPage({ status }: PageProps) {
   const makeupLatestTwo = ins ? ins.cohort_makeup.slice(-2).map((r) => r.cohort) : [];
   const makeupUndated = ins ? ins.kpis.members_now - ins.cohort_makeup.reduce((sum, r) => sum + r.current, 0) : 0;
   const fin = ins?.financials ?? null;
+  const finYears = fin ? fin.by_year.filter((r) => r.complete) : [];
+  const finCompleteFys = new Set(finYears.map((r) => r.fy));
+  const finYearClass = fin ? fin.by_year_class.filter((r) => finCompleteFys.has(r.fy)) : [];
+  const finLatest = fin ? fin.by_year.find((r) => r.fy === fin.fiscal_year) : undefined;
+  const finPrior = fin ? fin.by_year.filter((r) => r.complete && r.fy < fin.fiscal_year).slice(-1)[0] : undefined;
+  const finYoyPct = finLatest && finPrior && finPrior.received > 0 ? Math.round((1000 * (finLatest.received - finPrior.received)) / finPrior.received) / 10 : null;
+  const finCohortLatestTwo = fin ? fin.by_cohort.slice(-2).map((r) => r.cohort) : [];
   const built = ins?.built_at ? new Date(ins.built_at).toLocaleString() : "not built";
   const anyAnchor = capOn("renewal") || capOn("school") || capOn("committee");
   const sectionClass = (key: typeof tab) => `insights-section${renderingPdf || tab === key ? "" : " insights-section-hidden"}`;
@@ -602,7 +609,30 @@ export default function InsightsPage({ status }: PageProps) {
           ) : (
             <>
               <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
-                <CardHeader><CardTitle>Who carries the dues base</CardTitle></CardHeader>
+                <CardHeader><CardTitle>Money in over time</CardTitle></CardHeader>
+                <Lede>{`Every dollar billed and received each fiscal year, across all billed households — not only today's members, so earlier years aren't understated. Billing begins in FY2023, so the window is short and that first year reflects only partial coverage; the in-progress year is left off the bars because its totals are partial too.`}</Lede>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
+                  <Stat label={`Received ${fyLabel(fin.fiscal_year)}`} value={fmtMoney(finLatest?.received ?? 0)} sub="latest complete year" icon="badge-dollar-sign" tone="success" />
+                  <Stat label="Collected" value={`${finLatest && finLatest.billed > 0 ? Math.round((1000 * finLatest.received) / finLatest.billed) / 10 : 0}%`} sub="of amount billed" icon="percent" tone="primary" />
+                  <Stat label="Year over year" value={finYoyPct === null ? "—" : `${finYoyPct >= 0 ? "+" : ""}${finYoyPct}%`} sub={finPrior ? `received vs ${fyLabel(finPrior.fy)}` : "no prior year"} icon="trending-up" tone={finYoyPct !== null && finYoyPct < 0 ? "accent" : "success"} />
+                </div>
+                <MoneyOverTimeChart rows={finYears} />
+                <TableView rows={fin.by_year} getRowKey={(r) => String(r.fy)} columns={[
+                  { key: "fy", header: "Fiscal year", render: (r) => `${fyLabel(r.fy)}${r.complete ? "" : " (partial)"}` },
+                  { key: "b", header: "Billed", align: "right", render: (r) => fmtMoney(r.billed) },
+                  { key: "r", header: "Received", align: "right", render: (r) => fmtMoney(r.received) },
+                  { key: "c", header: "Collected", align: "right", render: (r) => `${r.billed > 0 ? Math.round((1000 * r.received) / r.billed) / 10 : 0}%` },
+                ]} />
+              </Card>
+
+              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+                <CardHeader><CardTitle>Where the money comes in over time</CardTitle></CardHeader>
+                <Lede>Cash received by product class each complete fiscal year. A tall one-year segment — a big gift year, say — stands out against steady dues, so the makeup of the money is visible, not just the total.</Lede>
+                <ClassOverTimeChart rows={finYearClass} />
+              </Card>
+
+              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
+                <CardHeader><CardTitle>Who carries the base</CardTitle></CardHeader>
                 <Lede>{`Across today's member households, the cumulative share of ${fyLabel(fin.fiscal_year)} money held by the top-paying tenth, fifth, and so on — ranked by cash received. A steep early climb means a few households carry the base. Figures are aggregate; the smallest unit shown is a tenth of the membership, never a household.`}</Lede>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
                   <Stat label="Top 10% of members" value={`${fin.concentration[0]?.cumulative_received_share ?? 0}%`} sub="of cash received" icon="trending-up" tone="primary" />
@@ -619,26 +649,15 @@ export default function InsightsPage({ status }: PageProps) {
               </Card>
 
               <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
-                <CardHeader><CardTitle>Where the money comes in</CardTitle></CardHeader>
-                <Lede>{`${fyLabel(fin.fiscal_year)} money in by product class, across today's member households — cash received (colored) over the amount billed (grey), so the gap is what's still uncollected for that class.`}</Lede>
-                <RevenueMixChart rows={fin.by_class} />
-                <TableView rows={fin.by_class} getRowKey={(r) => r.key} columns={[
-                  { key: "l", header: "Product class", render: (r) => r.label },
-                  { key: "b", header: "Billed", align: "right", render: (r) => fmtMoney(r.billed) },
-                  { key: "r", header: "Received", align: "right", render: (r) => fmtMoney(r.received) },
-                  { key: "s", header: "Share of received", align: "right", render: (r) => `${fin.total_received > 0 ? Math.round((1000 * r.received) / fin.total_received) / 10 : 0}%` },
+                <CardHeader><CardTitle>Cohort value</CardTitle></CardHeader>
+                <Lede>{`What each join cohort brings in during ${fyLabel(fin.fiscal_year)}, per household — so cohorts of different sizes compare directly. This is a one-year snapshot, not lifetime value (billing only reaches back to FY2023). The two newest cohorts are highlighted.`}</Lede>
+                <CohortValueChart rows={fin.by_cohort} emphasize={finCohortLatestTwo} />
+                <TableView rows={fin.by_cohort} getRowKey={(r) => String(r.cohort)} columns={[
+                  { key: "c", header: "Cohort", render: (r) => fyLabel(r.cohort) },
+                  { key: "h", header: "Households", align: "right", render: (r) => fmt(r.households) },
+                  { key: "t", header: `Received ${fyLabel(fin.fiscal_year)}`, align: "right", render: (r) => fmtMoney(r.received) },
+                  { key: "p", header: "Per household", align: "right", render: (r) => fmtMoney(r.received_per_household) },
                 ]} />
-              </Card>
-
-              <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
-                <CardHeader><CardTitle>Collection: billed vs received</CardTitle></CardHeader>
-                <Lede>{`How much of what was billed in ${fyLabel(fin.fiscal_year)} has been collected, across today's member households. Received and outstanding are eventual states from the mirror, not the position as of any single date.`}</Lede>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--space-3)" }}>
-                  <Stat label="Billed" value={fmtMoney(fin.total_billed)} sub={`${fyLabel(fin.fiscal_year)} · member households`} icon="file-text" tone="neutral" />
-                  <Stat label="Received" value={fmtMoney(fin.total_received)} sub="cash settled" icon="badge-dollar-sign" tone="success" />
-                  <Stat label="Collected" value={`${fin.total_billed > 0 ? Math.round((1000 * fin.total_received) / fin.total_billed) / 10 : 0}%`} sub="of amount billed" icon="percent" tone="primary" />
-                  <Stat label="Outstanding" value={fmtMoney(Math.max(0, fin.total_billed - fin.total_received))} sub="billed, not yet received" icon="triangle-alert" tone="accent" />
-                </div>
               </Card>
             </>
           )}

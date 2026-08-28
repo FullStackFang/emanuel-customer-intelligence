@@ -1712,14 +1712,34 @@ pub struct DuesRow {
     pub partially_settled: i64,
     pub unsettled: i64,
 }
-/// One product class's share of the money in during a fiscal year. Billed is the amount
-/// charged; received is the cash eventually settled against it. Aggregate only.
+/// One fiscal year's institutional money: everything billed and received that year across
+/// every billed household (not only today's members — so the trend has no survivor bias).
+/// `complete` is false for the in-progress current year, whose totals are partial.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FinancialClassRow {
-    pub key: String,
-    pub label: String,
+pub struct FinancialYearRow {
+    pub fy: i32,
+    pub complete: bool,
     pub billed: f64,
     pub received: f64,
+}
+/// One product class's received money in one fiscal year, across every billed household.
+/// Drives the where-it-comes-from-over-time view (e.g. a gift spike in one year).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FinancialYearClassRow {
+    pub fy: i32,
+    pub key: String,
+    pub label: String,
+    pub received: f64,
+}
+/// One join-year cohort's money in the latest complete fiscal year, across today's members
+/// from that cohort: the total they bring and the per-household average (size-adjusted, so
+/// cohorts of different sizes compare). Aggregate — the household count is the smallest unit.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FinancialCohortRow {
+    pub cohort: i32,
+    pub households: i64,
+    pub received: f64,
+    pub received_per_household: f64,
 }
 /// One tenth of the member base, ranked by cash received (top decile first). `share` is
 /// this band's own slice of the year's total; `cumulative_*` runs the Pareto curve. The
@@ -1733,11 +1753,12 @@ pub struct ConcentrationRow {
     pub cumulative_billed_share: f64,
     pub cumulative_received_share: f64,
 }
-/// The aggregate financial picture for one complete fiscal year, across today's member
-/// households: how concentrated the money is (Pareto by decile), where it comes in by
-/// product class, and how much of what is billed is collected. Every figure is a total or
-/// a decile band — deliberately never a household — so the tab cannot expose one member's
-/// finances.
+/// The aggregate financial picture: money in over time (by year and by product class, all
+/// billed households), concentration among today's members for the latest complete year,
+/// and per-cohort value for that year. Every figure is a total, a decile band, or a cohort
+/// — deliberately never a household — so the tab cannot expose one member's finances. The
+/// `fiscal_year`/`total_*`/`households` fields describe the latest complete year's member
+/// snapshot that the concentration and cohort views share.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Financials {
     pub fiscal_year: i32,
@@ -1745,7 +1766,9 @@ pub struct Financials {
     pub paying_households: i64,
     pub total_billed: f64,
     pub total_received: f64,
-    pub by_class: Vec<FinancialClassRow>,
+    pub by_year: Vec<FinancialYearRow>,
+    pub by_year_class: Vec<FinancialYearClassRow>,
+    pub by_cohort: Vec<FinancialCohortRow>,
     pub concentration: Vec<ConcentrationRow>,
 }
 /// Retention of households that recently held one kind of Relationship Anchor.
@@ -3164,11 +3187,12 @@ fn class_label(class: DuesClass) -> (&'static str, &'static str) {
     }
 }
 
-/// The aggregate financial picture across today's member households for the latest complete
-/// fiscal year: Pareto concentration by decile, the revenue mix by product class, and the
-/// billed-vs-received collection gap. Every output is a total or a decile band — never a
-/// household — so no member's finances can be read off it. Returns None when the billing
-/// source or its money columns are absent, or no complete year carries member money yet.
+/// The aggregate financial picture: institutional money in over time (by year, and by
+/// product class per year, across every billed household), plus — for the latest complete
+/// year, across today's members — Pareto concentration by decile and per-cohort value.
+/// Every output is a total, a decile band, or a cohort — never a household. Returns None
+/// when the billing source or its money columns are absent, or no complete year carries
+/// member money yet.
 fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> {
     let statement_cols = store.mirror_columns("BillingStatement__c")?;
     let line_cols = store.mirror_columns("BillingStatementLine__c")?;
@@ -3213,18 +3237,33 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         return Ok(None);
     };
 
-    // Every current member seeded at zero, so the decile base is the whole membership — not
-    // only those who happened to be billed. `per_hh[i]` is (billed, received).
-    let current_ids: Vec<&str> = hh
+    // Product classes, dues first, for every by-class listing.
+    const CLASS_ORDER: [DuesClass; 7] = [
+        DuesClass::Membership,
+        DuesClass::Tuition,
+        DuesClass::SecurityFee,
+        DuesClass::Gift,
+        DuesClass::Event,
+        DuesClass::Sale,
+        DuesClass::Other,
+    ];
+
+    // Today's members, each seeded at zero, so the decile base and cohort averages cover the
+    // whole membership — not only those who happened to be billed. `per_hh[i]` is (billed,
+    // received) in `fiscal_year` for member `current[i]`; kept aligned until the decile sort.
+    let current: Vec<(&str, Option<i32>)> = hh
         .iter()
         .filter(|h| h.is_current)
-        .map(|h| h.account_id.as_str())
+        .map(|h| (h.account_id.as_str(), h.join_fy))
         .collect();
     let index: std::collections::HashMap<&str, usize> =
-        current_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    let mut per_hh: Vec<(f64, f64)> = vec![(0.0, 0.0); current_ids.len()];
-    let mut by_class: std::collections::HashMap<&'static str, (f64, f64)> =
-        std::collections::HashMap::new();
+        current.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+    let mut per_hh: Vec<(f64, f64)> = vec![(0.0, 0.0); current.len()];
+
+    // Institutional money by year and by (year, class), across EVERY billed household — no
+    // member filter, so the trend has no survivor bias.
+    let mut year_totals: std::collections::BTreeMap<i32, (f64, f64)> = std::collections::BTreeMap::new();
+    let mut year_class: std::collections::HashMap<(i32, &'static str), f64> = std::collections::HashMap::new();
 
     for row in &line_rows {
         let Some(parent) = field(row, &l_parent) else {
@@ -3233,20 +3272,20 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         let Some(&(household_id, fy)) = statement_meta.get(parent) else {
             continue;
         };
-        if fy != fiscal_year {
-            continue;
-        }
-        let Some(&i) = index.get(household_id) else {
-            continue; // a statement for a household that is not a current member
-        };
         let billed = field(row, &l_amt).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         let received = field(row, &l_recv).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        per_hh[i].0 += billed;
-        per_hh[i].1 += received;
         let (key, _) = class_label(dues_class(field(row, &l_fam), field(row, &l_name)));
-        let entry = by_class.entry(key).or_insert((0.0, 0.0));
-        entry.0 += billed;
-        entry.1 += received;
+        let yt = year_totals.entry(fy).or_default();
+        yt.0 += billed;
+        yt.1 += received;
+        *year_class.entry((fy, key)).or_default() += received;
+        // Member snapshot for the latest complete year, for concentration and cohort value.
+        if fy == fiscal_year {
+            if let Some(&i) = index.get(household_id) {
+                per_hh[i].0 += billed;
+                per_hh[i].1 += received;
+            }
+        }
     }
 
     let total_billed: f64 = per_hh.iter().map(|(b, _)| *b).sum();
@@ -3257,32 +3296,44 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
     }
     let paying_households = per_hh.iter().filter(|(_, r)| *r > 0.0).count() as i64;
 
-    // Revenue mix, dues first, only classes that carried money.
-    const CLASS_ORDER: [DuesClass; 7] = [
-        DuesClass::Membership,
-        DuesClass::Tuition,
-        DuesClass::SecurityFee,
-        DuesClass::Gift,
-        DuesClass::Event,
-        DuesClass::Sale,
-        DuesClass::Other,
-    ];
-    let by_class: Vec<FinancialClassRow> = CLASS_ORDER
+    // Money in over time (all billed households). The in-progress current year is partial.
+    let by_year: Vec<FinancialYearRow> = year_totals
         .iter()
-        .filter_map(|class| {
-            let (key, label) = class_label(*class);
-            let (billed, received) = by_class.get(key).copied().unwrap_or((0.0, 0.0));
-            (billed > 0.0 || received > 0.0).then(|| FinancialClassRow {
-                key: key.to_string(),
-                label: label.to_string(),
-                billed,
-                received,
-            })
+        .map(|(&fy, &(billed, received))| FinancialYearRow { fy, complete: fy < cur, billed, received })
+        .collect();
+    let mut by_year_class: Vec<FinancialYearClassRow> = Vec::new();
+    for &fy in year_totals.keys() {
+        for class in CLASS_ORDER {
+            let (key, label) = class_label(class);
+            let received = year_class.get(&(fy, key)).copied().unwrap_or(0.0);
+            if received > 0.0 {
+                by_year_class.push(FinancialYearClassRow { fy, key: key.to_string(), label: label.to_string(), received });
+            }
+        }
+    }
+
+    // Per-cohort value in `fiscal_year`: total and size-adjusted per-household. The whole
+    // cohort (not only its payers) is the denominator, so the average is comparable.
+    let mut cohort_agg: std::collections::BTreeMap<i32, (i64, f64)> = std::collections::BTreeMap::new();
+    for (i, (_, cohort)) in current.iter().enumerate() {
+        if let Some(c) = cohort {
+            let entry = cohort_agg.entry(*c).or_default();
+            entry.0 += 1;
+            entry.1 += per_hh[i].1;
+        }
+    }
+    let by_cohort: Vec<FinancialCohortRow> = cohort_agg
+        .into_iter()
+        .map(|(cohort, (households, received))| FinancialCohortRow {
+            cohort,
+            households,
+            received,
+            received_per_household: if households > 0 { (received / households as f64 * 100.0).round() / 100.0 } else { 0.0 },
         })
         .collect();
 
-    // Concentration: rank by cash received (billed as a fallback if no cash is recorded),
-    // then split the base into ten equal-count bands, top first, and run the Pareto curve.
+    // Concentration: rank members by cash received (billed as a fallback if no cash is
+    // recorded), then split into ten equal-count bands, top first, and run the Pareto curve.
     let rank_received = total_received > 0.0;
     per_hh.sort_by(|a, b| {
         let (primary_a, primary_b) = if rank_received { (a.1, b.1) } else { (a.0, b.0) };
@@ -3317,7 +3368,9 @@ fn financials(store: &Store, hh: &[Hh], cur: i32) -> Result<Option<Financials>> 
         paying_households,
         total_billed,
         total_received,
-        by_class,
+        by_year,
+        by_year_class,
+        by_cohort,
         concentration,
     }))
 }
@@ -3820,7 +3873,7 @@ const INSIGHTS_CACHE_KEY: &str = "insights_cache";
 /// everything the read model reads, only the cached read model is stale. Serde treats a
 /// missing `Option` field as `None`, so without this an added optional field (e.g.
 /// `financials`) would deserialize from an older cache as absent and never recompute.
-const READ_MODEL_REVISION: u32 = 2;
+const READ_MODEL_REVISION: u32 = 3;
 
 /// Cache-validity fingerprint: the mart schema plus the read-model revision. A change to
 /// either invalidates the persisted insights cache.
@@ -5560,51 +5613,45 @@ mod tests {
     }
 
     #[test]
-    fn financials_rank_by_received_split_the_mix_and_close_the_pareto() {
+    fn financials_trend_cohorts_and_concentration() {
         let (_d, mut s) = mem();
-        // Ten current member households, each billed in FY2025 (statement dated Sep 2024).
-        let ids = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
-        let statements: Vec<Row> = ids
-            .iter()
-            .map(|id| {
-                row(&[
-                    ("Id", format!("st{id}").as_str()),
-                    ("Account__c", format!("acc{id}").as_str()),
-                    ("Date__c", "2024-09-01"),
-                ])
-            })
-            .collect();
-        let mut lines: Vec<Row> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                let (billed, received): (i64, i64) = match i {
-                    0 => (1000, 1000),
-                    1 => (1000, 500),
-                    _ => (250, 250),
-                };
-                row(&[
-                    ("Id", format!("dl{id}").as_str()),
-                    ("BillingStatement__c", format!("st{id}").as_str()),
-                    ("Billing_PrimaryProductFamily__c", "Dues"),
-                    ("Billing_PrimaryProductName__c", "Membership Dues"),
-                    ("Charges__c", billed.to_string().as_str()),
-                    ("Billing_ReceivedAmount__c", received.to_string().as_str()),
-                    ("Billing_Balance__c", (billed - received).to_string().as_str()),
-                ])
-            })
-            .collect();
-        // One tuition line on accA, so the revenue mix has a second class and accA is the
-        // single biggest total payer.
-        lines.push(row(&[
-            ("Id", "tlA"),
-            ("BillingStatement__c", "stA"),
-            ("Billing_PrimaryProductFamily__c", "Tuition"),
-            ("Billing_PrimaryProductName__c", "Religious School Tuition"),
-            ("Charges__c", "2000"),
-            ("Billing_ReceivedAmount__c", "2000"),
-            ("Billing_Balance__c", "0"),
-        ]));
+        let stmt = |id: &str, acc: &str, date: &str| {
+            row(&[("Id", id), ("Account__c", acc), ("Date__c", date)])
+        };
+        let line = |id: &str, parent: &str, fam: &str, name: &str, billed: i64, received: i64| {
+            row(&[
+                ("Id", id),
+                ("BillingStatement__c", parent),
+                ("Billing_PrimaryProductFamily__c", fam),
+                ("Billing_PrimaryProductName__c", name),
+                ("Charges__c", &billed.to_string()),
+                ("Billing_ReceivedAmount__c", &received.to_string()),
+                ("Billing_Balance__c", &(billed - received).to_string()),
+            ])
+        };
+        let mut statements: Vec<Row> = Vec::new();
+        let mut lines: Vec<Row> = Vec::new();
+        // FY2026 (dated Sep 2025): the latest-complete snapshot year, ten current members.
+        for i in 0..10 {
+            let (st, acc) = (format!("st26_{i}"), format!("acc{i}"));
+            statements.push(stmt(&st, &acc, "2025-09-01"));
+            let (billed, received) = match i {
+                0 => (1000, 1000),
+                1 => (1000, 500),
+                _ => (250, 250),
+            };
+            lines.push(line(&format!("l26_{i}"), &st, "Dues", "Membership Dues", billed, received));
+        }
+        // FY2025 (dated Sep 2024): a non-member's gift plus one member's dues — proves the
+        // trend counts every billed household (institutional), not only today's members.
+        statements.push(stmt("st25_X", "accX", "2024-09-01"));
+        lines.push(line("l25_X", "st25_X", "Gift", "Annual Gift", 5000, 4000));
+        statements.push(stmt("st25_0", "acc0", "2024-09-01"));
+        lines.push(line("l25_0", "st25_0", "Dues", "Membership Dues", 900, 900));
+        // FY2027 (dated Sep 2026): the in-progress year — its totals are partial.
+        statements.push(stmt("st27_0", "acc0", "2026-09-01"));
+        lines.push(line("l27_0", "st27_0", "Dues", "Membership Dues", 100, 0));
+
         seed_object(&mut s, "BillingStatement__c", &["Id", "Account__c", "Date__c"], &statements);
         seed_object(
             &mut s,
@@ -5620,33 +5667,52 @@ mod tests {
             ],
             &lines,
         );
-        let hh: Vec<Hh> = ids
-            .iter()
-            .map(|id| Hh { account_id: format!("acc{id}"), is_current: true, ..Default::default() })
+        // Ten current members split across two join cohorts, plus one non-member.
+        let mut hh: Vec<Hh> = (0..10)
+            .map(|i| Hh {
+                account_id: format!("acc{i}"),
+                is_current: true,
+                join_fy: Some(if i < 5 { 2020 } else { 2024 }),
+                ..Default::default()
+            })
             .collect();
+        hh.push(Hh { account_id: "accX".into(), is_current: false, join_fy: Some(2018), ..Default::default() });
 
-        let fin = financials(&s, &hh, 2026).unwrap().expect("financials present");
-        assert_eq!(fin.fiscal_year, 2025);
+        let fin = financials(&s, &hh, 2027).unwrap().expect("financials present");
+
+        // Latest-complete member snapshot.
+        assert_eq!(fin.fiscal_year, 2026);
         assert_eq!(fin.households, 10);
         assert_eq!(fin.paying_households, 10);
-        assert_eq!(fin.total_billed, 6000.0);
-        assert_eq!(fin.total_received, 5500.0);
-        // Revenue mix: dues first, then tuition; collection gap lives in billed vs received.
-        assert_eq!(fin.by_class.len(), 2);
-        assert_eq!(fin.by_class[0].key, "membership");
-        assert_eq!(fin.by_class[0].billed, 4000.0);
-        assert_eq!(fin.by_class[0].received, 3500.0);
-        assert_eq!(fin.by_class[1].key, "tuition");
-        assert_eq!(fin.by_class[1].received, 2000.0);
-        // Top decile is the single biggest payer (accA: 3000 received of 5500, 3000 billed of 6000).
-        let top = &fin.concentration[0];
-        assert_eq!(top.households, 1);
-        assert_eq!(top.received_share, 54.5);
-        assert_eq!(top.billed_share, 50.0);
-        // The Pareto curve closes at 100%.
-        let last = fin.concentration.last().unwrap();
-        assert_eq!(last.cumulative_received_share, 100.0);
-        assert_eq!(last.cumulative_billed_share, 100.0);
+        assert_eq!(fin.total_billed, 4000.0);
+        assert_eq!(fin.total_received, 3500.0);
+
+        // Money over time, institutional: FY2025 received includes the non-member's $4,000
+        // gift; FY2027 is in progress.
+        let year = |fy: i32| fin.by_year.iter().find(|r| r.fy == fy).unwrap();
+        assert_eq!(year(2025).received, 4900.0);
+        assert!(year(2025).complete);
+        assert_eq!(year(2026).received, 3500.0);
+        assert!(!year(2027).complete);
+        assert_eq!(year(2027).billed, 100.0);
+        // Where it comes in over time: FY2025 had a big gift year alongside dues.
+        let cell = |fy: i32, key: &str| fin.by_year_class.iter().find(|r| r.fy == fy && r.key == key).unwrap().received;
+        assert_eq!(cell(2025, "gift"), 4000.0);
+        assert_eq!(cell(2025, "membership"), 900.0);
+
+        // Per-cohort value in FY2026: the newer 2024 cohort is worth less per household here.
+        let cohort = |c: i32| fin.by_cohort.iter().find(|r| r.cohort == c).unwrap();
+        assert_eq!(cohort(2020).households, 5);
+        assert_eq!(cohort(2020).received, 2250.0);
+        assert_eq!(cohort(2020).received_per_household, 450.0);
+        assert_eq!(cohort(2024).households, 5);
+        assert_eq!(cohort(2024).received_per_household, 250.0);
+
+        // Concentration: top decile is the single biggest payer (acc0: 1000 of 3500).
+        assert_eq!(fin.concentration[0].households, 1);
+        assert_eq!(fin.concentration[0].received_share, 28.6);
+        assert_eq!(fin.concentration.last().unwrap().cumulative_received_share, 100.0);
+
         // No complete fiscal year before the in-progress one -> nothing to report.
         assert!(financials(&s, &hh, 2025).unwrap().is_none());
     }

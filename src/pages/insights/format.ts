@@ -5,6 +5,13 @@ export const fmt = (n: number) => n.toLocaleString();
 /** Whole-dollar currency, e.g. $1,234,000. Financial figures are aggregate totals, so
  *  cents add noise; round to the dollar. */
 export const fmtMoney = (n: number) => n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+/** Compact currency for axis ticks: $1.2M, $340K, $920. Keeps a money axis narrow. */
+export const fmtMoneyShort = (n: number) => {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `$${(n / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1)}M`;
+  if (abs >= 1_000) return `$${Math.round(n / 1_000)}K`;
+  return `$${Math.round(n)}`;
+};
 
 /** 7-step sequential ramp index for a retention percentage: 30% -> 0, 90% -> 6. */
 export function heatStep(pct: number): number {

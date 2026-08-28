@@ -30,7 +30,7 @@ vi.mock("./insights/charts", () => {
   return {
     TrendChart: N, FlowsChart: N, Year1Chart: N, CohortHeatmap: N, CohortMakeupChart: N,
     HBarChart: N, ReasonsHeatmap: N, OutcomeByTenureChart: N, DuesChart: N,
-    ConcentrationChart: N, RevenueMixChart: N,
+    ConcentrationChart: N, MoneyOverTimeChart: N, ClassOverTimeChart: N, CohortValueChart: N,
     TableView: ({ rows, columns, getRowKey }: { rows: unknown[]; columns: Col[]; getRowKey: (r: unknown) => string }) => (
       <div data-testid="table">
         {rows.map((r) => (
@@ -141,11 +141,20 @@ describe("InsightsPage", () => {
 
   it("renders the financials tab from aggregate figures when billing is available", async () => {
     const financials: api.Financials = {
-      fiscal_year: 2025, households: 100, paying_households: 90,
+      fiscal_year: 2026, households: 100, paying_households: 90,
       total_billed: 200000, total_received: 180000,
-      by_class: [
-        { key: "membership", label: "Dues", billed: 150000, received: 140000 },
-        { key: "tuition", label: "Tuition", billed: 50000, received: 40000 },
+      by_year: [
+        { fy: 2025, complete: true, billed: 150000, received: 140000 },
+        { fy: 2026, complete: true, billed: 200000, received: 180000 },
+        { fy: 2027, complete: false, billed: 50000, received: 10000 },
+      ],
+      by_year_class: [
+        { fy: 2025, key: "membership", label: "Dues", received: 120000 },
+        { fy: 2026, key: "membership", label: "Dues", received: 150000 },
+      ],
+      by_cohort: [
+        { cohort: 2020, households: 60, received: 108000, received_per_household: 1800 },
+        { cohort: 2024, households: 40, received: 72000, received_per_household: 1800 },
       ],
       concentration: Array.from({ length: 10 }, (_, i) => ({
         decile: i + 1, households: 10, billed_share: 10, received_share: 10,
@@ -156,12 +165,12 @@ describe("InsightsPage", () => {
     render(<InsightsPage {...props} />);
     await screen.findByText("Membership over time");
     fireEvent.click(screen.getByRole("button", { name: "Financials" }));
-    // All three panels render, and the collection figures read off the totals.
-    expect(screen.getByText("Who carries the dues base")).toBeTruthy();
-    expect(screen.getByText("Where the money comes in")).toBeTruthy();
-    expect(screen.getByText("Collection: billed vs received")).toBeTruthy();
-    expect(screen.getByText("$180,000")).toBeTruthy(); // total received
-    expect(screen.getByText("$20,000")).toBeTruthy();   // outstanding = billed - received
+    // All four panels render, and figures read off the aggregates.
+    expect(screen.getByText("Money in over time")).toBeTruthy();
+    expect(screen.getByText("Where the money comes in over time")).toBeTruthy();
+    expect(screen.getByText("Who carries the base")).toBeTruthy();
+    expect(screen.getByText("Cohort value")).toBeTruthy();
+    expect(screen.getAllByText("$180,000").length).toBeGreaterThan(0); // latest complete year received
   });
 
   it("shows an unavailable state when an optional source is not synced", async () => {

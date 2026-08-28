@@ -4,9 +4,9 @@ import {
   Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import type { RenderableText } from "recharts";
-import type { CohortCell, CohortMakeupRow, CohortYear1, ConcentrationRow, DuesRow, FinancialClassRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
+import type { CohortCell, CohortMakeupRow, CohortYear1, ConcentrationRow, DuesRow, FinancialCohortRow, FinancialYearClassRow, FinancialYearRow, OutcomeByTenureRow, ReasonCell, TrendRow } from "../../api";
 import { Table } from "../../design-system";
-import { fmt, fmtMoney, fyLabel, heatInk, heatStep } from "./format";
+import { fmt, fmtMoney, fmtMoneyShort, fyLabel, heatInk, heatStep } from "./format";
 
 /* Palette — validated with dataviz/scripts/validate_palette.js (light, white surface).
    Hex values are the design-system tokens named beside them. Do not reorder. */
@@ -205,20 +205,75 @@ export function ConcentrationChart({ rows }: { rows: ConcentrationRow[] }) {
   );
 }
 
-/** Where the money comes in, by product class: received (cash in, colored) over billed
-    (charged, grey) so the gap between the two bars is the uncollected amount for that class. */
-export function RevenueMixChart({ rows }: { rows: FinancialClassRow[] }) {
-  const data = rows.map((r) => ({ label: r.label, Received: r.received, Billed: r.billed }));
+/** Money in over time: cash received (colored) beside amount billed (grey) per complete
+    fiscal year, so both growth and the widening/narrowing collection gap read at a glance. */
+export function MoneyOverTimeChart({ rows }: { rows: FinancialYearRow[] }) {
+  const data = rows.map((r) => ({ fy: fyLabel(r.fy), Received: r.received, Billed: r.billed }));
   return (
-    <ResponsiveContainer width="100%" height={44 * rows.length + 44}>
-      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 16, bottom: 0, left: 8 }} barGap={2} barCategoryGap="30%">
-        <CartesianGrid horizontal={false} stroke={PALETTE.grid} />
-        <XAxis type="number" tick={axisTick} tickLine={false} axisLine={false} tickFormatter={(v: number) => fmtMoney(v)} />
-        <YAxis type="category" dataKey="label" width={150} tick={axisTick} tickLine={false} axisLine={false} />
+    <ResponsiveContainer width="100%" height={260}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 8 }} barGap={2} barCategoryGap="30%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={56} tickFormatter={(v: number) => fmtMoneyShort(v)} />
         <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [fmtMoney(Number(v)), name]} />
         <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
-        <Bar dataKey="Received" fill={PALETTE.series[4]} radius={[0, 4, 4, 0]} maxBarSize={14} isAnimationActive={false} />
-        <Bar dataKey="Billed" fill={PALETTE.deemphasis} radius={[0, 4, 4, 0]} maxBarSize={14} isAnimationActive={false} />
+        <Bar dataKey="Received" fill={PALETTE.series[4]} radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} />
+        <Bar dataKey="Billed" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Colors for the product classes, in the backend's dues-first order. */
+const CLASS_COLORS = [...PALETTE.series, PALETTE.other];
+
+/** Where the money comes in over time: received per product class, stacked per fiscal year,
+    so a one-off gift year or steady dues growth stands out. Pivots the flat (fy, class) rows. */
+export function ClassOverTimeChart({ rows }: { rows: FinancialYearClassRow[] }) {
+  const fys = [...new Set(rows.map((r) => r.fy))].sort((a, b) => a - b);
+  // First-seen order preserves the backend's dues-first class ordering.
+  const classes = [...new Map(rows.map((r) => [r.key, r.label])).entries()];
+  const data = fys.map((fy) => {
+    const o: Record<string, number | string> = { fy: fyLabel(fy) };
+    for (const [key, label] of classes) o[label] = rows.find((r) => r.fy === fy && r.key === key)?.received ?? 0;
+    return o;
+  });
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 8 }} barCategoryGap="30%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={56} tickFormatter={(v: number) => fmtMoneyShort(v)} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, name) => [fmtMoney(Number(v)), name]} />
+        <Legend wrapperStyle={{ fontSize: 12, fontFamily: "var(--font-body)" }} formatter={(value) => <span style={{ color: "var(--text-secondary)" }}>{value}</span>} />
+        {classes.map(([key, label], i) => (
+          <Bar key={key} dataKey={label} stackId="a" fill={CLASS_COLORS[i % CLASS_COLORS.length]} maxBarSize={48} isAnimationActive={false} stroke="#fff" strokeWidth={1}
+            radius={i === classes.length - 1 ? [4, 4, 0, 0] : undefined} />
+        ))}
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Per-cohort value: average money received per household by join cohort in the latest
+    complete year, so cohorts of different sizes compare directly. Two newest emphasized. */
+export function CohortValueChart({ rows, emphasize }: { rows: FinancialCohortRow[]; emphasize: number[] }) {
+  const data = rows.map((r) => ({
+    fy: fyLabel(r.cohort),
+    main: emphasize.includes(r.cohort) ? r.received_per_household : null,
+    rest: emphasize.includes(r.cohort) ? null : r.received_per_household,
+    total: r.received,
+    households: r.households,
+  }));
+  return (
+    <ResponsiveContainer width="100%" height={240}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 8 }} barCategoryGap="35%">
+        <CartesianGrid vertical={false} stroke={PALETTE.grid} />
+        <XAxis dataKey="fy" tick={axisTick} tickLine={false} axisLine={{ stroke: PALETTE.grid }} />
+        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={56} tickFormatter={(v: number) => fmtMoneyShort(v)} />
+        <Tooltip contentStyle={tooltipStyle} formatter={(v, _name, item: { payload?: { total?: number; households?: number } }) => [`${fmtMoney(Number(v))} per household · ${fmtMoney(item.payload?.total ?? 0)} from ${fmt(item.payload?.households ?? 0)}`, "Received"]} />
+        <Bar dataKey="rest" stackId="a" fill={PALETTE.deemphasis} radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
+        <Bar dataKey="main" stackId="a" fill={PALETTE.emphasis} radius={[4, 4, 0, 0]} maxBarSize={28} isAnimationActive={false} />
       </BarChart>
     </ResponsiveContainer>
   );
