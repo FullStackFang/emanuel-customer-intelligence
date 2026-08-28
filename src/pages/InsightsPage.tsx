@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import type { PageProps } from "../App";
 import * as api from "../api";
 import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
@@ -18,6 +19,20 @@ function SoWhat({ text }: { text: string }) {
 
 function Lede({ children }: { children: string }) {
   return <p style={{ margin: "0 0 var(--space-3)", fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>{children}</p>;
+}
+
+/**
+ * The aggregate summary row that heads a tab — the high-level KPIs for whatever section is open.
+ * Sits directly under the sticky tab bar as the first child of each section, so switching tabs
+ * swaps the headline stats with the content. Responsive: tiles wrap on narrow widths and compose
+ * into the PDF ahead of their section (no screen-only gating).
+ */
+function TabStats({ children }: { children: ReactNode }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
+      {children}
+    </div>
+  );
 }
 
 function Unavailable({ column }: { column: string }) {
@@ -268,6 +283,23 @@ export default function InsightsPage({ status }: PageProps) {
   const latestTwo = ins ? ins.year1.slice(-2).map((r) => r.cohort) : [];
   const makeupLatestTwo = ins ? ins.cohort_makeup.slice(-2).map((r) => r.cohort) : [];
   const makeupUndated = ins ? ins.kpis.members_now - ins.cohort_makeup.reduce((sum, r) => sum + r.current, 0) : 0;
+  // Jobs tab headline aggregates: the joiner window is grouped mutually-exclusively by how many
+  // reasons a household stated, so those counts sum to a clean denominator (channels double-count
+  // households under every reason they named). The top entry job is the best-retained reason above
+  // a small count floor, so a one-household reason at 100% never wins.
+  const jobsTotal = ins ? ins.multi_job.reduce((sum, r) => sum + r.n, 0) : 0;
+  const jobsStill = ins ? ins.multi_job.reduce((sum, r) => sum + r.still_members, 0) : 0;
+  const jobsRetainedPct = jobsTotal > 0 ? Math.round((1000 * jobsStill) / jobsTotal) / 10 : 0;
+  const topChannel = ins && ins.channels.length
+    ? [...ins.channels].sort((a, b) => b.pct - a.pct).find((c) => c.n >= 20) ?? [...ins.channels].sort((a, b) => b.n - a.n)[0]
+    : undefined;
+  const topJobsBucket = ins && ins.multi_job.length ? ins.multi_job.reduce((m, r) => (r.jobs > m.jobs ? r : m)) : undefined;
+
+  // Renewal tab headline aggregates: the most recent dues year on record, and the best-retained
+  // Relationship Anchor. Each is gated on its own source below, so a tile only appears with data.
+  const duesLatest = ins && ins.dues.length ? ins.dues[ins.dues.length - 1] : undefined;
+  const topAnchor = ins && ins.anchor_type.length ? [...ins.anchor_type].sort((a, b) => b.pct - a.pct)[0] : undefined;
+
   const fin = ins?.financials ?? null;
   const finYears = fin ? fin.by_year.filter((r) => r.complete) : [];
   const finCompleteFys = new Set(finYears.map((r) => r.fy));
@@ -286,26 +318,6 @@ export default function InsightsPage({ status }: PageProps) {
   return (
     <div style={{ width: "100%", maxWidth: 1180, margin: "0 auto" }}>
       <div className="insights-screen-only">
-        <PageTitle eyebrow="Customer Intelligence" title="Insights" actions={
-          <MenuButton disabled={busy !== null} items={[
-            { key: "pdf", label: "Download PDF report", icon: "file-text", disabled: !ins, onSelect: () => void doPdf() },
-            { divider: true },
-            ...api.INSIGHT_VIEWS.map((v) => ({ key: v, label: `CSV · ${VIEW_LABELS[v]}`, icon: "table", disabled: !ins, onSelect: () => void doExport(v) })),
-            { divider: true },
-            { key: "rebuild", label: "Rebuild insights", icon: "refresh-cw", onSelect: () => void load(true) },
-          ]}>
-            {busy === "pdf" ? "Rendering…" : busy === "export" ? "Exporting…" : busy === "rebuild" ? "Rebuilding…" : "Export"}
-          </MenuButton>
-        } />
-        <div style={{ fontSize: "var(--text-xs)", color: "var(--text-tertiary)", marginTop: "calc(-1 * var(--space-4))", marginBottom: "var(--space-4)" }}>
-          Built {built} · fiscal years run June 1 – May 31 and are labeled by the year they end
-          {riskBusy && (
-            <span style={{ marginLeft: "var(--space-2)", display: "inline-flex", alignItems: "center", gap: "var(--space-1)" }}>
-              · <span className="app-spinner" style={{ width: "0.8em", height: "0.8em" }} aria-hidden />
-              {riskProgress ? `Risk analysis: step ${riskProgress.step} of ${riskProgress.steps} · ${elapsed}` : `Risk analysis running · ${elapsed}`}
-            </span>
-          )}
-        </div>
         {ins && rebuilding && (
           <Alert tone="info" style={{ marginBottom: "var(--space-4)" }}>
             Rebuilding insights from the latest sync — showing the previous build until it finishes.
@@ -345,24 +357,42 @@ export default function InsightsPage({ status }: PageProps) {
             <div style={{ fontFamily: "var(--font-display)", fontSize: "var(--text-2xl)", fontWeight: "var(--font-semibold)", color: "var(--text-primary)" }}>Membership Insights</div>
             <div style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>Built {built} · {fyLabel(ins.current_fy)} in progress · report generated {new Date().toLocaleDateString()}</div>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-5)" }}>
+          <div ref={tabsRef} className="insights-screen-only" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--space-3)", flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg-secondary)", paddingTop: "var(--space-3)", paddingBottom: "var(--space-3)", marginBottom: "var(--space-2)" }}>
+            <div role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
+              {(["overview", "jobs", "renewal", "geography", "financials", "risk"] as const).map((key) => (
+                <Button key={key} size="sm" variant={tab === key ? "primary" : "secondary"} onClick={() => { if (key === tab) return; setTab(key); scrollScrollportToTop(tabsRef.current); }}>
+                  {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : key === "geography" ? "Geography" : key === "financials" ? "Financials" : "Risk"}
+                </Button>
+              ))}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", marginLeft: "auto" }}>
+              {riskBusy && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-1)", fontSize: "var(--text-xs)", color: "var(--text-tertiary)", whiteSpace: "nowrap" }}>
+                  <span className="app-spinner" style={{ width: "0.8em", height: "0.8em" }} aria-hidden />
+                  {riskProgress ? `Risk analysis: step ${riskProgress.step} of ${riskProgress.steps} · ${elapsed}` : `Risk analysis running · ${elapsed}`}
+                </span>
+              )}
+              <MenuButton disabled={busy !== null} items={[
+                { key: "pdf", label: "Download PDF report", icon: "file-text", disabled: !ins, onSelect: () => void doPdf() },
+                { divider: true },
+                ...api.INSIGHT_VIEWS.map((v) => ({ key: v, label: `CSV · ${VIEW_LABELS[v]}`, icon: "table", disabled: !ins, onSelect: () => void doExport(v) })),
+                { divider: true },
+                { key: "rebuild", label: "Rebuild insights", icon: "refresh-cw", onSelect: () => void load(true) },
+              ]}>
+                {busy === "pdf" ? "Rendering…" : busy === "export" ? "Exporting…" : busy === "rebuild" ? "Rebuilding…" : "Export"}
+              </MenuButton>
+            </div>
+          </div>
+
+          {/* ── Overview ─────────────────────────────────────────────────────── */}
+          <div className={renderingPdf || tab === "overview" ? "insights-overview" : "insights-overview insights-overview-hidden"}>
+          <TabStats>
             <Stat label="Member households" value={fmt(ins.kpis.members_now)} sub={`${ins.kpis.net_vs_prior_fy >= 0 ? "+" : ""}${fmt(ins.kpis.net_vs_prior_fy)} vs ${fyLabel(ins.current_fy - 1)} · ${fyLabel(ins.current_fy)} in progress`} icon="users" tone="primary" />
             <Stat label={`Joins ${fyLabel(ins.current_fy)}`} value={fmt(ins.kpis.joins_this_fy)} sub="fiscal year to date" icon="user-plus" tone="success" />
             <Stat label={`Resignations ${fyLabel(ins.current_fy)}`} value={fmt(ins.kpis.resigns_this_fy)} sub="fiscal year to date" icon="user-minus" tone="neutral" />
             <Stat label="First-year retention" value={`${ins.kpis.year1_pct}%`} sub={`${fyLabel(ins.kpis.year1_cohort)} cohort · baseline ${ins.kpis.year1_baseline_pct}%`} icon="repeat" tone="primary" />
             <Stat label="Households at risk" value={fmt(ins.kpis.at_risk_count)} sub="current members matching a churn pattern" icon="triangle-alert" tone="accent" />
-          </div>
-
-          <div ref={tabsRef} className="insights-screen-only" role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap", position: "sticky", top: 0, zIndex: 5, background: "var(--bg-secondary)", paddingTop: "var(--space-3)", paddingBottom: "var(--space-3)", marginBottom: "var(--space-2)" }}>
-            {(["overview", "jobs", "renewal", "geography", "financials", "risk"] as const).map((key) => (
-              <Button key={key} size="sm" variant={tab === key ? "primary" : "secondary"} onClick={() => { if (key === tab) return; setTab(key); scrollScrollportToTop(tabsRef.current); }}>
-                {key === "overview" ? "Overview" : key === "jobs" ? "Jobs" : key === "renewal" ? "Renewal & Engagement" : key === "geography" ? "Geography" : key === "financials" ? "Financials" : "Risk"}
-              </Button>
-            ))}
-          </div>
-
-          {/* ── Overview ─────────────────────────────────────────────────────── */}
-          <div className={renderingPdf || tab === "overview" ? "insights-overview" : "insights-overview insights-overview-hidden"}>
+          </TabStats>
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Membership over time</CardTitle></CardHeader>
             <Lede>Active member households at the end of each fiscal year, and the joins and resignations behind them. The current fiscal year is in progress.</Lede>
@@ -439,6 +469,14 @@ export default function InsightsPage({ status }: PageProps) {
 
           {/* ── Jobs ─────────────────────────────────────────────────────────── */}
           <div className={sectionClass("jobs")}>
+          {!missing("Join_Reason__c") && jobsTotal > 0 && (
+            <TabStats>
+              <Stat label="Households analyzed" value={fmt(jobsTotal)} sub="joined 4–12 fiscal years ago" icon="users" tone="primary" />
+              {topChannel && <Stat label="Top entry job" value={topChannel.label} sub={`${topChannel.pct}% still members`} icon="repeat" tone="success" />}
+              <Stat label="Still members" value={`${jobsRetainedPct}%`} sub="across the joiner window" icon="activity" tone="neutral" />
+              {topJobsBucket && <Stat label="Most reasons stated" value={`${topJobsBucket.pct}%`} sub={`${topJobsBucket.bucket} · still members`} icon="layers" tone="primary" />}
+            </TabStats>
+          )}
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Stickiness by Entry Job</CardTitle></CardHeader>
             {missing("Join_Reason__c") ? <Unavailable column="Join_Reason__c" /> : (
@@ -540,6 +578,18 @@ export default function InsightsPage({ status }: PageProps) {
 
           {/* ── Renewal & Engagement ─────────────────────────────────────────── */}
           <div className={sectionClass("renewal")}>
+          {((capOn("renewal") && duesLatest) || topAnchor) && (
+            <TabStats>
+              {capOn("renewal") && duesLatest && (
+                <>
+                  <Stat label={`Dues billed ${fyLabel(duesLatest.fy)}`} value={fmt(duesLatest.billed)} sub={`of ${fmt(duesLatest.active)} active households`} icon="badge-dollar-sign" tone="primary" />
+                  <Stat label="Coverage missing" value={fmt(duesLatest.coverage_missing)} sub="no dues line found while active" icon="triangle-alert" tone="accent" />
+                  <Stat label="Settled (eventual)" value={fmt(duesLatest.settled)} sub="of the households billed" icon="circle-check" tone="success" />
+                </>
+              )}
+              {topAnchor && <Stat label="Top anchor" value={topAnchor.label} sub={`${topAnchor.pct}% still active`} icon="anchor" tone="neutral" />}
+            </TabStats>
+          )}
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Dues renewal state</CardTitle></CardHeader>
             {!capOn("renewal") ? <Unavailable column="BillingStatement__c and BillingStatementLine__c" /> : (
@@ -608,14 +658,14 @@ export default function InsightsPage({ status }: PageProps) {
             </Card>
           ) : (
             <>
+              <TabStats>
+                <Stat label={`Received ${fyLabel(fin.fiscal_year)}`} value={fmtMoney(finLatest?.received ?? 0)} sub="latest complete year" icon="badge-dollar-sign" tone="success" />
+                <Stat label="Collected" value={`${finLatest && finLatest.billed > 0 ? Math.round((1000 * finLatest.received) / finLatest.billed) / 10 : 0}%`} sub="of amount billed" icon="percent" tone="primary" />
+                <Stat label="Year over year" value={finYoyPct === null ? "—" : `${finYoyPct >= 0 ? "+" : ""}${finYoyPct}%`} sub={finPrior ? `received vs ${fyLabel(finPrior.fy)}` : "no prior year"} icon="trending-up" tone={finYoyPct !== null && finYoyPct < 0 ? "accent" : "success"} />
+              </TabStats>
               <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
                 <CardHeader><CardTitle>Money in over time</CardTitle></CardHeader>
                 <Lede>{`Every dollar billed and received each fiscal year, across all billed households — not only today's members, so earlier years aren't understated. Billing begins in FY2023, so the window is short and that first year reflects only partial coverage; the in-progress year is left off the bars because its totals are partial too.`}</Lede>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
-                  <Stat label={`Received ${fyLabel(fin.fiscal_year)}`} value={fmtMoney(finLatest?.received ?? 0)} sub="latest complete year" icon="badge-dollar-sign" tone="success" />
-                  <Stat label="Collected" value={`${finLatest && finLatest.billed > 0 ? Math.round((1000 * finLatest.received) / finLatest.billed) / 10 : 0}%`} sub="of amount billed" icon="percent" tone="primary" />
-                  <Stat label="Year over year" value={finYoyPct === null ? "—" : `${finYoyPct >= 0 ? "+" : ""}${finYoyPct}%`} sub={finPrior ? `received vs ${fyLabel(finPrior.fy)}` : "no prior year"} icon="trending-up" tone={finYoyPct !== null && finYoyPct < 0 ? "accent" : "success"} />
-                </div>
                 <MoneyOverTimeChart rows={finYears} />
                 <TableView rows={fin.by_year} getRowKey={(r) => String(r.fy)} columns={[
                   { key: "fy", header: "Fiscal year", render: (r) => `${fyLabel(r.fy)}${r.complete ? "" : " (partial)"}` },
@@ -665,6 +715,14 @@ export default function InsightsPage({ status }: PageProps) {
 
           {/* ── Risk ─────────────────────────────────────────────────────────── */}
           <div className={sectionClass("risk")}>
+          {risk && risk.available && (
+            <TabStats>
+              <Stat label="ROC-AUC" value={risk.roc_auc.toFixed(3)} sub="discrimination (≥ 0.65)" icon="activity" tone="primary" />
+              <Stat label="Top-decile lift" value={`${risk.top_decile_lift.toFixed(2)}×`} sub="vs base rate (≥ 2.0)" icon="trending-up" tone="success" />
+              <Stat label="Brier score" value={risk.brier.toFixed(4)} sub={`baseline ${risk.baseline_brier.toFixed(4)}`} icon="target" tone="neutral" />
+              <Stat label="Watch List" value={fmt(risk.watch_list_count)} sub="evidence-gated households" icon="list-checks" tone="accent" />
+            </TabStats>
+          )}
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Validated churn risk</CardTitle></CardHeader>
             {riskFailed ? (
@@ -677,15 +735,7 @@ export default function InsightsPage({ status }: PageProps) {
             ) : risk === null ? (
               <Lede>Waiting for insights to load…</Lede>
             ) : risk.available ? (
-              <>
-                <Lede>A regularized logistic model of Addressable Churn passed rolling historical validation. Scores rank current households; they are associations from history, not predictions that any household will resign.</Lede>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "var(--space-3)", marginBottom: "var(--space-3)" }}>
-                  <Stat label="ROC-AUC" value={risk.roc_auc.toFixed(3)} sub="discrimination (≥ 0.65)" icon="activity" tone="primary" />
-                  <Stat label="Top-decile lift" value={`${risk.top_decile_lift.toFixed(2)}×`} sub="vs base rate (≥ 2.0)" icon="trending-up" tone="success" />
-                  <Stat label="Brier score" value={risk.brier.toFixed(4)} sub={`baseline ${risk.baseline_brier.toFixed(4)}`} icon="target" tone="neutral" />
-                  <Stat label="Watch List" value={fmt(risk.watch_list_count)} sub="evidence-gated households" icon="list-checks" tone="accent" />
-                </div>
-              </>
+              <Lede>A regularized logistic model of Addressable Churn passed rolling historical validation. Scores rank current households; they are associations from history, not predictions that any household will resign.</Lede>
             ) : (
               <>
                 <Alert tone="warning" style={{ marginBottom: "var(--space-3)" }}>No validated household ranking. The model did not pass every validation gate, so no household scores or names are produced. Aggregate evidence below still stands.</Alert>

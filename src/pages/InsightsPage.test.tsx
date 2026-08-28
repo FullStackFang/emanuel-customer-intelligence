@@ -139,6 +139,21 @@ describe("InsightsPage", () => {
     expect(jobs.className).not.toContain("insights-section-hidden");
   });
 
+  it("heads each tab with its own aggregate tiles that swap with the section", async () => {
+    render(<InsightsPage {...props} />);
+    await screen.findByText("Membership over time");
+    // The Overview headline tiles live inside the overview section, not in a fixed row above the tabs.
+    const overview = screen.getByText("Member households").closest(".insights-overview");
+    expect(overview).not.toBeNull();
+    expect(screen.getByText("Member households").closest("[role=tablist]")).toBeNull();
+    // The Jobs tab carries its own derived tiles inside the (currently hidden) jobs section.
+    const jobsTile = screen.getByText("Households analyzed").closest(".insights-section")!;
+    expect(jobsTile.className).toContain("insights-section-hidden");
+    expect(screen.getByText("Top entry job")).toBeTruthy(); // best-retained entry job, derived
+    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
+    expect(jobsTile.className).not.toContain("insights-section-hidden");
+  });
+
   it("renders the financials tab from aggregate figures when billing is available", async () => {
     const financials: api.Financials = {
       fiscal_year: 2026, households: 100, paying_households: 90,

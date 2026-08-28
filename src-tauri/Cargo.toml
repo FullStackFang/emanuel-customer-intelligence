@@ -60,6 +60,13 @@ tempfile = "3"
 # `cargo run --release --example time_insights` (see openspec optimize-insights-load).
 [profile.dev]
 opt-level = 1
+# Incremental compilation is DISABLED on purpose. Optimized incremental builds
+# (opt-level > 0 + incremental) periodically corrupt rustc's codegen-unit cache on
+# Windows/MSVC, producing `unresolved external symbol anon.*.llvm.*` LNK2001 errors
+# that only `cargo clean -p ...` clears. Turning incremental off eliminates that stale
+# cache entirely. Cost is small: only THIS crate does a full recompile per edit; the
+# heavy deps below (sqlcipher, smartcore, serde) stay cached at opt-level 3.
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 3
