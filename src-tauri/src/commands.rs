@@ -38,6 +38,10 @@ pub struct AppState {
     /// via kill_on_drop — and `chat_cancels` holds each stream's cooperative cancel flag.
     pub agents: AgentRegistry,
     pub chat_cancels: Mutex<HashMap<String, Cancel>>,
+    /// Keeps the non-blocking file-log writer's flush thread alive for the process lifetime.
+    /// Dropping it stops the rotating log sink, so it is held here and never taken. `None`
+    /// when file logging could not be initialized (stdout logging still applies).
+    pub _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 /// A short unique id with a role prefix (OS randomness, matching `secrets`/`auth`).
@@ -45,6 +49,161 @@ fn new_id(prefix: &str) -> String {
     let mut b = [0u8; 8];
     let _ = getrandom::fill(&mut b);
     format!("{prefix}-{}", hex::encode(b))
+}
+
+/// A per-action correlation id: an opaque `act-<hex>` token (OS randomness, carrying no
+/// household identity) that ties an audited action's log events to its audit row. See the
+/// request-correlation capability.
+fn new_cid() -> String {
+    new_id("act")
+}
+
+// ── record-level access auditing (pii-access-audit) ───────────────────────────
+// Each helper writes the audit row a command delegates to, so the audit-detail shape can be
+// unit-tested against a real Store without a Tauri runtime. The disclosed household set is
+// keyed on `account_id`; the household `name` is deliberately never written.
+
+/// Audit the at-risk read: the full disclosed household id set plus the count, tagged with the
+/// action's correlation id.
+fn audit_at_risk_access(s: &Store, w: &Who, cid: &str, rows: &[AtRiskRow]) -> anyhow::Result<()> {
+    let account_ids: Vec<&str> = rows.iter().map(|r| r.account_id.as_str()).collect();
+    s.audit(
+        w,
+        "insights.at_risk",
+        None,
+        Some(serde_json::json!({"cid": cid, "count": rows.len(), "account_ids": account_ids})),
+    )
+}
+
+/// Audit a Watch List read or export: the full disclosed household id set, the count, and
+/// availability. Never the household `name`.
+fn audit_watch_list_access(
+    s: &Store,
+    w: &Who,
+    cid: &str,
+    action: &str,
+    rows: &[risk::WatchRowView],
+    available: bool,
+) -> anyhow::Result<()> {
+    let account_ids: Vec<&str> = rows.iter().map(|r| r.account_id.as_str()).collect();
+    s.audit(
+        w,
+        action,
+        None,
+        Some(serde_json::json!({
+            "cid": cid, "count": rows.len(), "available": available, "account_ids": account_ids,
+        })),
+    )
+}
+
+/// Audit a read of the audit log itself — paging parameters only, no audit-row content. Written
+/// after the read (`list_audit` stays a pure read) so it never recurses.
+fn audit_audit_read(s: &Store, w: &Who, cid: &str, limit: i64, offset: i64) -> anyhow::Result<()> {
+    s.audit(
+        w,
+        "audit.read",
+        None,
+        Some(serde_json::json!({"cid": cid, "limit": limit, "offset": offset})),
+    )
+}
+
+/// Audit a listing of chat conversations — a count only, no titles or content.
+fn audit_chat_list_conversations(
+    s: &Store,
+    w: &Who,
+    cid: &str,
+    count: usize,
+) -> anyhow::Result<()> {
+    s.audit(
+        w,
+        "chat.list_conversations",
+        None,
+        Some(serde_json::json!({"cid": cid, "count": count})),
+    )
+}
+
+/// Audit opening a chat transcript — the conversation id and message count only, no content.
+fn audit_chat_list_messages(
+    s: &Store,
+    w: &Who,
+    cid: &str,
+    conversation_id: &str,
+    messages: usize,
+) -> anyhow::Result<()> {
+    s.audit(
+        w,
+        "chat.list_messages",
+        None,
+        Some(serde_json::json!({
+            "cid": cid, "conversation_id": conversation_id, "messages": messages,
+        })),
+    )
+}
+
+// ── chat retention (chat-retention) ───────────────────────────────────────────
+
+/// Maximum age of a stored chat message before age-based retention prunes it. A named,
+/// documented default (a retention *setting* UI is deferred). See the chat-retention capability.
+const CHAT_RETENTION_DAYS: i64 = 365;
+
+/// The retention cutoff timestamp (now − `CHAT_RETENTION_DAYS`) in the store's `created_at`
+/// format (RFC-3339, seconds, `Z`), so it compares directly against `_chat_messages.created_at`.
+fn chat_retention_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(CHAT_RETENTION_DAYS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Run a best-effort chat-retention prune: log the count on success, warn and swallow on
+/// failure so the caller's chat action still proceeds. The prune is a closure so the failure
+/// path is testable without corrupting a real store.
+fn best_effort_prune(cid: &str, prune: impl FnOnce() -> anyhow::Result<usize>) {
+    match prune() {
+        Ok(0) => {}
+        Ok(n) => {
+            tracing::info!(target: "chat_retention", cid, pruned = n, "pruned expired chat messages")
+        }
+        Err(e) => {
+            tracing::warn!(target: "chat_retention", cid, error = %e, "chat retention prune failed; continuing")
+        }
+    }
+}
+
+/// Apply age-based retention to stored chat, best-effort — a prune failure never fails the
+/// chat action.
+fn prune_chat_best_effort(s: &mut Store, cid: &str) {
+    let cutoff = chat_retention_cutoff();
+    best_effort_prune(cid, || s.prune_chat(&cutoff));
+}
+
+// ── chat-turn telemetry (persistent-logging) ──────────────────────────────────
+
+/// A content-free, PII-free record of one completed chat turn: backend, elapsed ms, optional
+/// token counts (present only when the backend reports them), the conversation id, and the
+/// action's correlation id. It holds NO prompt or reply text and NO household identity by
+/// construction — asserted by `telemetry_event_carries_no_content_or_identity`.
+#[derive(Debug)]
+struct ChatTurnTelemetry {
+    cid: String,
+    backend: chat::BackendKind,
+    ms: u128,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    conversation_id: String,
+}
+
+impl ChatTurnTelemetry {
+    fn emit(&self) {
+        tracing::info!(
+            target: "chat_telemetry",
+            cid = %self.cid,
+            backend = self.backend.as_str(),
+            ms = self.ms,
+            prompt_tokens = self.prompt_tokens,
+            completion_tokens = self.completion_tokens,
+            conversation_id = %self.conversation_id,
+            "chat turn completed"
+        );
+    }
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -425,8 +584,15 @@ pub async fn get_audit(
     offset: i64,
     state: State<'_, AppState>,
 ) -> CmdResult<Vec<AuditRow>> {
+    let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "audit.read", "audited access");
     with_store(state.inner(), |s| {
-        s.list_audit(limit.clamp(1, 500), offset.max(0))
+        // Read first (a pure read), then record that the audit log was read — so the read
+        // never includes its own row and writing it triggers no recursive audit.
+        let rows = s.list_audit(limit.clamp(1, 500), offset.max(0))?;
+        audit_audit_read(s, &w, &cid, limit, offset)?;
+        Ok(rows)
     })
 }
 
@@ -709,15 +875,12 @@ pub async fn neighborhood_geography(
 #[tauri::command]
 pub async fn get_at_risk(state: State<'_, AppState>) -> CmdResult<Vec<AtRiskRow>> {
     let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "insights.at_risk", "audited access");
     with_store(state.inner(), |s| {
         ensure_fresh(s, &w, false)?;
         let rows = insights::at_risk(s, insights::current_fy())?;
-        s.audit(
-            &w,
-            "insights.at_risk",
-            None,
-            Some(serde_json::json!({"count": rows.len()})),
-        )?;
+        audit_at_risk_access(s, &w, &cid, &rows)?;
         Ok(rows)
     })
 }
@@ -843,6 +1006,8 @@ pub async fn get_watch_list(
     state: State<'_, AppState>,
 ) -> CmdResult<risk::WatchListView> {
     let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "risk.watch_list.load", "audited access");
     tauri::async_runtime::spawn_blocking(move || -> CmdResult<risk::WatchListView> {
         let state = app.state::<AppState>();
         let state = state.inner();
@@ -864,11 +1029,8 @@ pub async fn get_watch_list(
                 if let Some(built) = &to_cache {
                     risk_write_cache(s, built.as_deref(), &model, &list)?;
                 }
-                s.audit(
-                    &w,
-                    "risk.watch_list.load",
-                    None,
-                    Some(serde_json::json!({"count": view.rows.len(), "available": view.available})),
+                audit_watch_list_access(
+                    s, &w, &cid, "risk.watch_list.load", &view.rows, view.available,
                 )?;
                 Ok(view)
             })
@@ -885,6 +1047,8 @@ pub async fn get_watch_list(
 #[tauri::command]
 pub async fn export_watch_list_csv(state: State<'_, AppState>) -> CmdResult<String> {
     let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "risk.watch_list.export", "audited access");
     let dir = exports_dir(state.inner());
     with_store(state.inner(), |s| {
         let mut sink = progress::noop();
@@ -897,11 +1061,8 @@ pub async fn export_watch_list_csv(state: State<'_, AppState>) -> CmdResult<Stri
         std::fs::create_dir_all(&dir)?;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M");
         let path = dir.join(format!("watch-list-{stamp}.csv"));
-        s.audit(
-            &w,
-            "risk.watch_list.export",
-            None,
-            Some(serde_json::json!({"count": view.rows.len()})),
+        audit_watch_list_access(
+            s, &w, &cid, "risk.watch_list.export", &view.rows, view.available,
         )?;
         std::fs::write(&path, risk::watch_list_csv(&view))?;
         Ok(path.to_string_lossy().into_owned())
@@ -1102,7 +1263,14 @@ pub async fn chat_create_conversation(
 
 #[tauri::command]
 pub async fn chat_list_conversations(state: State<'_, AppState>) -> CmdResult<Vec<ChatConversation>> {
-    with_store(state.inner(), |s| s.list_conversations())
+    let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "chat.list_conversations", "audited access");
+    with_store(state.inner(), |s| {
+        let convs = s.list_conversations()?;
+        audit_chat_list_conversations(s, &w, &cid, convs.len())?;
+        Ok(convs)
+    })
 }
 
 #[tauri::command]
@@ -1110,7 +1278,17 @@ pub async fn chat_list_messages(
     conversation_id: String,
     state: State<'_, AppState>,
 ) -> CmdResult<Vec<StoredChatMessage>> {
-    with_store(state.inner(), |s| s.list_chat_messages(&conversation_id))
+    let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "chat.list_messages", "audited access");
+    with_store(state.inner(), |s| {
+        // Opening a conversation is a chat entry point: apply age-based retention best-effort
+        // (a prune failure must not fail the open), then read and audit the transcript access.
+        prune_chat_best_effort(s, &cid);
+        let msgs = s.list_chat_messages(&conversation_id)?;
+        audit_chat_list_messages(s, &w, &cid, &conversation_id, msgs.len())?;
+        Ok(msgs)
+    })
 }
 
 #[tauri::command]
@@ -1202,11 +1380,14 @@ pub async fn chat_send(
         return Err("Message is empty.".into());
     }
     let w = who(state.inner());
+    let cid = new_cid();
+    tracing::info!(target: "access", cid, action = "chat.send", "audited access");
 
     // (a) Prepare under the store lock (a stale mart triggers a rebuild here): off the async workers.
     let app_prep = app.clone();
     let conv_prep = conversation_id.clone();
     let user_prep = msg.clone();
+    let cid_prep = cid.clone();
     let prep = tauri::async_runtime::spawn_blocking(move || -> CmdResult<ChatPrep> {
         let state = app_prep.state::<AppState>();
         let state = state.inner();
@@ -1214,6 +1395,9 @@ pub async fn chat_send(
             if s.get_conversation(&conv_prep)?.is_none() {
                 return Err(anyhow::anyhow!("unknown conversation"));
             }
+            // Turn start is a chat entry point: apply age-based retention best-effort before
+            // building the turn (a prune failure must not fail the send).
+            prune_chat_best_effort(s, &cid_prep);
             ensure_fresh(s, &w, false)?;
             let snapshot = chat_context::build(s, insights::current_fy())?.text;
             let history: Vec<chat::ChatMessage> = s
@@ -1236,7 +1420,7 @@ pub async fn chat_send(
                 &w,
                 "chat.send",
                 None,
-                Some(serde_json::json!({"backend": backend, "conversation": conv_prep})),
+                Some(serde_json::json!({"cid": cid_prep, "backend": backend, "conversation": conv_prep})),
             )?;
             Ok(ChatPrep { snapshot, history, ollama_base_url, ollama_model, cli_model })
         })
@@ -1254,7 +1438,7 @@ pub async fn chat_send(
     let app_run = app.clone();
     let conv_run = conversation_id.clone();
     let handle = tokio::spawn(async move {
-        run_chat_stream(app_run, conv_run, backend, prep, msg, cancel).await;
+        run_chat_stream(app_run, conv_run, backend, prep, msg, cancel, cid).await;
     });
     state.agents.insert(conversation_id, handle);
     Ok(())
@@ -1269,7 +1453,9 @@ async fn run_chat_stream(
     prep: ChatPrep,
     user_msg: String,
     cancel: Cancel,
+    cid: String,
 ) {
+    let started = std::time::Instant::now();
     let token_app = app.clone();
     let token_conv = conversation_id.clone();
     let mut on_token = move |tok: &str| {
@@ -1307,6 +1493,16 @@ async fn run_chat_stream(
     }
     match result {
         Ok(outcome) => {
+            // One content-free telemetry event per completed (non-cancelled) turn.
+            ChatTurnTelemetry {
+                cid,
+                backend,
+                ms: started.elapsed().as_millis(),
+                prompt_tokens: outcome.prompt_tokens,
+                completion_tokens: outcome.completion_tokens,
+                conversation_id: conversation_id.clone(),
+            }
+            .emit();
             let message_id = new_id("msg");
             let content = outcome.text.clone();
             let conv = conversation_id.clone();
@@ -1345,4 +1541,180 @@ pub async fn chat_cancel(conversation_id: String, state: State<'_, AppState>) ->
     }
     state.agents.kill(&conversation_id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// Returns the TempDir too so it lives as long as the Store.
+    fn mem() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store::open(&dir.path().join("t.db"), KEY).unwrap();
+        (dir, s)
+    }
+
+    fn who_t() -> Who {
+        Who { sf_user_id: Some("005".into()), sf_username: Some("u@x".into()) }
+    }
+
+    fn detail_of(row: &AuditRow) -> serde_json::Value {
+        serde_json::from_str(row.detail.as_deref().unwrap()).unwrap()
+    }
+
+    /// Audit details, newest-first (matching `list_audit`'s ordering).
+    fn details(s: &Store) -> Vec<serde_json::Value> {
+        s.list_audit(100, 0).unwrap().iter().map(detail_of).collect()
+    }
+
+    fn at_risk_row(account_id: &str, name: &str) -> AtRiskRow {
+        AtRiskRow {
+            account_id: account_id.into(),
+            name: name.into(),
+            tier: None,
+            join_fy: None,
+            rules: vec![],
+        }
+    }
+
+    fn watch_row(account_id: &str, name: &str) -> risk::WatchRowView {
+        risk::WatchRowView {
+            account_id: account_id.into(),
+            name: name.into(),
+            score: 0.5,
+            evidence: vec![],
+        }
+    }
+
+    // ── 2.1 at-risk audit lists the disclosed id set + count, never a name ────
+    #[test]
+    fn at_risk_audit_lists_account_ids_and_count_without_name() {
+        let (_d, s) = mem();
+        let rows = vec![at_risk_row("001AAA", "Cohen"), at_risk_row("001BBB", "Levy")];
+        audit_at_risk_access(&s, &who_t(), "act-1", &rows).unwrap();
+
+        let audit = s.list_audit(10, 0).unwrap();
+        assert_eq!(audit.len(), 1, "exactly one audit row for the read");
+        let detail = detail_of(&audit[0]);
+        assert_eq!(detail["count"], 2);
+        assert_eq!(detail["account_ids"], serde_json::json!(["001AAA", "001BBB"]));
+        let raw = audit[0].detail.as_deref().unwrap();
+        assert!(!raw.contains("Cohen") && !raw.contains("Levy"), "no household name in the audit");
+    }
+
+    // ── 2.2 Watch List audit lists ids; empty result is a zero-count row ──────
+    #[test]
+    fn watch_list_audit_lists_ids_and_empty_result_is_accountable() {
+        let (_d, s) = mem();
+        audit_watch_list_access(
+            &s, &who_t(), "act-2", "risk.watch_list.load", &[watch_row("001XYZ", "Adler")], true,
+        )
+        .unwrap();
+        // An empty result still records an accountable read: zero count, empty id set.
+        audit_watch_list_access(&s, &who_t(), "act-3", "risk.watch_list.load", &[], true).unwrap();
+
+        let d = details(&s); // newest first
+        assert_eq!(d[0]["count"], 0);
+        assert_eq!(d[0]["account_ids"], serde_json::json!([]));
+        assert_eq!(d[1]["count"], 1);
+        assert_eq!(d[1]["account_ids"], serde_json::json!(["001XYZ"]));
+        assert!(!s.list_audit(10, 0).unwrap()[1].detail.as_deref().unwrap().contains("Adler"));
+    }
+
+    // ── 2.3 sensitive reads each write one low-cardinality row; no recursion ──
+    #[test]
+    fn sensitive_reads_write_one_low_cardinality_row_without_content() {
+        let (_d, s) = mem();
+        // A pure read of the audit log writes nothing by itself (no recursion).
+        let before = s.list_audit(500, 0).unwrap().len();
+        let _ = s.list_audit(500, 0).unwrap();
+        assert_eq!(s.list_audit(500, 0).unwrap().len(), before, "reading the audit log is pure");
+
+        audit_audit_read(&s, &who_t(), "act-a", 50, 0).unwrap();
+        audit_chat_list_conversations(&s, &who_t(), "act-b", 3).unwrap();
+        audit_chat_list_messages(&s, &who_t(), "act-c", "conv-1", 7).unwrap();
+
+        let audit = s.list_audit(10, 0).unwrap();
+        assert_eq!(audit.len(), 3, "exactly one row per read");
+        let find = |a: &str| detail_of(audit.iter().find(|r| r.action == a).unwrap());
+        let ar = find("audit.read");
+        assert_eq!((ar["limit"].as_i64(), ar["offset"].as_i64()), (Some(50), Some(0)));
+        assert_eq!(find("chat.list_conversations")["count"], 3);
+        let lm = find("chat.list_messages");
+        assert_eq!(lm["conversation_id"], "conv-1");
+        assert_eq!(lm["messages"], 7);
+        // Low-cardinality only — no content-bearing keys.
+        for a in ["audit.read", "chat.list_conversations", "chat.list_messages"] {
+            let d = find(a);
+            assert!(d.get("content").is_none() && d.get("text").is_none());
+        }
+    }
+
+    // ── 3.2 chat-turn telemetry carries no transcript content or PII ─────────
+    #[test]
+    fn telemetry_event_carries_no_content_or_identity() {
+        // A turn whose prompt/reply contain text and whose context contains household PII.
+        const SECRET_PROMPT: &str = "who is the most profitable household?";
+        const SECRET_REPLY: &str = "The Cohen household, account 001AAA.";
+        const SECRET_NAME: &str = "Cohen";
+        const SECRET_EMAIL: &str = "cohen@example.org";
+        const SECRET_STREET: &str = "12 Oak Street";
+        const SECRET_ID: &str = "001AAA";
+
+        let t = ChatTurnTelemetry {
+            cid: "act-telemetry".into(),
+            backend: chat::BackendKind::Ollama,
+            ms: 1234,
+            prompt_tokens: Some(7001),
+            completion_tokens: Some(8002),
+            conversation_id: "conv-1".into(),
+        };
+        let repr = format!("{t:?}");
+        // Backend, elapsed ms, and token counts are present.
+        assert!(repr.contains("Ollama") && repr.contains("1234"));
+        assert!(repr.contains("7001") && repr.contains("8002"));
+        // No transcript content, no household identity.
+        for leak in [SECRET_PROMPT, SECRET_REPLY, SECRET_NAME, SECRET_EMAIL, SECRET_STREET, SECRET_ID] {
+            assert!(!repr.contains(leak), "telemetry must not carry {leak:?}");
+        }
+
+        // Token counts are optional — absent, not fabricated, when the backend omits them.
+        let none = ChatTurnTelemetry { prompt_tokens: None, completion_tokens: None, ..t };
+        let repr = format!("{none:?}");
+        assert!(repr.contains("None"), "absent token counts stay None, never fabricated");
+    }
+
+    // ── 4.3 a prune failure never surfaces as a chat error ───────────────────
+    #[test]
+    fn prune_failure_does_not_break_the_chat_action() {
+        // A chat action that prunes best-effort then proceeds — modeled as returning success.
+        fn fake_chat_action(prune: impl FnOnce() -> anyhow::Result<usize>) -> Result<&'static str, String> {
+            best_effort_prune("act-x", prune);
+            Ok("sent")
+        }
+        assert_eq!(fake_chat_action(|| Err(anyhow::anyhow!("simulated prune failure"))), Ok("sent"));
+        assert_eq!(fake_chat_action(|| Ok(5)), Ok("sent"));
+    }
+
+    // ── 5.1 audited action carries a unique, identity-free correlation id ────
+    #[test]
+    fn audited_action_carries_a_unique_cid_free_of_identity() {
+        let (_d, s) = mem();
+        let name = "Cohen";
+        let cid1 = new_cid();
+        let cid2 = new_cid();
+        assert_ne!(cid1, cid2, "distinct invocations get distinct ids");
+        assert!(cid1.starts_with("act-"));
+        assert!(!cid1.contains(name) && !cid2.contains(name), "cid carries no household identity");
+
+        let rows = vec![at_risk_row("001AAA", name)];
+        audit_at_risk_access(&s, &who_t(), &cid1, &rows).unwrap();
+        audit_at_risk_access(&s, &who_t(), &cid2, &rows).unwrap();
+        let d = details(&s); // newest first
+        assert_eq!(d[0]["cid"], cid2);
+        assert_eq!(d[1]["cid"], cid1);
+        assert_ne!(d[0]["cid"], d[1]["cid"]);
+    }
 }

@@ -44,6 +44,7 @@ chrono = { version = "0.4", features = ["clock"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 smartcore = "=0.5.5"
 
 [target.'cfg(windows)'.dependencies]

@@ -79,11 +79,15 @@ pub fn new_cancel() -> Cancel {
 }
 
 /// What a completed stream produced: the full assistant text and, for CLI backends, the agent's
-/// own session id (captured for the conversation record).
+/// own session id (captured for the conversation record). `prompt_tokens`/`completion_tokens`
+/// are populated only when the backend reports them (Ollama's final chunk does; the CLI agents
+/// leave them `None`) and feed the per-turn telemetry event — they are counts only, never content.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
     pub text: String,
     pub session_id: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 /// A chat transport. The snapshot is the sole governed data input; history + user_msg are the
@@ -259,7 +263,7 @@ impl ChatBackend for CliAgentBackend {
         .await?;
 
         if cancel.load(Ordering::Relaxed) {
-            return Ok(StreamOutcome { text: parser.text, session_id: parser.session_id });
+            return Ok(StreamOutcome { text: parser.text, session_id: parser.session_id, ..Default::default() });
         }
         if outcome.timed_out {
             return Err(anyhow!("{} timed out", self.agent.bin()));
@@ -273,7 +277,7 @@ impl ChatBackend for CliAgentBackend {
             };
             return Err(anyhow!(hint));
         }
-        Ok(StreamOutcome { text: parser.text, session_id: parser.session_id })
+        Ok(StreamOutcome { text: parser.text, session_id: parser.session_id, ..Default::default() })
     }
 }
 
@@ -284,7 +288,9 @@ pub struct OllamaBackend {
     pub model: String,
 }
 
-/// One newline-delimited JSON object from Ollama's `/api/chat` stream.
+/// One newline-delimited JSON object from Ollama's `/api/chat` stream. The final (`done`)
+/// chunk also carries `prompt_eval_count` / `eval_count` — the prompt and completion token
+/// counts — which the per-turn telemetry event records.
 #[derive(Deserialize)]
 struct OllamaChunk {
     #[serde(default)]
@@ -293,6 +299,10 @@ struct OllamaChunk {
     done: bool,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 #[derive(Deserialize)]
 struct OllamaMsg {
@@ -368,12 +378,17 @@ impl ChatBackend for OllamaBackend {
                         }
                     }
                     if evt.done {
-                        return Ok(StreamOutcome { text, session_id: None });
+                        return Ok(StreamOutcome {
+                            text,
+                            session_id: None,
+                            prompt_tokens: evt.prompt_eval_count,
+                            completion_tokens: evt.eval_count,
+                        });
                     }
                 }
             }
         }
-        Ok(StreamOutcome { text, session_id: None })
+        Ok(StreamOutcome { text, session_id: None, ..Default::default() })
     }
 }
 
@@ -744,7 +759,7 @@ mod tests {
                 text.push('x');
                 tokio::task::yield_now().await;
             }
-            Ok(StreamOutcome { text, session_id: None })
+            Ok(StreamOutcome { text, session_id: None, ..Default::default() })
         }
     }
 

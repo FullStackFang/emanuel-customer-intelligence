@@ -16,23 +16,56 @@ pub mod segment;
 pub mod store;
 
 use commands::AppState;
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::Manager;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Initialize `tracing` with the existing stdout layer plus a daily-rotating file layer under
+/// `<app_data_dir>/logs/`, so diagnostics survive process exit. A single registry-level
+/// `EnvFilter` (default `info`, overridable via `RUST_LOG`) governs both sinks, preserving the
+/// `insights_timing` target behavior. Returns the non-blocking writer's `WorkerGuard`, which the
+/// caller must hold for the process lifetime; `None` (stdout only) if the logs dir is unwritable.
+fn init_tracing(app_data_dir: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+    };
+    let logs_dir = app_data_dir.join("logs");
+    match std::fs::create_dir_all(&logs_dir) {
+        Ok(()) => {
+            let (writer, guard) =
+                tracing_appender::non_blocking(tracing_appender::rolling::daily(&logs_dir, "app.log"));
+            tracing_subscriber::registry()
+                .with(filter())
+                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer))
+                .init();
+            Some(guard)
+        }
+        Err(e) => {
+            tracing_subscriber::registry()
+                .with(filter())
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+            tracing::warn!("could not create log directory {logs_dir:?}: {e}; logging to stdout only");
+            None
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cfg = config::Config::from_env().expect("configuration: set SF_CLIENT_ID in .env");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let db_path = app.path().app_data_dir()?.join("mirror.db");
+            let app_data_dir = app.path().app_data_dir()?;
+            // Tracing is initialized here (not before the builder) because the file sink lives
+            // under the app data dir, which only the resolved app can provide.
+            let log_guard = init_tracing(&app_data_dir);
+            let db_path = app_data_dir.join("mirror.db");
             app.manage(AppState {
                 cfg: cfg.clone(),
                 secrets: secrets::Secrets::default_service(),
@@ -42,6 +75,7 @@ pub fn run() {
                 job: Mutex::new(None),
                 agents: Default::default(),
                 chat_cancels: Mutex::new(std::collections::HashMap::new()),
+                _log_guard: log_guard,
             });
             Ok(())
         })

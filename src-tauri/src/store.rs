@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS _chat_messages(
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
   content TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS _chat_messages_conv ON _chat_messages(conversation_id);
+CREATE INDEX IF NOT EXISTS _chat_messages_created ON _chat_messages(created_at);
 ";
 
 pub fn open(path: &Path, key_hex: &str) -> Result<Store> {
@@ -584,6 +585,26 @@ impl Store {
         Ok(())
     }
 
+    /// Age-based chat retention: delete `_chat_messages` older than `before` (an ISO-8601
+    /// timestamp in the same format as `created_at`), then remove any conversation left with
+    /// no remaining messages. Returns the number of messages deleted. Touches only the chat
+    /// tables — never the synced mirror — and is distinct from `purge_mirror`. The delete is
+    /// indexed by `_chat_messages_created`. No schema change.
+    pub fn prune_chat(&mut self, before: &str) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM _chat_messages WHERE created_at < ?1",
+            params![before],
+        )?;
+        tx.execute(
+            "DELETE FROM _chat_conversations
+             WHERE id NOT IN (SELECT DISTINCT conversation_id FROM _chat_messages)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     // ── status ──────────────────────────────────────────────────────────
     pub fn status(&self) -> Result<Status> {
         let object_count: i64 = self
@@ -855,6 +876,89 @@ mod tests {
         let convs = s.list_conversations().unwrap();
         assert_eq!(convs.len(), 1, "conversation survives a mirror purge");
         assert_eq!(s.list_chat_messages("c1").unwrap().len(), 1, "messages survive a mirror purge");
+    }
+
+    // ── 1.1 audit detail round-trips the record-level access shape ───────────
+    #[test]
+    fn audit_detail_round_trips_account_ids_and_cid() {
+        let (_d, s) = mem();
+        s.audit(
+            &who(),
+            "insights.at_risk",
+            None,
+            Some(serde_json::json!({
+                "cid": "act-deadbeef",
+                "count": 2,
+                "account_ids": ["001AAA", "001BBB"],
+            })),
+        )
+        .unwrap();
+        let rows = s.list_audit(10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let detail: serde_json::Value =
+            serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["cid"], "act-deadbeef");
+        assert_eq!(detail["count"], 2);
+        assert_eq!(detail["account_ids"], serde_json::json!(["001AAA", "001BBB"]));
+    }
+
+    /// Seed a message with an explicit `created_at`, bypassing `append_chat_message`'s
+    /// now-stamping so retention cutoffs can be exercised deterministically.
+    fn seed_msg(s: &Store, id: &str, conv: &str, at: &str) {
+        s.conn()
+            .execute(
+                "INSERT INTO _chat_messages(id, conversation_id, role, content, created_at)
+                 VALUES(?1, ?2, 'user', 'x', ?3)",
+                params![id, conv, at],
+            )
+            .unwrap();
+    }
+
+    // ── 1.2 prune deletes old messages, empties/keeps conversations correctly ─
+    #[test]
+    fn prune_chat_deletes_old_and_removes_emptied_conversations() {
+        let (_d, mut s) = mem();
+        s.create_conversation("c_old", "ollama", "All old").unwrap();
+        s.create_conversation("c_mix", "ollama", "Mixed").unwrap();
+        seed_msg(&s, "m1", "c_old", "2024-01-01T00:00:00Z");
+        seed_msg(&s, "m2", "c_mix", "2024-01-01T00:00:00Z");
+        seed_msg(&s, "m3", "c_mix", "2026-08-01T00:00:00Z");
+
+        let deleted = s.prune_chat("2025-01-01T00:00:00Z").unwrap();
+        assert_eq!(deleted, 2, "only the two pre-cutoff messages are deleted");
+
+        let convs = s.list_conversations().unwrap();
+        assert_eq!(convs.len(), 1, "the fully-pruned conversation is removed");
+        assert_eq!(convs[0].id, "c_mix");
+        let msgs = s.list_chat_messages("c_mix").unwrap();
+        assert_eq!(msgs.len(), 1, "the partially-pruned conversation keeps newer messages");
+        assert_eq!(msgs[0].id, "m3");
+        assert!(s.list_chat_messages("c_old").unwrap().is_empty());
+    }
+
+    // ── 1.3 prune is mirror-independent; purge preserves unexpired chat ───────
+    #[test]
+    fn prune_chat_leaves_mirror_and_purge_preserves_unexpired_chat() {
+        let (_d, mut s) = mem();
+        s.upsert_object("A", "A", 1).unwrap();
+        s.upsert_field("A", "Id", "id", "Id", false).unwrap();
+        let mut r = Row::new();
+        r.insert("Id".into(), serde_json::Value::String("1".into()));
+        s.replace_mirror("A", &["Id".to_string()], &[r]).unwrap();
+        s.create_conversation("c1", "ollama", "Recent").unwrap();
+        s.append_chat_message("m1", "c1", "user", "hi").unwrap(); // created_at = now
+
+        // A far-past cutoff prunes nothing recent and never touches the mirror.
+        let deleted = s.prune_chat("2000-01-01T00:00:00Z").unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(s.status().unwrap().synced_rows, 1, "prune_chat leaves the mirror intact");
+        assert_eq!(s.list_chat_messages("c1").unwrap().len(), 1);
+
+        // The mirror purge still leaves unexpired chat history alone.
+        s.purge_mirror().unwrap();
+        assert_eq!(s.status().unwrap().synced_rows, 0);
+        assert_eq!(s.list_conversations().unwrap().len(), 1, "purge_mirror keeps chat");
+        assert_eq!(s.list_chat_messages("c1").unwrap().len(), 1);
     }
 
     #[test]
