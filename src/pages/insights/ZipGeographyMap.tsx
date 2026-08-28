@@ -17,7 +17,7 @@ const GAIN = "#047857";
 const NEW = "#d4a017";
 
 type ModeConfig = { tab: string; measureLabel: string };
-const MODES: Record<GeoMode, ModeConfig> = {
+export const MODES: Record<GeoMode, ModeConfig> = {
   density: { tab: "Where members are", measureLabel: "Member households" },
   provenance: { tab: "New members", measureLabel: "New members" },
   net_change: { tab: "Growth & decline", measureLabel: "Net change" },
@@ -26,7 +26,7 @@ const MODES: Record<GeoMode, ModeConfig> = {
 };
 // provenance is folded into density (the per-ZIP new-member ratio), so it is not offered as a
 // standalone mode; its MODES entry is kept only to satisfy the GeoMode enum the backend defines.
-const MODE_ORDER: GeoMode[] = ["density", "retention", "net_change", "attrition"];
+export const MODE_ORDER: GeoMode[] = ["density", "retention", "net_change", "attrition"];
 
 const SEGMENT_ALL = "";
 const encodeSegment = (seg: Segment | null): string => (seg == null ? SEGMENT_ALL : `${seg.kind}:${seg.value}`);
@@ -110,13 +110,14 @@ function Headline({ children }: { children: React.ReactNode }) {
   return <p style={{ margin: "0 0 var(--space-3)", fontSize: "var(--text-base)", lineHeight: "var(--leading-relaxed)", color: "var(--text-primary)" }}>{children}</p>;
 }
 
-export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { currentFy: number; capability?: SourceCapability; builtAt: string; initial?: ZipGeography }) {
+// The mode toggle lives in the Insights tab header (the "Geography" split button), so `mode`
+// is a controlled prop here rather than local state.
+export function ZipGeographyMap({ currentFy, capability, builtAt, initial, mode }: { currentFy: number; capability?: SourceCapability; builtAt: string; initial?: ZipGeography; mode: GeoMode }) {
   const available = capability?.available ?? false;
   // The current fiscal year is only weeks/months in, so attrition and net change read as
   // empty; default to the last completed year and let the reader step forward to the live
   // (in-progress) snapshot if they want it.
   const lastCompleteFy = currentFy - 1;
-  const [mode, setMode] = useState<GeoMode>("density");
   // Segment filtering was removed from the UI; every view is all-members. Kept as a null
   // constant so the fetch/cache keys and the child maps' props stay unchanged.
   const segment: Segment | null = null;
@@ -181,23 +182,11 @@ export function ZipGeographyMap({ currentFy, capability, builtAt, initial }: { c
     );
   }
 
-  const controlBtn = (activeC: boolean): React.CSSProperties => ({
-    height: 32, padding: "0 var(--space-3)", display: "inline-flex", alignItems: "center",
-    border: "1px solid var(--border-default)", borderRadius: "var(--radius-md)",
-    font: "var(--font-semibold) var(--text-sm) var(--font-body)", cursor: "pointer",
-    background: activeC ? POS : "var(--bg-primary)", color: activeC ? "#fff" : "var(--text-primary)",
-  });
-
   return (
     <>
-      {/* Standing header: where the members are, at a glance — constant across every mode. */}
+      {/* Standing header: where the members are, at a glance — constant across every mode. The
+          mode toggle lives in the Insights tab header (the "Geography" split button). */}
       {densityData && <GeoHeader density={densityData} />}
-      {/* questions, not jargon */}
-      <div role="group" aria-label="Map mode" style={{ display: "inline-flex", gap: "var(--space-1)", marginBottom: "var(--space-3)", flexWrap: "wrap" }}>
-        {MODE_ORDER.map((m) => (
-          <button key={m} type="button" aria-pressed={mode === m} onClick={() => setMode(m)} style={controlBtn(mode === m)}>{MODES[m].tab}</button>
-        ))}
-      </div>
       {isRetention ? (
         <>
           <NeighborhoodRetentionMap currentFy={currentFy} segment={segment} builtAt={builtAt} />

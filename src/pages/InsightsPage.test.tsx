@@ -55,6 +55,13 @@ const cap = (key: string, available: boolean): api.SourceCapability => ({
   last_synced_at: null, unavailable_reason: available ? null : `Select and sync ${key}`,
 });
 
+// The geography map mode is chosen from the "Geography" split button in the tab header: click the
+// caret to open the mode menu, then pick the mode. Assumes the menu starts closed.
+const pickGeoMode = (name: string) => {
+  fireEvent.click(screen.getByRole("button", { name: "Choose geography view" }));
+  fireEvent.click(screen.getByRole("menuitem", { name }));
+};
+
 const fakeInsights: api.Insights = {
   built_at: "2026-08-01T00:00:00Z", newest_source_sync_at: "2026-08-01T00:00:00Z", stale: false,
   capabilities: [cap("membership", true), cap("renewal", false), cap("school", false), cap("committee", false)],
@@ -393,7 +400,13 @@ describe("InsightsPage", () => {
     // Default view leads with "Where members are" for the last COMPLETED fiscal year
     // (currentFy 2027 is only weeks in, so the default is FY2026).
     expect(await screen.findByRole("region", { name: "Where members are — FY2026" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Where members are" }).getAttribute("aria-pressed")).toBe("true");
+    // The mode toggle lives in the header's "Geography" split button; its caret opens the mode menu.
+    fireEvent.click(screen.getByRole("button", { name: "Choose geography view" }));
+    expect(screen.getByRole("menuitem", { name: "Where members are" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Retention by area" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Growth & decline" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Attrition" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" }); // close before the next open
     await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "density" && (a as { fiscalYear: number })?.fiscalYear === 2026)).toBe(true));
 
     // Headline stats: total mapped households, the top area, and its concentration share.
@@ -410,7 +423,7 @@ describe("InsightsPage", () => {
     // Retention by area: a cohort × area heatmap across eight join-year cohorts, fetched in
     // ONE backend call — every command queues on one store lock, so eight calls would be
     // eight waits in a row.
-    fireEvent.click(screen.getByRole("button", { name: "Retention by area" }));
+    pickGeoMode("Retention by area");
     expect(await screen.findByRole("region", { name: "Retention by area — cohort trend" })).toBeTruthy();
     expect(await screen.findByTestId("zip-retention-table")).toBeTruthy();
     const retentionCalls = invoke.mock.calls.filter(([c, a]) => c === "zip_geography_years" && (a as { mode: string })?.mode === "retention");
@@ -420,14 +433,14 @@ describe("InsightsPage", () => {
     expect(screen.getAllByText("10024").length).toBeGreaterThan(0);
 
     // Growth & decline splits gainers from losers.
-    fireEvent.click(screen.getByRole("button", { name: "Growth & decline" }));
+    pickGeoMode("Growth & decline");
     expect(await screen.findByRole("region", { name: "Growth & decline — FY2026" })).toBeTruthy();
     await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "net_change")).toBe(true));
     expect(await screen.findByText("Losing ground")).toBeTruthy();
     expect(screen.getByText("Gaining members")).toBeTruthy();
 
     // Attrition tightens the suppression floor to 10.
-    fireEvent.click(screen.getByRole("button", { name: "Attrition" }));
+    pickGeoMode("Attrition");
     expect(await screen.findByRole("region", { name: "Attrition — FY2026" })).toBeTruthy();
     await waitFor(() => expect(invoke.mock.calls.some(([c, a]) => c === "neighborhood_geography" && (a as { mode: string })?.mode === "attrition")).toBe(true));
     expect(await screen.findByText(/fewer than 10 in this view/)).toBeTruthy();
@@ -449,9 +462,9 @@ describe("InsightsPage", () => {
     await waitFor(() => expect(densityCalls()).toBe(1));
 
     // Leave the default view, then come back to the exact same selection.
-    fireEvent.click(screen.getByRole("button", { name: "Attrition" }));
+    pickGeoMode("Attrition");
     await screen.findByRole("region", { name: "Attrition — FY2026" });
-    fireEvent.click(screen.getByRole("button", { name: "Where members are" }));
+    pickGeoMode("Where members are");
     await screen.findByRole("region", { name: "Where members are — FY2026" });
 
     // The revisit paints from cache — the backend was never asked a second time for it.
@@ -486,7 +499,7 @@ describe("InsightsPage", () => {
     render(<InsightsPage {...props} />);
     await screen.findByRole("region", { name: "Where members are — FY2026" });
     expect(screen.getByText("Loading member households by area for FY2026…")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Retention by area" }));
+    pickGeoMode("Retention by area");
     expect(await screen.findByText("Computing retention by ZIP for the FY2019–FY2026 cohorts…")).toBeTruthy();
     expect(screen.queryByText("Loading…")).toBeNull();
   });

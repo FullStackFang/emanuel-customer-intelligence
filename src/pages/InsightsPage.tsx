@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { PageProps } from "../App";
 import * as api from "../api";
-import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, MenuButton } from "../design-system";
+import { Alert, Badge, Button, Card, CardHeader, CardTitle, EmptyState, Icon, Menu, MenuButton } from "../design-system";
 import { PageTitle, Stat } from "../design-system/ui-kits/grant-management/chrome.jsx";
 import "./insights/print.css";
 import { ClassOverTimeChart, CohortHeatmap, ConcentrationChart, DuesChart, FlowsChart, GrowthVsRecurringChart, HBarChart, JoinedVsStillHereChart, MembershipAgeChart, MembershipAgeOverTimeChart, MoneyOverTimeChart, OutcomeByTenureChart, ReasonsHeatmap, TableView, TrendChart, ValueByAgeChart, Year1Chart } from "./insights/charts";
 import type { JoinedVsStillHereRow } from "./insights/charts";
-import { ZipGeographyMap } from "./insights/ZipGeographyMap";
+import { ZipGeographyMap, MODES as GEO_MODES, MODE_ORDER as GEO_MODE_ORDER } from "./insights/ZipGeographyMap";
 import { bandLabel, EVIDENCE_LABELS, fmt, fmtMoney, fyLabel, soWhat } from "./insights/format";
 
 function SoWhat({ text }: { text: string }) {
@@ -182,12 +182,63 @@ function scrollScrollportToTop(from: HTMLElement | null) {
   }
 }
 
+/** The "Geography" tab, rendered as one cohesive split control: the label navigates to the tab,
+ *  the caret opens the map-mode menu. It reads as a single pill (one border, one shadow, clipped
+ *  corners, a hairline divider) rather than two abutting Buttons; each half lights on hover. */
+function GeoSplitTab({ active, mode, onGo, onPickMode }: {
+  active: boolean;
+  mode: api.GeoMode;
+  onGo: () => void;
+  onPickMode: (m: api.GeoMode) => void;
+}) {
+  const [hover, setHover] = useState<"label" | "caret" | null>(null);
+  const fill = active ? "var(--color-primary-600)" : "var(--bg-secondary)";
+  const seg = (on: boolean): CSSProperties => ({
+    display: "inline-flex", alignItems: "center", justifyContent: "center",
+    height: "100%", border: "none", cursor: "pointer", transition: "var(--transition-all)",
+    fontFamily: "var(--font-body)", fontWeight: "var(--font-medium)", fontSize: "var(--text-sm)",
+    background: on ? fill : "transparent",
+    color: active ? "var(--text-inverse)" : on ? "var(--text-primary)" : "var(--text-secondary)",
+  });
+  return (
+    <Menu align="left"
+      items={GEO_MODE_ORDER.map((m) => ({ key: m, label: GEO_MODES[m].tab, active: mode === m, onSelect: () => onPickMode(m) }))}
+      trigger={({ open, toggle }: { open: boolean; toggle: () => void }) => (
+        <div style={{
+          display: "inline-flex", alignItems: "stretch", height: "var(--btn-height-md)", overflow: "hidden",
+          borderRadius: "var(--radius-lg)", transition: "var(--transition-all)",
+          background: active ? "var(--color-primary-500)" : "var(--bg-primary)",
+          border: active ? "1px solid transparent"
+            : `1px solid ${hover || open ? "var(--border-strong)" : "var(--border-default)"}`,
+          boxShadow: active ? "var(--shadow-sm)" : "none",
+        }}>
+          <button type="button" onClick={onGo}
+            onMouseEnter={() => setHover("label")} onMouseLeave={() => setHover(null)}
+            style={{ ...seg(hover === "label"), padding: "var(--btn-padding-md)" }}>
+            Geography
+          </button>
+          <span aria-hidden style={{ width: 1, alignSelf: "stretch", background: active ? "rgba(255,255,255,0.28)" : "var(--border-default)" }} />
+          <button type="button" onClick={toggle}
+            aria-label="Choose geography view" aria-haspopup="menu" aria-expanded={open}
+            onMouseEnter={() => setHover("caret")} onMouseLeave={() => setHover(null)}
+            style={{ ...seg(hover === "caret" || open), padding: "0 var(--space-2)" }}>
+            <Icon name="chevron-down" size={14} />
+          </button>
+        </div>
+      )}
+    />
+  );
+}
+
 export default function InsightsPage({ status }: PageProps) {
   const [ins, setIns] = useState<api.Insights | null>(snapshot?.ins ?? null);
   const [risk, setRisk] = useState<api.RiskSummary | null>(snapshot?.risk ?? null);
   const [riskFailed, setRiskFailed] = useState(snapshot?.riskFailed ?? false);
   const [watch, setWatch] = useState<api.WatchListView | null>(null);
   const [tab, setTab] = useState<"overview" | "join" | "engagement" | "financials" | "risk" | "geography">("overview");
+  // The Geography map mode is chosen from the tab header's "Geography" split button, so it lives
+  // here (above ZipGeographyMap) and is passed down as a controlled prop.
+  const [geoMode, setGeoMode] = useState<api.GeoMode>("density");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [exported, setExported] = useState<string | null>(null);
@@ -414,11 +465,22 @@ export default function InsightsPage({ status }: PageProps) {
           <div ref={tabsRef} className="insights-screen-only" style={{ position: "sticky", top: 0, zIndex: 5, background: "var(--bg-secondary)", paddingTop: "var(--space-3)", paddingBottom: "var(--space-3)", marginBottom: "var(--space-2)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--space-3)", flexWrap: "wrap", background: "var(--bg-primary)", border: "1px solid var(--border-default)", borderRadius: "var(--radius-xl)", boxShadow: "var(--shadow-md)", padding: "var(--space-2) var(--space-3)" }}>
               <div role="tablist" aria-label="Insights sections" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
-              {(["overview", "join", "engagement", "financials", "risk", "geography"] as const).map((key) => (
-                <Button key={key} variant={tab === key ? "primary" : "secondary"} onClick={() => { if (key === tab) return; setTab(key); scrollScrollportToTop(tabsRef.current); }}>
-                  {key === "overview" ? "Overview" : key === "join" ? "Join reasons" : key === "engagement" ? "Engagement & Renewal" : key === "financials" ? "Financials" : key === "risk" ? "Attrition & Risk" : "Geography"}
-                </Button>
-              ))}
+              {(["overview", "join", "engagement", "financials", "risk", "geography"] as const).map((key) => {
+                const goTo = () => { if (key !== tab) { setTab(key); scrollScrollportToTop(tabsRef.current); } };
+                // Geography is a split button: the label navigates to the tab (keeping the current
+                // mode), the caret opens the mode menu — picking a mode also jumps to the tab.
+                if (key === "geography") {
+                  return (
+                    <GeoSplitTab key={key} active={tab === "geography"} mode={geoMode}
+                      onGo={goTo} onPickMode={(m) => { setGeoMode(m); goTo(); }} />
+                  );
+                }
+                return (
+                  <Button key={key} variant={tab === key ? "primary" : "secondary"} onClick={goTo}>
+                    {key === "overview" ? "Overview" : key === "join" ? "Join reasons" : key === "engagement" ? "Engagement & Renewal" : key === "financials" ? "Financials" : "Attrition & Risk"}
+                  </Button>
+                );
+              })}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", marginLeft: "auto" }}>
               {riskBusy && (
@@ -861,7 +923,7 @@ export default function InsightsPage({ status }: PageProps) {
           <div className={sectionClass("geography")}>
           <Card className="insights-report-card" style={{ marginBottom: "var(--space-4)" }}>
             <CardHeader><CardTitle>Membership geography</CardTitle></CardHeader>
-            <ZipGeographyMap currentFy={ins.current_fy} capability={ins.capabilities.find((capability) => capability.key === "geography")} builtAt={ins.built_at ?? ""} initial={ins.geography ?? undefined} />
+            <ZipGeographyMap currentFy={ins.current_fy} capability={ins.capabilities.find((capability) => capability.key === "geography")} builtAt={ins.built_at ?? ""} initial={ins.geography ?? undefined} mode={geoMode} />
           </Card>
           </div>
           </div>
